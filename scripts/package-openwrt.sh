@@ -31,6 +31,12 @@ if [ ! -f "$binary" ]; then
     exit 1
 fi
 
+# Resolve dest to an absolute path: ipkg-build cds into the package dir and
+# creates its temp scratch dir under the destination, so a relative dest would
+# resolve against the wrong cwd.
+dest="$(cd "$(dirname "$dest")" && pwd)/$(basename "$dest")"
+mkdir -p "$dest"
+
 pkg_name="bypasscore"
 description="Standalone routing engine: rule matching -> routing decision."
 script_dir="$(cd "$(dirname "$0")" && pwd)"
