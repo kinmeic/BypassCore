@@ -124,3 +124,37 @@ type DialerManager interface {
 	GetDialer(tag string) dialer.Dialer
 	GetDefaultDialer() dialer.Dialer
 }
+
+// DialOutbound routes the destination via the router and dials the chosen
+// outbound. It's used by the UDP tproxy listener which can't use Dispatch
+// (Dispatch is stream-oriented, not packet-oriented).
+//
+// The returned net.Conn is a raw TCP/UDP connection to the outbound; the
+// caller manages I/O directly.
+func (d *Dispatcher) DialOutbound(ctx context.Context, dest bcnet.Destination) (net.Conn, error) {
+	// Build routing context.
+	rctx := buildRoutingContext(ctx, dest)
+
+	// Route.
+	route, err := d.router.PickRoute(rctx)
+	var dialer dialer.Dialer
+	if err != nil {
+		// Fall back to default.
+		dialer = d.ohm.GetDefaultDialer()
+		if dialer == nil {
+			return nil, errors.New("no default outbound available")
+		}
+	} else {
+		outTag := route.GetOutboundTag()
+		dialer = d.ohm.GetDialer(outTag)
+		if dialer == nil {
+			dialer = d.ohm.GetDefaultDialer()
+		}
+	}
+
+	if dialer == nil {
+		return nil, errors.New("no outbound available")
+	}
+
+	return dialer.Dial(ctx, dest)
+}

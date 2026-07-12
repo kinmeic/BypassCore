@@ -4,19 +4,21 @@ import (
 	"context"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/eugene/bypasscore/app/dispatcher"
 	"github.com/eugene/bypasscore/common/errors"
 )
 
-// Listener is a TCP transparent proxy listener. It accepts connections,
-// recovers the original destination, and dispatches them to the dispatcher.
+// Listener is a transparent proxy listener supporting both TCP (redirect/tproxy)
+// and UDP (tproxy). The network config field determines which protocols to listen on.
 type Listener struct {
 	cfg        *Config
 	dispatcher *dispatcher.Dispatcher
 
 	tcpListener net.Listener
+	udpListener *udpTproxyListener
 	wg          sync.WaitGroup
 
 	ctx    context.Context
@@ -28,26 +30,50 @@ func New(cfg *Config, d *dispatcher.Dispatcher) *Listener {
 	return &Listener{cfg: cfg, dispatcher: d}
 }
 
-// Start begins listening and accepting connections.
+// Start begins listening on TCP and/or UDP based on the network config.
 func (l *Listener) Start() error {
 	l.ctx, l.cancel = context.WithCancel(context.Background())
 
-	addr := net.JoinHostPort(l.cfg.Listen, strconv.Itoa(l.cfg.Port))
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return errors.New("inbound listen failed: ", addr).Base(err)
+	netCfg := strings.ToLower(l.cfg.Network)
+	if netCfg == "" {
+		netCfg = "tcp"
 	}
-	l.tcpListener = ln
 
-	errors.LogInfo(context.Background(), "inbound[", l.cfg.Tag, "] listening on tcp://", addr)
+	wantTCP := strings.Contains(netCfg, "tcp")
+	wantUDP := strings.Contains(netCfg, "udp")
 
-	l.wg.Add(1)
-	go l.acceptLoop()
+	if wantTCP {
+		addr := net.JoinHostPort(l.cfg.Listen, strconv.Itoa(l.cfg.Port))
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			return errors.New("inbound TCP listen failed: ", addr).Base(err)
+		}
+		l.tcpListener = ln
+		errors.LogInfo(context.Background(), "inbound[", l.cfg.Tag, "] listening on tcp://", addr)
+		l.wg.Add(1)
+		go l.acceptLoop()
+	}
+
+	if wantUDP {
+		udpLn, err := startUDP(l.cfg, l.dispatcher)
+		if err != nil {
+			// Close TCP listener if already started.
+			if l.tcpListener != nil {
+				l.tcpListener.Close()
+			}
+			return errors.New("inbound UDP listen failed").Base(err)
+		}
+		l.udpListener = udpLn
+	}
+
+	if !wantTCP && !wantUDP {
+		return errors.New("inbound: network must be tcp, udp, or tcp,udp")
+	}
 
 	return nil
 }
 
-// Close stops the listener.
+// Close stops all listeners.
 func (l *Listener) Close() error {
 	if l.cancel != nil {
 		l.cancel()
@@ -55,18 +81,21 @@ func (l *Listener) Close() error {
 	if l.tcpListener != nil {
 		_ = l.tcpListener.Close()
 	}
+	if l.udpListener != nil {
+		_ = l.udpListener.Close()
+	}
 	l.wg.Wait()
 	return nil
 }
 
-// acceptLoop accepts connections and dispatches them.
+// acceptLoop accepts TCP connections and dispatches them.
 func (l *Listener) acceptLoop() {
 	defer l.wg.Done()
 	for {
 		conn, err := l.tcpListener.Accept()
 		if err != nil {
 			if l.ctx.Err() != nil {
-				return // shutting down
+				return
 			}
 			errors.LogErrorInner(context.Background(), err, "inbound accept failed")
 			continue
@@ -80,7 +109,7 @@ func (l *Listener) acceptLoop() {
 func (l *Listener) handleConn(conn net.Conn) {
 	defer l.wg.Done()
 
-	// Get original destination via SO_ORIGINAL_DST.
+	// Get original destination via SO_ORIGINAL_DST (TCP redirect/tproxy).
 	dest, err := getOriginalDst(conn)
 	if err != nil {
 		errors.LogErrorInner(context.Background(), err, "inbound failed to get original dest")
@@ -88,15 +117,8 @@ func (l *Listener) handleConn(conn net.Conn) {
 		return
 	}
 
-	// If sniffing is enabled, the dispatcher will sniff and possibly override
-	// the destination address.
-	d := l.dispatcher
-	if l.cfg.Sniffing {
-		d = l.dispatcher // dispatcher already has sniffer if configured
-	}
-
 	// Dispatch blocks until the connection is fully proxied.
-	if err := d.Dispatch(l.ctx, conn, dest); err != nil {
+	if err := l.dispatcher.Dispatch(l.ctx, conn, dest); err != nil {
 		errors.LogErrorInner(context.Background(), err, "inbound dispatch failed for ", dest.String())
 	}
 }

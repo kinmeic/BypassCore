@@ -21,7 +21,7 @@ type Config struct {
 	// Port is the listen port (e.g. 12345, the tproxy/redirect target).
 	Port int `json:"port"`
 	// Network is the protocol: "tcp", "udp", or "tcp,udp".
-	// UDP tproxy is not yet implemented; only "tcp" is supported.
+	// TCP uses REDIRECT/SO_ORIGINAL_DST; UDP uses TPROXY (IP_TRANSPARENT).
 	Network string `json:"network"`
 	// Sniffing enables TLS/HTTP domain sniffing to override the destination
 	// address with the sniffed domain.
