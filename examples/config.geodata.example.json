@@ -1,0 +1,26 @@
+{
+  "_comment": "GeoData 变体：需要 geoip.dat/geosite.dat (见 examples/README.md)。未提供 geodata 时此配置无法加载。",
+  "outbounds": [
+    {"tag": "direct", "mode": "freedom"},
+    {"tag": "block",  "mode": "blackhole"},
+    {
+      "tag": "wan1",
+      "mode": "freedom",
+      "bind": {"interface": "en0", "localIP": "192.168.1.2"}
+    },
+    {
+      "tag": "proxy",
+      "mode": "proxy",
+      "upstream": {"protocol": "trojan", "server": "example.com:443"}
+    }
+  ],
+  "routing": {
+    "domainStrategy": "IpIfNonMatch",
+    "rules": [
+      {"domain": ["geosite:category-ads-all"], "outboundTag": "block"},
+      {"domain": ["geosite:google"], "outboundTag": "proxy"},
+      {"domain": ["geosite:cn"], "outboundTag": "wan1"},
+      {"ip":     ["geoip:private", "geoip:cn"], "outboundTag": "wan1"}
+    ]
+  }
+}

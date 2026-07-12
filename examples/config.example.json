@@ -1,0 +1,52 @@
+{
+  "outbounds": [
+    {"tag": "direct", "mode": "freedom"},
+    {"tag": "block",  "mode": "blackhole"},
+    {
+      "tag": "wan1",
+      "mode": "freedom",
+      "bind": {"interface": "en0", "localIP": "192.168.1.2"}
+    },
+    {
+      "tag": "wan2",
+      "mode": "freedom",
+      "bind": {"interface": "en1", "localIP": "192.168.2.2"}
+    },
+    {
+      "tag": "proxy",
+      "mode": "proxy",
+      "upstream": {
+        "protocol": "trojan",
+        "server": "example.com:443",
+        "settings": {"password": "secret"}
+      }
+    }
+  ],
+  "dns": {
+    "servers": [
+      {"address": "https://223.5.5.5/dns-query", "domains": ["domain:cn"], "tag": "cn-doh"},
+      {"address": "tls://1.1.1.1:853", "tag": "cloudflare-dot"},
+      "localhost"
+    ],
+    "hosts": {
+      "local.test": "127.0.0.1",
+      "alias.test": "local.test"
+    },
+    "queryStrategy": "UseIP",
+    "disableCache": false
+  },
+  "routing": {
+    "domainStrategy": "IpIfNonMatch",
+    "rules": [
+      {"domain": ["domain:baidu.com", "domain:qq.com", "domain:taobao.com"], "outboundTag": "wan1"},
+      {"ip": ["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"], "outboundTag": "wan1"},
+      {"port": "80,443", "outboundTag": "proxy"}
+    ]
+  },
+  "observatory": {
+    "subject_selector": ["wan"],
+    "probe_url": "https://www.gstatic.com/generate_204",
+    "probe_interval": 10000000000,
+    "enable_concurrency": true
+  }
+}

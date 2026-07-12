@@ -1,0 +1,27 @@
+# Binaries
+bin/
+/bypasscore$
+*.exe
+
+# Geodata files (too large for repo)
+geoip.dat
+geosite.dat
+
+# Editor/OS
+.DS_Store
+*.swp
+*.swo
+*~
+
+# IDE
+.idea/
+.vscode/
+
+# Go
+*.test
+*.out
+vendor/
+
+# ZCode session artifacts
+.zcode/
+/bypasscore

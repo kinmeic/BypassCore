@@ -1,0 +1,174 @@
+package dns
+
+import (
+	"bytes"
+	"context"
+	"crypto/tls"
+	"fmt"
+	"io"
+	"math/rand"
+	"net/http"
+	"net/url"
+	"time"
+
+	"github.com/eugene/bypasscore/common/errors"
+	bcnet "github.com/eugene/bypasscore/common/net"
+	"github.com/eugene/bypasscore/common/log"
+	dns_feature "github.com/eugene/bypasscore/features/dns"
+)
+
+// DoHNameServer implements DNS over HTTPS (RFC 8484) wire format using the
+// standard library net/http client with crypto/tls. The fingerprinting (utls)
+// and routed-HTTP paths of the original are dropped: queries go out directly.
+type DoHNameServer struct {
+	cacheController *CacheController
+	httpClient      *http.Client
+	dohURL          string
+	clientIP        bcnet.IP
+}
+
+// NewDoHNameServer creates a DoH client. h2c selects HTTP/2 cleartext (unused
+// by callers currently but kept for parity). The `dispatcher`/`h2c` arguments
+// from the original are dropped — BypassCore only supports local direct mode.
+func NewDoHNameServer(u *url.URL, _ bool, disableCache bool, serveStale bool, serveExpiredTTL uint32, clientIP bcnet.IP) *DoHNameServer {
+	u.Scheme = "https"
+	mode := "DOH"
+	errors.LogInfo(context.Background(), "DNS: created ", mode, " client for ", u.String())
+	s := &DoHNameServer{
+		cacheController: NewCacheController(mode+"//"+u.Host, disableCache, serveStale, serveExpiredTTL),
+		dohURL:          u.String(),
+		clientIP:        clientIP,
+	}
+	transport := &http.Transport{
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          4,
+		IdleConnTimeout:       bcnet.ConnIdleTimeout,
+		ResponseHeaderTimeout: 5 * time.Second,
+		TLSClientConfig: &tls.Config{
+			ServerName: u.Hostname(),
+			MinVersion: tls.VersionTLS12,
+		},
+	}
+	s.httpClient = &http.Client{Transport: transport, Timeout: 8 * time.Second}
+	return s
+}
+
+// Name implements Server.
+func (s *DoHNameServer) Name() string { return s.cacheController.name }
+
+// IsDisableCache implements Server.
+func (s *DoHNameServer) IsDisableCache() bool { return s.cacheController.disableCache }
+
+// DoH ignores reqID (server returns it in the response body).
+func (s *DoHNameServer) newReqID() uint16 { return 0 }
+
+// getCacheController implements CachedNameserver.
+func (s *DoHNameServer) getCacheController() *CacheController { return s.cacheController }
+
+// sendQuery implements CachedNameserver.
+func (s *DoHNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- error, fqdn string, option dns_feature.IPOption) {
+	errors.LogInfo(ctx, s.Name(), " querying: ", fqdn)
+
+	// Random EDNS0 padding to obscure traffic patterns (RFC 8467 best effort).
+	reqs, err := buildReqMsgs(fqdn, option, s.newReqID, genEDNS0Options(s.clientIP, randBetween(100, 300)))
+	if err != nil {
+		errors.LogErrorInner(ctx, err, "failed to build dns query for ", fqdn)
+		if noResponseErrCh != nil {
+			if option.IPv4Enable {
+				noResponseErrCh <- err
+			}
+			if option.IPv6Enable {
+				noResponseErrCh <- err
+			}
+		}
+		return
+	}
+
+	var deadline time.Time
+	if d, ok := ctx.Deadline(); ok {
+		deadline = d
+	} else {
+		deadline = time.Now().Add(5 * time.Second)
+	}
+
+	for _, req := range reqs {
+		go func(r *dnsRequest) {
+			dnsCtx, cancel := context.WithDeadline(ctx, deadline)
+			defer cancel()
+
+			b, err := packMessage(r.msg)
+			if err != nil {
+				errors.LogErrorInner(ctx, err, "failed to pack dns query for ", fqdn)
+				if noResponseErrCh != nil {
+					noResponseErrCh <- err
+				}
+				return
+			}
+			resp, err := s.dohHTTPSContext(dnsCtx, b)
+			if err != nil {
+				errors.LogErrorInner(ctx, err, "failed to retrieve response for ", fqdn)
+				if noResponseErrCh != nil {
+					noResponseErrCh <- err
+				}
+				return
+			}
+			rec, err := parseResponse(resp)
+			if err != nil {
+				errors.LogErrorInner(ctx, err, "failed to handle DOH response for ", fqdn)
+				if noResponseErrCh != nil {
+					noResponseErrCh <- err
+				}
+				return
+			}
+			log.Record(&log.DNSLog{Server: s.Name(), Domain: fqdn, Result: rec.IP, Status: log.DNSQueried})
+			s.cacheController.updateRecord(r, rec)
+		}(req)
+	}
+}
+
+// dohHTTPSContext issues a RFC 8484 binary POST and returns the raw response body.
+func (s *DoHNameServer) dohHTTPSContext(ctx context.Context, b []byte) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", s.dohURL, bytes.NewReader(b))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/dns-message")
+	req.Header.Set("Content-Type", "application/dns-message")
+	req.Header.Set("User-Agent", "BypassCore")
+	req.Header.Set("X-Padding", randomPadding(100, 1000))
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return nil, fmt.Errorf("DOH server returned code %d", resp.StatusCode)
+	}
+	return io.ReadAll(resp.Body)
+}
+
+// QueryIP implements Server.
+func (s *DoHNameServer) QueryIP(ctx context.Context, domain string, option dns_feature.IPOption) ([]bcnet.IP, uint32, error) {
+	return queryIP(ctx, s, domain, option)
+}
+
+// randBetween returns a random int in [lo, hi).
+func randBetween(lo, hi int) int {
+	if hi <= lo {
+		return lo
+	}
+	return lo + rand.Intn(hi-lo)
+}
+
+// randomPadding returns a base62-like random padding string of length in [lo, hi).
+func randomPadding(lo, hi int) string {
+	const letters = "0123123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	n := randBetween(lo, hi)
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = letters[rand.Intn(len(letters))]
+	}
+	return string(b)
+}

@@ -1,0 +1,126 @@
+// Package task provides simple concurrency helpers: a periodic runner and a
+// parallel error-collecting runner.
+package task
+
+import (
+	"context"
+	"sync"
+	"time"
+)
+
+// Periodic runs Execute at the given Interval until Close is called.
+type Periodic struct {
+	// Interval of the task being run.
+	Interval time.Duration
+	// Execute is the task function.
+	Execute func() error
+
+	access  sync.Mutex
+	timer   *time.Timer
+	running bool
+}
+
+func (t *Periodic) hasClosed() bool {
+	t.access.Lock()
+	defer t.access.Unlock()
+	return !t.running
+}
+
+func (t *Periodic) checkedExecute() error {
+	if t.hasClosed() {
+		return nil
+	}
+	if err := t.Execute(); err != nil {
+		t.access.Lock()
+		t.running = false
+		t.access.Unlock()
+		return err
+	}
+	t.access.Lock()
+	defer t.access.Unlock()
+	if !t.running {
+		return nil
+	}
+	t.timer = time.AfterFunc(t.Interval, func() {
+		_ = t.checkedExecute()
+	})
+	return nil
+}
+
+// Start begins the periodic execution.
+func (t *Periodic) Start() error {
+	t.access.Lock()
+	if t.running {
+		t.access.Unlock()
+		return nil
+	}
+	t.running = true
+	t.access.Unlock()
+
+	if err := t.checkedExecute(); err != nil {
+		t.access.Lock()
+		t.running = false
+		t.access.Unlock()
+		return err
+	}
+	return nil
+}
+
+// Close stops the periodic execution.
+func (t *Periodic) Close() error {
+	t.access.Lock()
+	defer t.access.Unlock()
+	t.running = false
+	if t.timer != nil {
+		t.timer.Stop()
+		t.timer = nil
+	}
+	return nil
+}
+
+// OnSuccess executes g() after f() returns nil.
+func OnSuccess(f func() error, g func() error) func() error {
+	return func() error {
+		if err := f(); err != nil {
+			return err
+		}
+		return g()
+	}
+}
+
+// Run executes tasks in parallel and returns the first error encountered, or
+// nil if all succeed. It uses a buffered channel as a semaphore.
+func Run(ctx context.Context, tasks ...func() error) error {
+	n := len(tasks)
+	sem := make(chan struct{}, n)
+	for i := 0; i < n; i++ {
+		sem <- struct{}{}
+	}
+	done := make(chan error, 1)
+
+	for _, task := range tasks {
+		<-sem
+		go func(f func() error) {
+			err := f()
+			if err == nil {
+				sem <- struct{}{}
+				return
+			}
+			select {
+			case done <- err:
+			default:
+			}
+		}(task)
+	}
+
+	for i := 0; i < n; i++ {
+		select {
+		case err := <-done:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-sem:
+		}
+	}
+	return nil
+}
