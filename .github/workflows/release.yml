@@ -47,9 +47,20 @@ jobs:
           upx --best --lzma dist/bypasscore-openwrt-x86_64
           upx --best --lzma dist/bypasscore-openwrt-aarch64_cortex-a53
 
-          # Package each binary
+      - name: Build OpenWrt .ipk + .apk installable packages
+        run: |
+          # Version from the tag name (strip leading 'v'); e.g. v1.0.2 -> 1.0.2
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist/pkgout
+
+          scripts/package-openwrt.sh dist/bypasscore-openwrt-x86_64                x86_64                "$VERSION" dist/pkgout
+          scripts/package-openwrt.sh dist/bypasscore-openwrt-aarch64_cortex-a53   aarch64_cortex-a53    "$VERSION" dist/pkgout
+
+      - name: Package each binary
+        run: |
           cd dist
           for f in bypasscore-*; do
+            [ -f "$f" ] || continue
             tar -czf "$f.tar.gz" "$f"
             echo "✓ $f.tar.gz ($(du -h "$f.tar.gz" | cut -f1)) — binary $(du -h "$f" | cut -f1)"
           done
@@ -57,5 +68,8 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.tar.gz
+          files: |
+            dist/*.tar.gz
+            dist/pkgout/*.ipk
+            dist/pkgout/*.apk
           generate_release_notes: true

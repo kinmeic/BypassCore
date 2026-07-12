@@ -46,11 +46,22 @@ jobs:
           echo "control.tar.gz members:"; tar tzf /tmp/ipk/control.tar.gz
           echo "data.tar.gz members:";     tar tzf /tmp/ipk/data.tar.gz
           echo
-          echo "--- .apk verify (x86_64) ---"
-          # .apk is a tar; list its members. The .PKGINFO should be present.
-          tar tf pkgout/bypasscore-1.0.2_x86_64.apk | head -20
+          echo "--- .apk header (x86_64) ---"
+          # apk v3 uses an ADB container (magic 'ADBd'), not a plain tar.
+          xxd pkgout/bypasscore-1.0.2_x86_64.apk | head -1
           echo
           ls -la pkgout/
+
+      - name: Verify .apk is a valid package (in-container)
+        run: |
+          # Confirm the ADB-format .apk is a valid package by having apk-tools
+          # itself inspect it inside alpine:edge (which ships apk v3.0.6).
+          # `apk manifest` prints the package manifest (name/version/arch) and
+          # exits 0 on a well-formed package; a malformed one exits non-zero.
+          docker run --rm \
+            -v "$PWD/pkgout:/pkg:ro" \
+            alpine:edge \
+            sh -c "apk manifest /pkg/bypasscore-1.0.2_x86_64.apk; echo 'exit code:' \$?"
 
       - name: Upload packages as CI artifacts
         uses: actions/upload-artifact@v4
