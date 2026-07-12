@@ -32,23 +32,23 @@ jobs:
       - name: Package x86_64 (.ipk + .apk)
         run: |
           mkdir -p pkgout
-          scripts/package-openwrt.sh dist/bypasscore-openwrt-x86_64 x86_64 1.0.2-dev pkgout
+          scripts/package-openwrt.sh dist/bypasscore-openwrt-x86_64 x86_64 1.0.2 pkgout
 
       - name: Package aarch64_cortex-a53 (.ipk + .apk)
         run: |
-          scripts/package-openwrt.sh dist/bypasscore-openwrt-aarch64_cortex-a53 aarch64_cortex-a53 1.0.2-dev pkgout
+          scripts/package-openwrt.sh dist/bypasscore-openwrt-aarch64_cortex-a53 aarch64_cortex-a53 1.0.2 pkgout
 
       - name: Verify packages are well-formed
         run: |
           echo "--- .ipk contents (x86_64) ---"
-          mkdir -p /tmp/ipk && tar xzf pkgout/bypasscore_1.0.2-dev_x86_64.ipk -C /tmp/ipk
+          mkdir -p /tmp/ipk && tar xzf pkgout/bypasscore_1.0.2_x86_64.ipk -C /tmp/ipk
           echo "debian-binary: $(cat /tmp/ipk/debian-binary)"
           echo "control.tar.gz members:"; tar tzf /tmp/ipk/control.tar.gz
           echo "data.tar.gz members:";     tar tzf /tmp/ipk/data.tar.gz
           echo
           echo "--- .apk verify (x86_64) ---"
           # .apk is a tar; list its members. The .PKGINFO should be present.
-          tar tf pkgout/bypasscore-1.0.2-dev_x86_64.apk | head -20
+          tar tf pkgout/bypasscore-1.0.2_x86_64.apk | head -20
           echo
           ls -la pkgout/
 

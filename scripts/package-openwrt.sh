@@ -6,6 +6,8 @@
 #   <binary>       path to the static linux binary (e.g. dist/bypasscore-openwrt-x86_64)
 #   <openwrt-arch> OpenWrt architecture (e.g. x86_64, aarch64_cortex-a53)
 #   <version>      package version without leading 'v' (e.g. 1.0.2)
+#                  — apk requires an r-suffix revision; this script appends '-r0'
+#                    to the apk metadata automatically when none is present.
 #   <dest-dir>     output directory
 #
 # Produces:
@@ -86,17 +88,23 @@ echo "    ✓ $(basename "$ipk_out") ($(du -h "$ipk_out" | cut -f1))"
 echo ">>> Building .apk for $owrt_arch ..."
 apk_out="$dest/${pkg_name}-${version}_${owrt_arch}.apk"
 
+# apk v3 requires a revision suffix (-rN). Append -r0 if the version lacks one.
+apk_version="$version"
+case "$apk_version" in
+    *-r[0-9]*) ;;  # already has a revision
+    *) apk_version="${apk_version}-r0" ;;
+esac
+
 # Run apk mkpkg in alpine:edge, mounting the rootfs + dest as a shared volume.
 # --info supplies the .PKGINFO fields; --files is the payload tree.
 docker run --rm \
     -v "$rootfs:/pkg:ro" \
     -v "$dest:/out" \
     alpine:edge \
-    sh -c "apk add --no-cache apk-tools >/dev/null 2>&1; \
-           apk mkpkg \
+    sh -c "apk mkpkg \
              --output /out/$(basename "$apk_out") \
              --info name:$pkg_name \
-             --info version:$version \
+             --info version:$apk_version \
              --info arch:$owrt_arch \
              --info description:'$description' \
              --info license:MIT \
