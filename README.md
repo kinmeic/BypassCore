@@ -14,13 +14,23 @@
 
 ## outbound 目标模型
 
-每个 outbound 是带完整绑定元数据的配置描述符：
+每个 outbound 是带完整绑定元数据的配置描述符。`mode` 决定流量如何承载，`bind` 决定从哪个接口/IP 发出，`upstream` 指定上游代理服务器：
 
-| Mode | 含义 | 典型场景 |
-|---|---|---|
-| `freedom` | 直连 | 本机直出，可绑定接口/IP 实现 wan1/wan2 |
-| `blackhole` | 丢弃 | 阻断 |
-| `proxy` | 经上游代理 | trojan/vless/socks 等服务器 |
+| Mode | bind | upstream | 含义 | 典型场景 |
+|---|---|---|---|---|
+| `freedom` | — | — | 直连 | 本机直出（`direct`） |
+| `freedom` | ✅ interface + localIP | — | 绑定接口直连 | **多 WAN 分流（wan1/wan2）** |
+| `blackhole` | — | — | 丢弃 | 阻断 |
+| `proxy` | — | ✅ protocol + server | 经上游代理 | trojan/vless/socks 等服务器 |
+
+`bind` 字段示例：
+```json
+{"tag": "wan1", "mode": "freedom", "bind": {"interface": "en0", "localIP": "192.168.1.2"}}
+```
+- `interface`：网络接口名（如 `en0`、`wan1`）—— L3 接口绑定
+- `localIP`：源 IP（相当于 sendThrough）—— 从指定本地 IP 拨号
+
+**wan1/wan2 就是一等公民**：它们是带 `bind` 绑定的 freedom outbound，路由规则和 balancer 都能引用它们，实现多 WAN 分流。
 
 引擎只输出 tag 字符串，上层（客户端/网关/TUN）查 outbound 表后各自解释绑定语义 —— 这就是"通用规则引擎"。
 
