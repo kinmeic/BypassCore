@@ -1,6 +1,6 @@
-// BypassCore CLI: load routing config, then either test a routing decision
-// (-test "tcp:host:port"), resolve a domain via the DNS subsystem
-// (-resolve "example.com"), or run an observatory probe round (-observe).
+// BypassCore CLI: load config, then either test a routing decision
+// (-test "tcp:host:port"), resolve a domain (-resolve "domain"), run an
+// observatory probe (-observe), or run as a daemon (-run).
 package main
 
 import (
@@ -9,9 +9,14 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
+	"github.com/eugene/bypasscore/app/dispatcher"
 	appdns "github.com/eugene/bypasscore/app/dns"
+	"github.com/eugene/bypasscore/app/dialer"
+	appinbound "github.com/eugene/bypasscore/app/inbound"
 	appoutbound "github.com/eugene/bypasscore/app/outbound"
 	"github.com/eugene/bypasscore/app/observatory"
 	"github.com/eugene/bypasscore/app/router"
@@ -22,21 +27,25 @@ import (
 	featdns "github.com/eugene/bypasscore/features/dns"
 	routingsession "github.com/eugene/bypasscore/features/routing/session"
 	"github.com/eugene/bypasscore/infra/conf"
+	"github.com/eugene/bypasscore/proxy/blackhole"
+	"github.com/eugene/bypasscore/proxy/freedom"
 )
 
-// Config is the top-level BypassCore config (outbounds + routing + dns).
+// Config is the top-level BypassCore config (outbounds + routing + dns + inbounds).
 type Config struct {
 	Outbounds   []*appoutbound.Outbound `json:"outbounds"`
 	Routing     conf.RouterConfig       `json:"routing"`
 	DNS         *conf.DNSConfig         `json:"dns"`
+	Inbounds    []*appinbound.Config    `json:"inbounds"`
 	Observatory *observatory.Config     `json:"observatory"`
 }
 
 func main() {
 	configPath := flag.String("config", "examples/config.example.json", "path to config file")
-	testDest := flag.String("test", "", `test a routing decision, e.g. "tcp:www.google.com:443" or "udp:8.8.8.8:53"`)
-	resolve := flag.String("resolve", "", `resolve a domain via the configured DNS subsystem, e.g. "example.com"`)
-	observe := flag.Bool("observe", false, "run a single observatory probe round and print results")
+	testDest := flag.String("test", "", `test a routing decision, e.g. "tcp:www.google.com:443"`)
+	resolve := flag.String("resolve", "", `resolve a domain via DNS, e.g. "example.com"`)
+	observe := flag.Bool("observe", false, "run a single observatory probe round")
+	runMode := flag.Bool("run", false, "run as a daemon (listen + dispatch)")
 	flag.Parse()
 
 	cfg, err := loadConfig(*configPath)
@@ -97,7 +106,34 @@ func main() {
 		fail("init router: ", err)
 	}
 
+	// Register the dialer factory so outbound.Manager can produce freedom/blackhole
+	// dialers from the descriptor table.
+	appoutbound.SetDialerFactory(func(ob *appoutbound.Outbound) dialer.Dialer {
+		bindIP := ""
+		bindIface := ""
+		if ob.Bind != nil {
+			bindIP = ob.Bind.LocalIP
+			bindIface = ob.Bind.Interface
+		}
+		switch ob.Mode {
+		case appoutbound.ModeBlackhole:
+			return blackhole.New(ob.Tag)
+		case appoutbound.ModeFreedom:
+			return freedom.New(ob.Tag, bindIP, bindIface)
+		case appoutbound.ModeProxy:
+			// Proxy mode is not yet supported as a dialer (would need a protocol
+			// implementation). Return a blackhole as a safe fallback.
+			return blackhole.New(ob.Tag)
+		default:
+			return freedom.New(ob.Tag, bindIP, bindIface)
+		}
+	})
+
 	switch {
+	case *runMode:
+		if err := runDaemon(r, ohm, cfg.Inbounds, baseCtx); err != nil {
+			fail("run: ", err)
+		}
 	case *resolve != "":
 		if err := runResolve(dnsClient, *resolve); err != nil {
 			fail("resolve: ", err)
@@ -240,4 +276,54 @@ func repeat(s string, n int) string {
 func fail(msg ...interface{}) {
 	fmt.Fprintln(os.Stderr, "error:", fmt.Sprint(msg...))
 	os.Exit(1)
+}
+
+// runDaemon starts all inbound listeners and blocks until a signal is received.
+// This is the "bypasscore run -c config.json" mode: the process stays alive
+// as a transparent proxy, accepting tproxy/redirect connections and routing
+// them via the router to outbound handlers.
+func runDaemon(r *router.Router, ohm *appoutbound.Manager, inbounds []*appinbound.Config, baseCtx context.Context) error {
+	// Build the sniffer (enabled if any inbound has sniffing=true).
+	sniffEnabled := false
+	for _, ib := range inbounds {
+		if ib.Sniffing {
+			sniffEnabled = true
+			break
+		}
+	}
+	sniffer := dispatcher.NewSniffer(sniffEnabled)
+
+	// Build the dispatcher (data-plane hub).
+	d := dispatcher.New(r, ohm, sniffer)
+
+	// Start all inbound listeners.
+	var listeners []*appinbound.Listener
+	for _, ibCfg := range inbounds {
+		ln := appinbound.New(ibCfg, d)
+		if err := ln.Start(); err != nil {
+			// Close already-started listeners before failing.
+			for _, l := range listeners {
+				_ = l.Close()
+			}
+			return errors.New("failed to start inbound ", ibCfg.Tag).Base(err)
+		}
+		listeners = append(listeners, ln)
+	}
+
+	if len(listeners) == 0 {
+		return errors.New("no inbounds configured; nothing to listen on")
+	}
+
+	fmt.Printf("BypassCore running with %d inbound(s). Ctrl+C to stop.\n", len(listeners))
+
+	// Block until SIGINT or SIGTERM.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	<-sigCh
+
+	fmt.Println("\nShutting down...")
+	for _, ln := range listeners {
+		_ = ln.Close()
+	}
+	return nil
 }

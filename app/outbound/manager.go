@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/eugene/bypasscore/app/dialer"
 	"github.com/eugene/bypasscore/common/errors"
 	featoutbound "github.com/eugene/bypasscore/features/outbound"
 )
@@ -191,4 +192,34 @@ func (m *Manager) RemoveHandler(_ context.Context, tag string) error {
 		}
 	}
 	return nil
+}
+
+
+// GetDialer returns the Dialer for the given outbound tag, or nil.
+func (m *Manager) GetDialer(tag string) dialer.Dialer {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	h, ok := m.handlers[tag]
+	if !ok {
+		return nil
+	}
+	return dialerFactory(h.ob)
+}
+
+// GetDefaultDialer returns the dialer for the first registered outbound.
+func (m *Manager) GetDefaultDialer() dialer.Dialer {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if len(m.order) == 0 {
+		return nil
+	}
+	return dialerFactory(m.handlers[m.order[0]].ob)
+}
+
+// dialerFactory converts an outbound descriptor to a Dialer.
+var dialerFactory = func(ob *Outbound) dialer.Dialer { return nil }
+
+// SetDialerFactory registers the dialer factory. Called once at CLI startup.
+func SetDialerFactory(f func(ob *Outbound) dialer.Dialer) {
+	dialerFactory = f
 }

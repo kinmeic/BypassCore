@@ -22,6 +22,16 @@
       }
     }
   ],
+  "inbounds": [
+    {
+      "tag": "tcp_redir",
+      "type": "redirect",
+      "listen": "0.0.0.0",
+      "port": 12345,
+      "network": "tcp",
+      "sniffing": true
+    }
+  ],
   "dns": {
     "servers": [
       {"address": "https://223.5.5.5/dns-query", "domains": ["domain:cn"], "tag": "cn-doh"},
