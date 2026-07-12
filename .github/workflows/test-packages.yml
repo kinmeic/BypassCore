@@ -1,0 +1,59 @@
+name: Test OpenWrt packages
+
+# Dry-run: build .ipk and .apk packages on push to main and upload them as CI
+# artifacts (NOT a release). Lets us verify the packages are well-formed before
+# wiring them into the real Release workflow.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/ipkg-build'
+      - 'scripts/package-openwrt.sh'
+      - '.github/workflows/test-packages.yml'
+  workflow_dispatch:
+
+jobs:
+  build-packages:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Build static binaries for both OpenWrt archs
+        run: |
+          mkdir -p dist
+          LDFLAGS="-s -w"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOAMD64=v1 go build -ldflags="$LDFLAGS" -o dist/bypasscore-openwrt-x86_64             ./cmd/bypasscore
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64              go build -ldflags="$LDFLAGS" -o dist/bypasscore-openwrt-aarch64_cortex-a53 ./cmd/bypasscore
+
+      - name: Package x86_64 (.ipk + .apk)
+        run: |
+          mkdir -p pkgout
+          scripts/package-openwrt.sh dist/bypasscore-openwrt-x86_64 x86_64 1.0.2-dev pkgout
+
+      - name: Package aarch64_cortex-a53 (.ipk + .apk)
+        run: |
+          scripts/package-openwrt.sh dist/bypasscore-openwrt-aarch64_cortex-a53 aarch64_cortex-a53 1.0.2-dev pkgout
+
+      - name: Verify packages are well-formed
+        run: |
+          echo "--- .ipk contents (x86_64) ---"
+          mkdir -p /tmp/ipk && tar xzf pkgout/bypasscore_1.0.2-dev_x86_64.ipk -C /tmp/ipk
+          echo "debian-binary: $(cat /tmp/ipk/debian-binary)"
+          echo "control.tar.gz members:"; tar tzf /tmp/ipk/control.tar.gz
+          echo "data.tar.gz members:";     tar tzf /tmp/ipk/data.tar.gz
+          echo
+          echo "--- .apk verify (x86_64) ---"
+          # .apk is a tar; list its members. The .PKGINFO should be present.
+          tar tf pkgout/bypasscore-1.0.2-dev_x86_64.apk | head -20
+          echo
+          ls -la pkgout/
+
+      - name: Upload packages as CI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-packages
+          path: pkgout/*
