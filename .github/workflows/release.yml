@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Build all targets
+        run: |
+          mkdir -p dist
+          LDFLAGS="-s -w"
+
+          # linux x86_64
+          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 GOAMD64=v1 go build -ldflags="$LDFLAGS" -o dist/bypasscore-linux-x86_64                 ./cmd/bypasscore
+
+          # darwin arm64
+          CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64               go build -ldflags="$LDFLAGS" -o dist/bypasscore-darwin-arm64                ./cmd/bypasscore
+
+          # darwin x86_64
+          CGO_ENABLED=0 GOOS=darwin  GOARCH=amd64 GOAMD64=v1   go build -ldflags="$LDFLAGS" -o dist/bypasscore-darwin-x86_64               ./cmd/bypasscore
+
+          # openwrt x86_64 (static, musl-compatible)
+          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 GOAMD64=v1   go build -ldflags="$LDFLAGS" -o dist/bypasscore-openwrt-x86_64             ./cmd/bypasscore
+
+          # openwrt aarch64_cortex-a53 (ARMv8-A)
+          CGO_ENABLED=0 GOOS=linux   GOARCH=arm64              go build -ldflags="$LDFLAGS" -o dist/bypasscore-openwrt-aarch64_cortex-a53 ./cmd/bypasscore
+
+          # Package each binary
+          cd dist
+          for f in bypasscore-*; do
+            tar -czf "$f.tar.gz" "$f"
+            echo "✓ $f.tar.gz ($(du -h "$f.tar.gz" | cut -f1))"
+          done
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
+          generate_release_notes: true
