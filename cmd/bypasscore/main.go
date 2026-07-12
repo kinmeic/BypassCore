@@ -29,6 +29,7 @@ import (
 	"github.com/eugene/bypasscore/infra/conf"
 	"github.com/eugene/bypasscore/proxy/blackhole"
 	"github.com/eugene/bypasscore/proxy/freedom"
+	"github.com/eugene/bypasscore/proxy/socks"
 )
 
 // Config is the top-level BypassCore config (outbounds + routing + dns + inbounds).
@@ -121,9 +122,11 @@ func main() {
 		case appoutbound.ModeFreedom:
 			return freedom.New(ob.Tag, bindIP, bindIface)
 		case appoutbound.ModeProxy:
-			// Proxy mode is not yet supported as a dialer (would need a protocol
-			// implementation). Return a blackhole as a safe fallback.
-			return blackhole.New(ob.Tag)
+			// Proxy mode: dial to upstream SOCKS5 server (e.g. naiveproxy local socks).
+			if ob.Upstream == nil || ob.Upstream.Server == "" {
+				return blackhole.New(ob.Tag)
+			}
+			return socks.NewFromSettings(ob.Tag, ob.Upstream.Server, ob.Upstream.Settings)
 		default:
 			return freedom.New(ob.Tag, bindIP, bindIface)
 		}
