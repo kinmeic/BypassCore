@@ -19,6 +19,10 @@ jobs:
         with:
           go-version: '1.26'
 
+      - name: Install UPX
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq upx
+
       - name: Build all targets
         run: |
           mkdir -p dist
@@ -39,11 +43,15 @@ jobs:
           # openwrt aarch64_cortex-a53 (ARMv8-A)
           CGO_ENABLED=0 GOOS=linux   GOARCH=arm64              go build -ldflags="$LDFLAGS" -o dist/bypasscore-openwrt-aarch64_cortex-a53 ./cmd/bypasscore
 
+          # UPX compress OpenWrt binaries only (saves ~60% on flash-constrained devices)
+          upx --best --lzma dist/bypasscore-openwrt-x86_64
+          upx --best --lzma dist/bypasscore-openwrt-aarch64_cortex-a53
+
           # Package each binary
           cd dist
           for f in bypasscore-*; do
             tar -czf "$f.tar.gz" "$f"
-            echo "✓ $f.tar.gz ($(du -h "$f.tar.gz" | cut -f1))"
+            echo "✓ $f.tar.gz ($(du -h "$f.tar.gz" | cut -f1)) — binary $(du -h "$f" | cut -f1)"
           done
 
       - name: Create GitHub release
