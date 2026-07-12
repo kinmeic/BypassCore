@@ -24,7 +24,7 @@ type Router struct {
 	ctx        context.Context
 	ohm        outbound.Manager
 	dispatcher routing.Dispatcher
-	mu         sync.Mutex
+	mu         sync.RWMutex
 }
 
 // Route is an implementation of routing.Route.
@@ -92,6 +92,11 @@ func (r *Router) Init(ctx context.Context, config *Config, d dns.Client, ohm out
 }
 
 // PickRoute implements routing.Router.
+//
+// It is safe to call concurrently with other PickRoute calls and with
+// ReloadRules/RemoveRule: the rules slice is snapshotted under a read lock and
+// then evaluated without the lock held, so rule application (which may perform
+// blocking DNS resolution) never blocks rule mutations.
 func (r *Router) PickRoute(ctx routing.Context) (routing.Route, error) {
 	originalCtx := ctx
 	rule, ctx, err := r.pickRouteInternal(ctx)
@@ -197,6 +202,11 @@ func (r *Router) ReloadRules(config *Config, shouldAppend bool) error {
 	return nil
 }
 
+// RuleExists reports whether a rule with the given ruleTag is registered.
+//
+// Caller-held lock: this method does not take r.mu itself, because it is
+// invoked from ReloadRules (which already holds the write lock). Callers that
+// invoke it standalone must take r.mu.RLock() to guard the read of r.rules.
 func (r *Router) RuleExists(tag string) bool {
 	if tag != "" {
 		for _, rule := range r.rules {
@@ -243,29 +253,40 @@ func (r *Router) ListRule() []routing.Route {
 }
 
 func (r *Router) pickRouteInternal(ctx routing.Context) (*Rule, routing.Context, error) {
+	// Snapshot the rule set and strategy under the read lock so concurrent
+	// ReloadRules/RemoveRule mutations cannot race with iteration. The snapshot
+	// (rule pointers are shared, but the slice header is stable) is then
+	// evaluated without the lock, allowing rule.Apply to block on DNS without
+	// holding off rule mutations.
+	r.mu.RLock()
+	rules := r.rules
+	strategy := r.domainStrategy
+	dnsClient := r.dns
+	r.mu.RUnlock()
+
 	// SkipDNSResolve is set from DNS module.
 	// the DOH remote server maybe a domain name,
 	// this prevents cycle resolving dead loop
 	skipDNSResolve := ctx.GetSkipDNSResolve()
 
-	if r.domainStrategy == Config_IpOnDemand && !skipDNSResolve {
-		ctx = routing_dns.ContextWithDNSClient(ctx, r.dns)
+	if strategy == Config_IpOnDemand && !skipDNSResolve {
+		ctx = routing_dns.ContextWithDNSClient(ctx, dnsClient)
 	}
 
-	for _, rule := range r.rules {
+	for _, rule := range rules {
 		if rule.Apply(ctx) {
 			return rule, ctx, nil
 		}
 	}
 
-	if r.domainStrategy != Config_IpIfNonMatch || len(ctx.GetTargetDomain()) == 0 || skipDNSResolve {
+	if strategy != Config_IpIfNonMatch || len(ctx.GetTargetDomain()) == 0 || skipDNSResolve {
 		return nil, ctx, common.ErrNoClue
 	}
 
-	ctx = routing_dns.ContextWithDNSClient(ctx, r.dns)
+	ctx = routing_dns.ContextWithDNSClient(ctx, dnsClient)
 
 	// Try applying rules again if we have IPs.
-	for _, rule := range r.rules {
+	for _, rule := range rules {
 		if rule.Apply(ctx) {
 			return rule, ctx, nil
 		}

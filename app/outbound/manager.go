@@ -3,6 +3,7 @@ package outbound
 import (
 	"context"
 	"strings"
+	"sync"
 
 	"github.com/eugene/bypasscore/common/errors"
 	featoutbound "github.com/eugene/bypasscore/features/outbound"
@@ -11,7 +12,14 @@ import (
 // Manager is a config-driven outbound.Manager. It is backed by the Outbound
 // descriptor table and also implements HandlerSelector so the router's balancer
 // can resolve selector prefixes to concrete tags.
+//
+// All methods are safe for concurrent use: reads take a read lock and writes
+// (Add/AddHandler/RemoveHandler) take a write lock. This matters because the
+// observatory probes outbounds via Select from a background goroutine while the
+// router/CLI may mutate the table at runtime.
 type Manager struct {
+	// mu guards handlers and order.
+	mu sync.RWMutex
 	// handlers maps tag -> wrapped descriptor.
 	handlers map[string]*handler
 	// order preserves insertion order so the first registered outbound is the
@@ -35,6 +43,8 @@ func (m *Manager) Add(ob *Outbound) {
 	if ob == nil || ob.Tag == "" {
 		return
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if _, exists := m.handlers[ob.Tag]; !exists {
 		m.order = append(m.order, ob.Tag)
 	}
@@ -43,6 +53,8 @@ func (m *Manager) Add(ob *Outbound) {
 
 // GetHandler implements features/outbound.Manager.
 func (m *Manager) GetHandler(tag string) featoutbound.Handler {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if h, ok := m.handlers[tag]; ok {
 		return h
 	}
@@ -52,6 +64,8 @@ func (m *Manager) GetHandler(tag string) featoutbound.Handler {
 // GetDefaultHandler implements features/outbound.Manager. Returns the first
 // registered outbound, or nil if none.
 func (m *Manager) GetDefaultHandler() featoutbound.Handler {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if len(m.order) == 0 {
 		return nil
 	}
@@ -60,18 +74,21 @@ func (m *Manager) GetDefaultHandler() featoutbound.Handler {
 
 // Select implements features/outbound.HandlerSelector.
 //
-// Each selector matches by tag *prefix*: a tag is selected if it equals or has
-// a dotted/underscored segment boundary after any selector. To keep things
-// simple and predictable for wan1/wan2-style grouping, a tag matches selector
-// `s` when `tag == s` or `strings.HasPrefix(tag, s)`. Duplicates are removed and
-// the original registration order is preserved.
+// Each selector matches by tag *prefix*: a tag is selected when `tag == s` or
+// `strings.HasPrefix(tag, s)`. This is a deliberate bare-prefix match (not a
+// segment-boundary match), so selector "wan" selects both "wan1" and "wan2",
+// but also "wanted" — callers should use a sufficiently specific prefix to
+// avoid unintended matches. Duplicates are removed and the original
+// registration order is preserved.
 //
 // Selectors group outbounds by a common tag prefix (e.g. selector "wan" →
 // "wan1", "wan2").
 func (m *Manager) Select(selectors []string) []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if len(selectors) == 0 {
 		// No selectors: return all tags.
-		return m.allTags()
+		return m.allTagsLocked()
 	}
 	seen := make(map[string]bool, len(m.order))
 	var result []string
@@ -90,7 +107,8 @@ func (m *Manager) Select(selectors []string) []string {
 	return result
 }
 
-func (m *Manager) allTags() []string {
+// allTagsLocked returns a copy of the order slice; caller must hold mu (read).
+func (m *Manager) allTagsLocked() []string {
 	out := make([]string, 0, len(m.order))
 	out = append(out, m.order...)
 	return out
@@ -98,13 +116,13 @@ func (m *Manager) allTags() []string {
 
 // matchSelector reports whether tag matches a single selector.
 //
-// Matches:
+// Matches by exact equality or bare string prefix:
 //   - exact equality:  "wan1" == "wan1"
-//   - prefix boundary: "wan1" matches "wan" (the remainder "1" is a continuation),
-//                       but "wan1-extra" also matches "wan1".
+//   - bare prefix:     "wan1" matches "wan"; "wanted" also matches "wan".
 //
 // A bare prefix is accepted because outbound grouping tags (wan1/wan2) are
-// conventionally constructed as `<prefix><index>`.
+// conventionally constructed as `<prefix><index>`. Callers needing tighter
+// grouping should use more specific selectors.
 func matchSelector(tag, selector string) bool {
 	if selector == "" {
 		return false
@@ -128,6 +146,8 @@ func (m *Manager) Close() error { return nil }
 
 // Validate checks the descriptor table for obvious misconfigurations.
 func (m *Manager) Validate() error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if len(m.handlers) == 0 {
 		return errors.New("no outbound configured")
 	}
@@ -146,6 +166,8 @@ func (m *Manager) AddHandler(_ context.Context, h featoutbound.Handler) error {
 		return errors.New("nil handler")
 	}
 	tag := h.Tag()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if _, exists := m.handlers[tag]; !exists {
 		m.order = append(m.order, tag)
 	}
@@ -156,6 +178,8 @@ func (m *Manager) AddHandler(_ context.Context, h featoutbound.Handler) error {
 
 // RemoveHandler removes a handler by tag.
 func (m *Manager) RemoveHandler(_ context.Context, tag string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if _, ok := m.handlers[tag]; !ok {
 		return errors.New("outbound ", tag, " not found")
 	}

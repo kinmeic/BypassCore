@@ -116,14 +116,18 @@ func (h *handler) Close() error             { return nil }
 
 // GetOutbound returns the raw descriptor for a tag, or nil.
 func (m *Manager) GetOutbound(tag string) *Outbound {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if h, ok := m.handlers[tag]; ok {
 		return h.ob
 	}
 	return nil
 }
 
-// List returns all registered outbound descriptors.
+// List returns all registered outbound descriptors in registration order.
 func (m *Manager) List() []*Outbound {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	out := make([]*Outbound, 0, len(m.order))
 	for _, tag := range m.order {
 		if h, ok := m.handlers[tag]; ok {

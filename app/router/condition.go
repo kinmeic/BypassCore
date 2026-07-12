@@ -163,16 +163,22 @@ func NewUserMatcher(users []string) *UserMatcher {
 	usersCopy := make([]string, 0, len(users))
 	patternsCopy := make([]*regexp.Regexp, 0, len(users))
 	for _, user := range users {
-		if len(user) > 0 {
-			if len(user) > 7 && strings.HasPrefix(user, "regexp:") {
-				if re, err := regexp.Compile(user[7:]); err == nil {
-					patternsCopy = append(patternsCopy, re)
-				}
-				// Items of users slice with an invalid regexp syntax are ignored.
+		if user == "" {
+			continue
+		}
+		// "regexp:<pattern>" entries compile <pattern> and match by regex.
+		// A bare "regexp:" (empty pattern) is dropped as meaningless.
+		if pattern, ok := strings.CutPrefix(user, "regexp:"); ok {
+			if pattern == "" {
 				continue
 			}
-			usersCopy = append(usersCopy, user)
+			if re, err := regexp.Compile(pattern); err == nil {
+				patternsCopy = append(patternsCopy, re)
+			}
+			// Entries with an invalid regexp pattern are ignored.
+			continue
 		}
+		usersCopy = append(usersCopy, user)
 	}
 	return &UserMatcher{
 		user:    usersCopy,

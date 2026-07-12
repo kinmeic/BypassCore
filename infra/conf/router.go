@@ -281,14 +281,13 @@ func parseFieldRule(msg json.RawMessage) (*router.RoutingRule, error) {
 	return rule, nil
 }
 
+// parseRule parses a single routing rule JSON object. parseFieldRule performs
+// the full parse including the outboundTag/balancerTag target validation, so
+// this is a thin wrapper that supplies a clearer error context.
 func parseRule(msg json.RawMessage) (*router.RoutingRule, error) {
-	rawRule := new(RouterRule)
-	if err := json.Unmarshal(msg, rawRule); err != nil {
-		return nil, errors.New("invalid router rule").Base(err)
-	}
-	fieldrule, err := parseFieldRule(msg)
+	rule, err := parseFieldRule(msg)
 	if err != nil {
 		return nil, errors.New("invalid field rule").Base(err)
 	}
-	return fieldrule, nil
+	return rule, nil
 }

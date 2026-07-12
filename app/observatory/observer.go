@@ -82,30 +82,29 @@ func (o *Observer) background() {
 			sleepTime = time.Duration(o.config.ProbeInterval)
 		}
 
+		// Probe every selected outbound (serially or concurrently), then sleep
+		// once between rounds. Previously the serial branch slept *between each
+		// probe*, so a full round took N×interval; both branches now share the
+		// same round-then-sleep cadence.
 		if !o.config.EnableConcurrency {
 			sort.Strings(outbounds)
 			for _, v := range outbounds {
 				result := o.probe(v)
 				o.updateStatusForResult(v, &result)
-				select {
-				case <-o.ctx.Done():
-					return
-				case <-time.After(sleepTime):
-				}
 			}
-			continue
+		} else {
+			var wg sync.WaitGroup
+			for _, v := range outbounds {
+				wg.Add(1)
+				go func(v string) {
+					defer wg.Done()
+					result := o.probe(v)
+					o.updateStatusForResult(v, &result)
+				}(v)
+			}
+			wg.Wait()
 		}
 
-		var wg sync.WaitGroup
-		for _, v := range outbounds {
-			wg.Add(1)
-			go func(v string) {
-				defer wg.Done()
-				result := o.probe(v)
-				o.updateStatusForResult(v, &result)
-			}(v)
-		}
-		wg.Wait()
 		select {
 		case <-o.ctx.Done():
 			return

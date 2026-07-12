@@ -6,15 +6,12 @@ import (
 	"github.com/eugene/bypasscore/common/errors"
 )
 
+// OverrideBalancer pins a balancer to always return the given target tag,
+// bypassing its strategy. Equivalent to SetOverrideTarget but kept for API
+// compatibility with callers that expect the explicit override verb.
 func (r *Router) OverrideBalancer(balancer string, target string) error {
-	var b *Balancer
-	for tag, bl := range r.balancers {
-		if tag == balancer {
-			b = bl
-			break
-		}
-	}
-	if b == nil {
+	b, found := r.balancers[balancer]
+	if !found {
 		return errors.New("balancer '", balancer, "' not found")
 	}
 	b.override.Put(target)
