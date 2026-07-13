@@ -100,3 +100,12 @@ func (s *Service) Publish(name string, message interface{}) {
 		}
 	}
 }
+
+// Close stops background cleanup and releases subscriber references.
+func (s *Service) Close() error {
+	_ = s.ctask.Close()
+	s.Lock()
+	s.subs = make(map[string][]*Subscriber)
+	s.Unlock()
+	return nil
+}

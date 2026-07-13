@@ -1,6 +1,7 @@
 package conf
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 
@@ -67,11 +68,11 @@ func (r *BalancingRule) Build() (*router.BalancingRule, error) {
 
 // StrategyLeastLoadConfig is the JSON form of the least-load strategy settings.
 type StrategyLeastLoadConfig struct {
-	Costs      []StrategyWeight `json:"costs"`
-	Baselines  []Duration       `json:"baselines"`
-	Expected   int32            `json:"expected"`
-	MaxRTT     Duration         `json:"maxRTT"`
-	Tolerance  float64          `json:"tolerance"`
+	Costs     []StrategyWeight `json:"costs"`
+	Baselines []Duration       `json:"baselines"`
+	Expected  int32            `json:"expected"`
+	MaxRTT    Duration         `json:"maxRTT"`
+	Tolerance float64          `json:"tolerance"`
 }
 
 // StrategyWeight is a single weighting entry.
@@ -130,25 +131,31 @@ type RouterConfig struct {
 	Balancers      []*BalancingRule  `json:"balancers"`
 }
 
-func (c *RouterConfig) getDomainStrategy() router.Config_DomainStrategy {
+func (c *RouterConfig) getDomainStrategy() (router.Config_DomainStrategy, error) {
 	ds := ""
 	if c.DomainStrategy != nil {
 		ds = *c.DomainStrategy
 	}
-	switch strings.ToLower(ds) {
+	switch strings.ToLower(strings.TrimSpace(ds)) {
+	case "", "asis":
+		return router.Config_AsIs, nil
 	case "ipifnonmatch":
-		return router.Config_IpIfNonMatch
+		return router.Config_IpIfNonMatch, nil
 	case "ipondemand":
-		return router.Config_IpOnDemand
+		return router.Config_IpOnDemand, nil
 	default:
-		return router.Config_AsIs
+		return router.Config_AsIs, errors.New("unknown domain strategy: " + ds)
 	}
 }
 
 // Build converts the JSON RouterConfig to a router.Config.
 func (c *RouterConfig) Build() (*router.Config, error) {
 	config := new(router.Config)
-	config.DomainStrategy = c.getDomainStrategy()
+	strategy, err := c.getDomainStrategy()
+	if err != nil {
+		return nil, err
+	}
+	config.DomainStrategy = strategy
 
 	for _, rawRule := range c.RuleList {
 		rule, err := parseRule(rawRule)
@@ -177,25 +184,27 @@ type RouterRule struct {
 func parseFieldRule(msg json.RawMessage) (*router.RoutingRule, error) {
 	type RawFieldRule struct {
 		RouterRule
-		Domain     *StringList `json:"domain"`
-		Domains    *StringList `json:"domains"`
-		IP         *StringList `json:"ip"`
-		Port       *PortList   `json:"port"`
-		Network    *NetworkList `json:"network"`
-		SourceIP   *StringList `json:"sourceIP"`
-		Source     *StringList `json:"source"`
-		SourcePort *PortList   `json:"sourcePort"`
-		User       *StringList `json:"user"`
-		VlessRoute *PortList   `json:"vlessRoute"`
-		InboundTag *StringList `json:"inboundTag"`
-		Protocols  *StringList `json:"protocol"`
+		Domain     *StringList       `json:"domain"`
+		Domains    *StringList       `json:"domains"`
+		IP         *StringList       `json:"ip"`
+		Port       *PortList         `json:"port"`
+		Network    *NetworkList      `json:"network"`
+		SourceIP   *StringList       `json:"sourceIP"`
+		Source     *StringList       `json:"source"`
+		SourcePort *PortList         `json:"sourcePort"`
+		User       *StringList       `json:"user"`
+		VlessRoute *PortList         `json:"vlessRoute"`
+		InboundTag *StringList       `json:"inboundTag"`
+		Protocols  *StringList       `json:"protocol"`
 		Attributes map[string]string `json:"attrs"`
-		LocalIP    *StringList `json:"localIP"`
-		LocalPort  *PortList   `json:"localPort"`
-		Process    *StringList `json:"process"`
+		LocalIP    *StringList       `json:"localIP"`
+		LocalPort  *PortList         `json:"localPort"`
+		Process    *StringList       `json:"process"`
 	}
 	rawFieldRule := new(RawFieldRule)
-	if err := json.Unmarshal(msg, rawFieldRule); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(msg))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(rawFieldRule); err != nil {
 		return nil, err
 	}
 
@@ -222,7 +231,7 @@ func parseFieldRule(msg json.RawMessage) (*router.RoutingRule, error) {
 		if err != nil {
 			return nil, err
 		}
-		rule.Domain = rules
+		rule.Domain = append(rule.Domain, rules...)
 	}
 	if rawFieldRule.IP != nil {
 		rules, err := geodata.ParseIPRules(*rawFieldRule.IP)

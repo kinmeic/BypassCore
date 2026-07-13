@@ -21,10 +21,12 @@ func NewSniffer(enabled bool) *Sniffer {
 	return &Sniffer{enabled: enabled}
 }
 
-// sniffTimeout is the maximum time to wait for the first bytes of a
+// sniffTimeout is the maximum total time to wait for enough bytes of a
 // connection. If the client sends nothing within this window (port scan,
 // or a server-speaks-first protocol), we give up and route by IP:port.
-const sniffTimeout = 4 * time.Second
+const sniffTimeout = 500 * time.Millisecond
+
+const maxSniffBytes = 32 * 1024
 
 // Sniff reads the first bytes of conn, recovers the sniffed domain, and
 // returns a NEW net.Conn that replays the consumed bytes before reading
@@ -34,41 +36,78 @@ const sniffTimeout = 4 * time.Second
 // If sniffing is disabled or no domain is recovered, the returned conn is
 // still the wrapped conn (so callers can always use the return value).
 func (s *Sniffer) Sniff(conn net.Conn) (net.Conn, string) {
+	wrapped, domain, _ := s.SniffMetadata(conn)
+	return wrapped, domain
+}
+
+// SniffMetadata incrementally reads a bounded prefix and returns the sniffed
+// domain and protocol. Incremental reads prevent trivial TLS/HTTP segmentation
+// from bypassing domain rules.
+func (s *Sniffer) SniffMetadata(conn net.Conn) (net.Conn, string, string) {
 	if !s.enabled {
-		return conn, ""
+		return conn, "", ""
 	}
 
-	// Set a read deadline so a port-scan or server-speaks-first protocol
-	// does not block the dispatch goroutine indefinitely.
 	_ = conn.SetReadDeadline(time.Now().Add(sniffTimeout))
-	buf := make([]byte, 4096)
-	n, err := conn.Read(buf)
-	// Clear the deadline regardless of outcome.
-	_ = conn.SetReadDeadline(time.Time{})
+	defer conn.SetReadDeadline(time.Time{})
 
-	if err != nil || n == 0 {
-		// If we read some bytes before an error (e.g. a partial read followed
-		// by EOF), still wrap them so the caller sees the same stream.
+	data := make([]byte, 0, 4096)
+	tmp := make([]byte, 4096)
+	for len(data) < maxSniffBytes {
+		n, err := conn.Read(tmp)
 		if n > 0 {
-			return &prependConn{Conn: conn, buf: buf[:n]}, ""
+			data = append(data, tmp[:n]...)
+			if domain := tls.SniffSNI(data); domain != "" {
+				return &prependConn{Conn: conn, buf: data}, domain, "tls"
+			}
+			if domain := http.SniffHost(data); domain != "" {
+				return &prependConn{Conn: conn, buf: data}, domain, "http"
+			}
+			if !sniffNeedsMore(data) {
+				break
+			}
 		}
-		return conn, ""
+		if err != nil {
+			break
+		}
 	}
-	data := buf[:n]
-
-	// Try TLS SNI first.
-	if domain := tls.SniffSNI(data); domain != "" {
-		return &prependConn{Conn: conn, buf: data}, domain
+	if len(data) == 0 {
+		return conn, "", ""
 	}
+	return &prependConn{Conn: conn, buf: data}, "", ""
+}
 
-	// Try HTTP Host.
-	if domain := http.SniffHost(data); domain != "" {
-		return &prependConn{Conn: conn, buf: data}, domain
+func sniffNeedsMore(data []byte) bool {
+	if len(data) == 0 {
+		return true
 	}
+	if data[0] == 0x16 { // TLS handshake record
+		if len(data) < 5 {
+			return true
+		}
+		recordLen := int(data[3])<<8 | int(data[4])
+		return len(data) < 5+recordLen
+	}
+	methods := []string{"GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "OPTIONS ", "CONNECT ", "PATCH "}
+	for _, method := range methods {
+		prefixLen := len(data)
+		if prefixLen > len(method) {
+			prefixLen = len(method)
+		}
+		if string(data[:prefixLen]) == method[:prefixLen] {
+			return len(data) < maxSniffBytes && !containsHeaderEnd(data)
+		}
+	}
+	return false
+}
 
-	// No domain recovered, but we consumed bytes — wrap them so the outbound
-	// still receives the full stream.
-	return &prependConn{Conn: conn, buf: data}, ""
+func containsHeaderEnd(data []byte) bool {
+	for i := 0; i+3 < len(data); i++ {
+		if data[i] == '\r' && data[i+1] == '\n' && data[i+2] == '\r' && data[i+3] == '\n' {
+			return true
+		}
+	}
+	return false
 }
 
 // prependConn wraps a net.Conn, replaying buffered bytes first on Read before

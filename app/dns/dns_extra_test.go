@@ -48,7 +48,7 @@ func TestStaticHosts_AliasDepthLimit(t *testing.T) {
 	chain := []string{"a", "b", "c", "d", "e", "f", "g"}
 	for i := 0; i < len(chain)-1; i++ {
 		mappings = append(mappings, &Config_HostMapping{
-			Domain:         mustDomainRule(t, chain[i]+".test"),
+			Domain:        mustDomainRule(t, chain[i]+".test"),
 			ProxiedDomain: chain[i+1] + ".test",
 		})
 	}
@@ -140,7 +140,7 @@ func TestStaticHosts_IPv6Filtering(t *testing.T) {
 	}
 	hosts, _ := NewStaticHosts(cfg.StaticHosts)
 	addrs, _ := hosts.Lookup("v4only.test", dns_feature.IPOption{IPv6Enable: true})
-	if addrs != nil && len(addrs) != 0 {
+	if len(addrs) != 0 {
 		t.Errorf("v4-only host with IPv6 option = %v, want empty", addrs)
 	}
 }

@@ -172,3 +172,5 @@ func (s *TCPNameServer) sendOneTCPQuery(ctx context.Context, noResponseErrCh cha
 func (s *TCPNameServer) QueryIP(ctx context.Context, domain string, option dns_feature.IPOption) ([]bcnet.IP, uint32, error) {
 	return queryIP(ctx, s, domain, option)
 }
+
+func (s *TCPNameServer) Close() error { return s.cacheController.Close() }

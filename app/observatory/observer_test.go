@@ -8,8 +8,39 @@ import (
 	"testing"
 	"time"
 
+	"github.com/eugene/bypasscore/app/dialer"
 	appoutbound "github.com/eugene/bypasscore/app/outbound"
+	"github.com/eugene/bypasscore/proxy/blackhole"
+	"github.com/eugene/bypasscore/proxy/freedom"
 )
+
+func installTestDialerFactory() {
+	appoutbound.SetDialerFactory(func(ob *appoutbound.Outbound) dialer.Dialer {
+		if ob.Mode == appoutbound.ModeBlackhole {
+			return blackhole.New(ob.Tag)
+		}
+		return freedom.New(ob.Tag, "", "")
+	})
+}
+
+func TestObserver_ProbesActualBlackholeOutbound(t *testing.T) {
+	installTestDialerFactory()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	ohm := appoutbound.NewManager(&appoutbound.Config{Outbounds: []*appoutbound.Outbound{
+		{Tag: "block", Mode: appoutbound.ModeBlackhole},
+	}})
+	o, err := New(context.Background(), &Config{SubjectSelector: []string{"block"}, ProbeUrl: srv.URL}, ohm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := o.probe("block")
+	if result.Alive {
+		t.Fatal("blackhole must not be reported alive through a direct probe")
+	}
+}
 
 // TestObserver_SerialModeProbesAllInOneRound is the regression test for the
 // AUDIT.md P5-1 fix: in serial mode, the background loop used to sleep
@@ -20,6 +51,7 @@ import (
 // all three outbounds appear probed within a window that would be impossible
 // under the old N×interval cadence.
 func TestObserver_SerialModeProbesAllInOneRound(t *testing.T) {
+	installTestDialerFactory()
 	// Probe server returns 204 immediately.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
@@ -71,6 +103,7 @@ func TestObserver_SerialModeProbesAllInOneRound(t *testing.T) {
 // TestObserver_ConcurrentModeProbesAll mirrors the serial test for the
 // concurrent branch (which already had correct round cadence).
 func TestObserver_ConcurrentModeProbesAll(t *testing.T) {
+	installTestDialerFactory()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))

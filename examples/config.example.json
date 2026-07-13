@@ -40,8 +40,16 @@
       "type": "redirect",
       "listen": "0.0.0.0",
       "port": 12345,
-      "network": "tcp,udp",
+      "network": "tcp",
       "sniffing": true
+    },
+    {
+      "tag": "udp_tproxy",
+      "type": "tproxy",
+      "listen": "0.0.0.0",
+      "port": 12345,
+      "network": "udp",
+      "sniffing": false
     }
   ],
   "dns": {

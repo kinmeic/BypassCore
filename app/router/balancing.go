@@ -136,6 +136,8 @@ func (b *Balancer) SelectOutbounds() ([]string, error) {
 
 // GetPrincipleTarget implements routing.BalancerPrincipleTarget
 func (r *Router) GetPrincipleTarget(tag string) ([]string, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	if b, ok := r.balancers[tag]; ok {
 		if s, ok := b.strategy.(BalancingPrincipleTarget); ok {
 			candidates, err := b.SelectOutbounds()
@@ -151,6 +153,8 @@ func (r *Router) GetPrincipleTarget(tag string) ([]string, error) {
 
 // SetOverrideTarget implements routing.BalancerOverrider
 func (r *Router) SetOverrideTarget(tag, target string) error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	if b, ok := r.balancers[tag]; ok {
 		b.override.Put(target)
 		return nil
@@ -160,6 +164,8 @@ func (r *Router) SetOverrideTarget(tag, target string) error {
 
 // GetOverrideTarget implements routing.BalancerOverrider
 func (r *Router) GetOverrideTarget(tag string) (string, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	if b, ok := r.balancers[tag]; ok {
 		return b.override.Get(), nil
 	}

@@ -162,7 +162,7 @@ func (r *Router) ReloadRules(config *Config, shouldAppend bool) error {
 	}
 
 	for _, rule := range config.Rule {
-		if r.RuleExists(rule.GetRuleTag()) {
+		if r.ruleExistsLocked(rule.GetRuleTag()) {
 			closeNewWebhooks()
 			return errors.New("duplicate ruleTag ", rule.GetRuleTag())
 		}
@@ -203,11 +203,13 @@ func (r *Router) ReloadRules(config *Config, shouldAppend bool) error {
 }
 
 // RuleExists reports whether a rule with the given ruleTag is registered.
-//
-// Caller-held lock: this method does not take r.mu itself, because it is
-// invoked from ReloadRules (which already holds the write lock). Callers that
-// invoke it standalone must take r.mu.RLock() to guard the read of r.rules.
 func (r *Router) RuleExists(tag string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.ruleExistsLocked(tag)
+}
+
+func (r *Router) ruleExistsLocked(tag string) bool {
 	if tag != "" {
 		for _, rule := range r.rules {
 			if rule.RuleTag == tag {
@@ -240,8 +242,8 @@ func (r *Router) RemoveRule(tag string) error {
 
 // ListRule implements routing.Router
 func (r *Router) ListRule() []routing.Route {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	ruleList := make([]routing.Route, 0)
 	for _, rule := range r.rules {
 		ruleList = append(ruleList, &Route{

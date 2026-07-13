@@ -116,7 +116,8 @@ transport.Bridge (双向拷贝)
     {"tag": "proxy", "mode": "proxy", "upstream": {"protocol": "socks", "server": "127.0.0.1:1080"}}
   ],
   "inbounds": [
-    {"tag": "tcp_redir", "type": "redirect", "listen": "0.0.0.0", "port": 12345, "network": "tcp,udp", "sniffing": true}
+	{"tag": "tcp_redir", "type": "redirect", "listen": "0.0.0.0", "port": 12345, "network": "tcp", "sniffing": true},
+	{"tag": "udp_tproxy", "type": "tproxy", "listen": "0.0.0.0", "port": 12345, "network": "udp", "sniffing": false}
   ],
   "routing": {"domainStrategy": "IpIfNonMatch", "rules": [...]},
   "dns": {"servers": [...], "hosts": {...}},

@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"net"
 	"net/url"
-	"sync/atomic"
 	"time"
 
 	"github.com/eugene/bypasscore/common/errors"
@@ -63,11 +62,6 @@ func NewDOTNameServer(u *url.URL, disableCache bool, serveStale bool, serveExpir
 
 // Name overrides to report DoT.
 func (s *DOTNameServer) Name() string { return s.cacheController.name }
-
-// newReqID ensures the embedded TCP method still gets unique IDs.
-func (s *DOTNameServer) newReqID() uint16 {
-	return uint16(atomic.AddUint32(&s.reqID, 1))
-}
 
 // QueryIP implements Server.
 func (s *DOTNameServer) QueryIP(ctx context.Context, domain string, option dns_feature.IPOption) ([]bcnet.IP, uint32, error) {

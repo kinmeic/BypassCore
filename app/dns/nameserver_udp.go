@@ -23,9 +23,9 @@ import (
 type ClassicNameServer struct {
 	sync.Mutex
 	cacheController *CacheController
-	address        bcnet.Destination
-	clientIP       bcnet.IP
-	reqID          uint32
+	address         bcnet.Destination
+	clientIP        bcnet.IP
+	reqID           uint32
 }
 
 // NewClassicNameServer creates a UDP DNS server.
@@ -96,10 +96,8 @@ func (s *ClassicNameServer) sendOneQuery(ctx context.Context, noResponseErrCh ch
 	if !ok {
 		deadline = time.Now().Add(8 * time.Second)
 	}
-	conn, err := net.DialUDP("udp", nil, &net.UDPAddr{
-		IP:   s.address.Address.IP(),
-		Port: int(s.address.Port),
-	})
+	dialer := net.Dialer{}
+	conn, err := dialer.DialContext(ctx, "udp", s.address.NetAddr())
 	if err != nil {
 		if noResponseErrCh != nil {
 			noResponseErrCh <- err
@@ -161,6 +159,8 @@ func (s *ClassicNameServer) sendOneQuery(ctx context.Context, noResponseErrCh ch
 
 	s.cacheController.updateRecord(req, ipRec)
 }
+
+func (s *ClassicNameServer) Close() error { return s.cacheController.Close() }
 
 // QueryIP implements Server.
 func (s *ClassicNameServer) QueryIP(ctx context.Context, domain string, option dns_feature.IPOption) ([]bcnet.IP, uint32, error) {

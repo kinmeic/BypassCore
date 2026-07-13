@@ -3,23 +3,23 @@
 // the routing engine, and bridges it to the chosen outbound handler.
 //
 // Flow:
-//   inbound conn → (sniff TLS/HTTP) → router.PickRoute → outboundTag
-//   → outbound.Handler.Dial(ctx, dest) → transport.Bridge(inbound, outbound)
+//
+//	inbound conn → (sniff TLS/HTTP) → router.PickRoute → outboundTag
+//	→ outbound.Handler.Dial(ctx, dest) → transport.Bridge(inbound, outbound)
 package dispatcher
 
 import (
 	"context"
 	"net"
 
+	"github.com/eugene/bypasscore/app/dialer"
 	"github.com/eugene/bypasscore/common/errors"
 	bcnet "github.com/eugene/bypasscore/common/net"
 	bcsession "github.com/eugene/bypasscore/common/session"
 	"github.com/eugene/bypasscore/features/routing"
 	routingsession "github.com/eugene/bypasscore/features/routing/session"
-	"github.com/eugene/bypasscore/app/dialer"
 	"github.com/eugene/bypasscore/transport"
 )
-
 
 // Dispatcher routes accepted connections to outbound handlers.
 type Dispatcher struct {
@@ -44,22 +44,32 @@ func New(router routing.Router, ohm DialerManager, sniffer *Sniffer) *Dispatcher
 // dest is the original destination (from tproxy SO_ORIGINAL_DST / redirect).
 // conn is the accepted TCP connection.
 func (d *Dispatcher) Dispatch(ctx context.Context, conn net.Conn, dest bcnet.Destination) error {
-	// Build a routing context from the session.
-	rctx := buildRoutingContext(ctx, dest)
+	originalDest := dest
+	content := bcsession.ContentFromContext(ctx)
+	if content == nil {
+		content = new(bcsession.Content)
+		ctx = bcsession.ContextWithContent(ctx, content)
+	}
+	outboundSession := &bcsession.Outbound{OriginalTarget: originalDest, Target: originalDest}
 
 	// Sniff the first bytes to recover the domain (if enabled).
 	// Sniff returns a new conn that replays the consumed bytes, so the
 	// outbound stream is not truncated.
 	if d.sniffer != nil {
-		var sniffed string
-		conn, sniffed = d.sniffer.Sniff(conn)
+		var sniffed, protocol string
+		conn, sniffed, protocol = d.sniffer.SniffMetadata(conn)
+		content.Protocol = protocol
 		if sniffed != "" {
 			errors.LogInfo(ctx, "sniffed domain: ", sniffed, " for ", dest.String())
-			// Override destination address with sniffed domain.
-			dest.Address = bcnet.ParseAddress(sniffed)
-			rctx = buildRoutingContext(ctx, dest)
+			// Match Xray's routeOnly semantics: the untrusted SNI/Host is used for
+			// routing, while the actual dial target remains the kernel-recovered
+			// original destination.
+			routeDest := originalDest
+			routeDest.Address = bcnet.ParseAddress(sniffed)
+			outboundSession.RouteTarget = routeDest
 		}
 	}
+	rctx := buildRoutingContext(ctx, outboundSession)
 
 	// Route: ask the router which outbound tag to use.
 	route, err := d.router.PickRoute(rctx)
@@ -72,8 +82,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, conn net.Conn, dest bcnet.Des
 			conn.Close()
 			return errors.New("no default outbound available")
 		}
-		outTag = dialer.Tag()
-		return d.bridge(ctx, conn, dialer, dest)
+		return d.bridge(ctx, conn, dialer, originalDest)
 	}
 	outTag = route.GetOutboundTag()
 	errors.LogInfo(ctx, "route: ", dest.String(), " → ", outTag)
@@ -81,14 +90,11 @@ func (d *Dispatcher) Dispatch(ctx context.Context, conn net.Conn, dest bcnet.Des
 	// Look up the outbound dialer.
 	dialer := d.ohm.GetDialer(outTag)
 	if dialer == nil {
-		dialer = d.ohm.GetDefaultDialer()
-		if dialer == nil {
-			conn.Close()
-			return errors.New("outbound ", outTag, " not found and no default")
-		}
+		conn.Close()
+		return errors.New("routed outbound ", outTag, " not found")
 	}
 
-	return d.bridge(ctx, conn, dialer, dest)
+	return d.bridge(ctx, conn, dialer, originalDest)
 }
 
 // bridge dials the outbound and copies data bidirectionally.
@@ -108,12 +114,11 @@ func (d *Dispatcher) bridge(ctx context.Context, inbound net.Conn, dialer dialer
 
 // buildRoutingContext creates a routing.Context from the session info and
 // destination.
-func buildRoutingContext(ctx context.Context, dest bcnet.Destination) routing.Context {
+func buildRoutingContext(ctx context.Context, outbound *bcsession.Outbound) routing.Context {
 	return &routingsession.Context{
-		Outbound: &bcsession.Outbound{
-			Target: dest,
-		},
-		Content: bcsession.ContentFromContext(ctx),
+		Inbound:  bcsession.InboundFromContext(ctx),
+		Outbound: outbound,
+		Content:  bcsession.ContentFromContext(ctx),
 	}
 }
 
@@ -131,7 +136,7 @@ type DialerManager interface {
 // caller manages I/O directly.
 func (d *Dispatcher) DialOutbound(ctx context.Context, dest bcnet.Destination) (net.Conn, error) {
 	// Build routing context.
-	rctx := buildRoutingContext(ctx, dest)
+	rctx := buildRoutingContext(ctx, &bcsession.Outbound{OriginalTarget: dest, Target: dest})
 
 	// Route.
 	route, err := d.router.PickRoute(rctx)
@@ -146,7 +151,7 @@ func (d *Dispatcher) DialOutbound(ctx context.Context, dest bcnet.Destination) (
 		outTag := route.GetOutboundTag()
 		dialer = d.ohm.GetDialer(outTag)
 		if dialer == nil {
-			dialer = d.ohm.GetDefaultDialer()
+			return nil, errors.New("routed outbound ", outTag, " not found")
 		}
 	}
 

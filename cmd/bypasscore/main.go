@@ -8,17 +8,18 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/eugene/bypasscore/app/dialer"
 	"github.com/eugene/bypasscore/app/dispatcher"
 	appdns "github.com/eugene/bypasscore/app/dns"
-	"github.com/eugene/bypasscore/app/dialer"
 	appinbound "github.com/eugene/bypasscore/app/inbound"
-	appoutbound "github.com/eugene/bypasscore/app/outbound"
 	"github.com/eugene/bypasscore/app/observatory"
+	appoutbound "github.com/eugene/bypasscore/app/outbound"
 	"github.com/eugene/bypasscore/app/router"
 	"github.com/eugene/bypasscore/common/errors"
 	bcnet "github.com/eugene/bypasscore/common/net"
@@ -42,6 +43,13 @@ type Config struct {
 }
 
 func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	configPath := flag.String("config", "examples/config.example.json", "path to config file")
 	testDest := flag.String("test", "", `test a routing decision, e.g. "tcp:www.google.com:443"`)
 	resolve := flag.String("resolve", "", `resolve a domain via DNS, e.g. "example.com"`)
@@ -51,19 +59,23 @@ func main() {
 
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
-		fail("load config: ", err)
+		return errors.New("load config: ").Base(err)
 	}
 
 	// Build the outbound manager from the descriptor table.
 	ohm := appoutbound.NewManager(&appoutbound.Config{Outbounds: cfg.Outbounds})
 	if err := ohm.Validate(); err != nil {
-		fail("outbound config: ", err)
+		return errors.New("outbound config: ").Base(err)
 	}
+	registerDialerFactory()
 
 	// Build the routing config.
 	routerCfg, err := cfg.Routing.Build()
 	if err != nil {
-		fail("build routing config: ", err)
+		return errors.New("build routing config: ").Base(err)
+	}
+	if err := validateRoutingTargets(routerCfg, ohm); err != nil {
+		return errors.New("routing config: ").Base(err)
 	}
 
 	// Build the DNS client. If a dns config is provided, use the full DNS
@@ -74,14 +86,14 @@ func main() {
 	if cfg.DNS != nil {
 		dnsCfg, err := cfg.DNS.Build()
 		if err != nil {
-			fail("build dns config: ", err)
+			return errors.New("build dns config: ").Base(err)
 		}
 		srv, err := appdns.New(baseCtx, dnsCfg)
 		if err != nil {
-			fail("create dns server: ", err)
+			return errors.New("create dns server: ").Base(err)
 		}
 		if err := srv.Start(); err != nil {
-			fail("start dns server: ", err)
+			return errors.New("start dns server: ").Base(err)
 		}
 		defer srv.Close()
 		dnsClient = srv
@@ -94,7 +106,7 @@ func main() {
 	if cfg.Observatory != nil && len(cfg.Observatory.SubjectSelector) > 0 {
 		observer, err = observatory.New(baseCtx, cfg.Observatory, ohm)
 		if err != nil {
-			fail("build observatory: ", err)
+			return errors.New("build observatory: ").Base(err)
 		}
 		_ = observer.Start()
 		defer observer.Close()
@@ -104,11 +116,38 @@ func main() {
 	routerCtx := core.ContextWithFeatures(baseCtx, dnsClient, ohm, nil, observer)
 	r := new(router.Router)
 	if err := r.Init(routerCtx, routerCfg, dnsClient, ohm, nil); err != nil {
-		fail("init router: ", err)
+		return errors.New("init router: ").Base(err)
 	}
 
-	// Register the dialer factory so outbound.Manager can produce freedom/blackhole
-	// dialers from the descriptor table.
+	// Choose the requested operating mode.
+	switch {
+	case *runMode:
+		if err := runDaemon(r, ohm, cfg.Inbounds, baseCtx); err != nil {
+			return errors.New("run: ").Base(err)
+		}
+	case *resolve != "":
+		if err := runResolve(dnsClient, *resolve); err != nil {
+			return errors.New("resolve: ").Base(err)
+		}
+	case *observe:
+		if err := runObserve(observer); err != nil {
+			return errors.New("observe: ").Base(err)
+		}
+	case *testDest != "":
+		if err := runTest(r, ohm, *testDest); err != nil {
+			return errors.New("test: ").Base(err)
+		}
+	default:
+		fmt.Println("BypassCore loaded. Use -test \"tcp:host:port\", -resolve \"domain\", or -observe.")
+		fmt.Println("Outbounds:")
+		for _, ob := range ohm.List() {
+			fmt.Printf("  - %s (mode=%s)\n", ob.Tag, ob.Mode)
+		}
+	}
+	return nil
+}
+
+func registerDialerFactory() {
 	appoutbound.SetDialerFactory(func(ob *appoutbound.Outbound) dialer.Dialer {
 		bindIP := ""
 		bindIface := ""
@@ -122,38 +161,11 @@ func main() {
 		case appoutbound.ModeFreedom:
 			return freedom.New(ob.Tag, bindIP, bindIface)
 		case appoutbound.ModeProxy:
-			// Proxy mode: dial to upstream SOCKS5 server (e.g. naiveproxy local socks).
-			if ob.Upstream == nil || ob.Upstream.Server == "" {
-				return blackhole.New(ob.Tag)
-			}
 			return socks.NewFromSettings(ob.Tag, ob.Upstream.Server, ob.Upstream.Settings)
 		default:
-			return freedom.New(ob.Tag, bindIP, bindIface)
+			return blackhole.New(ob.Tag)
 		}
 	})
-
-	switch {
-	case *runMode:
-		if err := runDaemon(r, ohm, cfg.Inbounds, baseCtx); err != nil {
-			fail("run: ", err)
-		}
-	case *resolve != "":
-		if err := runResolve(dnsClient, *resolve); err != nil {
-			fail("resolve: ", err)
-		}
-	case *observe:
-		runObserve(observer)
-	case *testDest != "":
-		if err := runTest(r, ohm, *testDest); err != nil {
-			fail("test: ", err)
-		}
-	default:
-		fmt.Println("BypassCore loaded. Use -test \"tcp:host:port\", -resolve \"domain\", or -observe.")
-		fmt.Println("Outbounds:")
-		for _, ob := range ohm.List() {
-			fmt.Printf("  - %s (mode=%s)\n", ob.Tag, ob.Mode)
-		}
-	}
 }
 
 func runResolve(dnsClient featdns.Client, domain string) error {
@@ -170,15 +182,51 @@ func runResolve(dnsClient featdns.Client, domain string) error {
 }
 
 func loadConfig(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
+	defer f.Close()
 	var cfg Config
-	if err := json.Unmarshal(data, &cfg); err != nil {
+	decoder := json.NewDecoder(f)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&cfg); err != nil {
+		return nil, errors.New("parse config.json").Base(err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, errors.New("parse config.json: multiple JSON values")
+		}
 		return nil, errors.New("parse config.json").Base(err)
 	}
 	return &cfg, nil
+}
+
+func validateRoutingTargets(cfg *router.Config, ohm *appoutbound.Manager) error {
+	if cfg == nil {
+		return errors.New("nil routing config")
+	}
+	for _, rule := range cfg.Rule {
+		if rule == nil {
+			return errors.New("nil routing rule")
+		}
+		if tag := rule.GetTag(); tag != "" && ohm.GetOutbound(tag) == nil {
+			return errors.New("routing rule references unknown outbound: ", tag)
+		}
+	}
+	for _, balancer := range cfg.BalancingRule {
+		if balancer == nil {
+			return errors.New("nil balancing rule")
+		}
+		if tag := balancer.FallbackTag; tag != "" && ohm.GetOutbound(tag) == nil {
+			return errors.New("balancer ", balancer.Tag, " references unknown fallback outbound: ", tag)
+		}
+		if len(ohm.Select(balancer.OutboundSelector)) == 0 {
+			return errors.New("balancer ", balancer.Tag, " selectors match no outbounds")
+		}
+	}
+	return nil
 }
 
 func runTest(r *router.Router, ohm *appoutbound.Manager, dest string) error {
@@ -233,20 +281,20 @@ func describeOutbound(ob *appoutbound.Outbound) {
 	}
 }
 
-func runObserve(observer *observatory.Observer) {
+func runObserve(observer *observatory.Observer) error {
 	if observer == nil {
 		fmt.Println("No observatory configured (set config \"observatory.subjectSelector\").")
-		return
+		return nil
 	}
 	// Give the background loop time to complete one probe round.
 	time.Sleep(6 * time.Second)
 	result, err := observer.GetObservation(context.Background())
 	if err != nil {
-		fail("get observation: ", err)
+		return err
 	}
 	obs, ok := result.(*observatory.ObservationResult)
 	if !ok {
-		fail("unexpected observation type")
+		return errors.New("unexpected observation type")
 	}
 	fmt.Printf("%-20s %-8s %-10s %s\n", "OUTBOUND", "ALIVE", "DELAY(ms)", "REASON")
 	fmt.Println(repeat("-", 60))
@@ -259,6 +307,7 @@ func runObserve(observer *observatory.Observer) {
 		}
 		fmt.Printf("%-20s %-8s %-10s %s\n", s.OutboundTag, alive, delay, s.LastErrorReason)
 	}
+	return nil
 }
 
 func orDash(s string) string {
@@ -276,32 +325,20 @@ func repeat(s string, n int) string {
 	return out
 }
 
-func fail(msg ...interface{}) {
-	fmt.Fprintln(os.Stderr, "error:", fmt.Sprint(msg...))
-	os.Exit(1)
-}
-
 // runDaemon starts all inbound listeners and blocks until a signal is received.
 // This is the "bypasscore run -c config.json" mode: the process stays alive
 // as a transparent proxy, accepting tproxy/redirect connections and routing
 // them via the router to outbound handlers.
 func runDaemon(r *router.Router, ohm *appoutbound.Manager, inbounds []*appinbound.Config, baseCtx context.Context) error {
-	// Build the sniffer (enabled if any inbound has sniffing=true).
-	sniffEnabled := false
-	for _, ib := range inbounds {
-		if ib.Sniffing {
-			sniffEnabled = true
-			break
-		}
-	}
-	sniffer := dispatcher.NewSniffer(sniffEnabled)
-
-	// Build the dispatcher (data-plane hub).
-	d := dispatcher.New(r, ohm, sniffer)
-
 	// Start all inbound listeners.
 	var listeners []*appinbound.Listener
 	for _, ibCfg := range inbounds {
+		if ibCfg == nil {
+			return errors.New("nil inbound configuration")
+		}
+		// Sniffing is an inbound property. Give each listener its own dispatcher
+		// so enabling it on one inbound does not silently affect every other one.
+		d := dispatcher.New(r, ohm, dispatcher.NewSniffer(ibCfg.Sniffing))
 		ln := appinbound.New(ibCfg, d)
 		if err := ln.Start(); err != nil {
 			// Close already-started listeners before failing.

@@ -2,7 +2,11 @@ package socks
 
 import (
 	"context"
+	"encoding/binary"
+	"io"
+	"net"
 	"testing"
+	"time"
 
 	bcnet "github.com/eugene/bypasscore/common/net"
 )
@@ -110,8 +114,8 @@ func TestParsePort(t *testing.T) {
 	}{
 		{"1080", 1080},
 		{" 80 ", 80},
-		{"abc", 1080},  // invalid → default
-		{"-1", 1080},   // negative → default
+		{"abc", 1080},   // invalid → default
+		{"-1", 1080},    // negative → default
 		{"70000", 1080}, // out of range → default
 	}
 	for _, c := range cases {
@@ -141,14 +145,56 @@ func TestReplyCodeText(t *testing.T) {
 	}
 }
 
-// TestHandler_Dial_UDPRejects verifies that UDP destinations are explicitly
-// rejected (P2-3 regression: previously silently sent as TCP CONNECT).
-func TestHandler_Dial_UDPRejects(t *testing.T) {
-	h := New("test", "127.0.0.1:1080", "", "")
+func TestHandler_Dial_UDPAssociate(t *testing.T) {
+	udpLn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udpLn.Close()
+	tcpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tcpLn.Close()
+
+	go func() {
+		conn, err := tcpLn.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		greeting := make([]byte, 3)
+		_, _ = io.ReadFull(conn, greeting)
+		_, _ = conn.Write([]byte{0x05, 0x00})
+		request := make([]byte, 10)
+		_, _ = io.ReadFull(conn, request)
+		port := make([]byte, 2)
+		binary.BigEndian.PutUint16(port, uint16(udpLn.LocalAddr().(*net.UDPAddr).Port))
+		response := append([]byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1}, port...)
+		_, _ = conn.Write(response)
+		buf := make([]byte, 65535)
+		n, peer, err := udpLn.ReadFromUDP(buf)
+		if err == nil {
+			_, _ = udpLn.WriteToUDP(buf[:n], peer)
+		}
+		<-time.After(time.Second)
+	}()
+
+	h := New("test", tcpLn.Addr().String(), "", "")
 	dest := bcnet.UDPDestination(bcnet.ParseAddress("1.2.3.4"), bcnet.Port(53))
-	_, err := h.Dial(context.Background(), dest)
-	if err == nil {
-		t.Fatal("UDP dial should be rejected with an error")
+	conn, err := h.Dial(context.Background(), dest)
+	if err != nil {
+		t.Fatalf("UDP associate: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 16)
+	n, err := conn.Read(buf)
+	if err != nil || string(buf[:n]) != "hello" {
+		t.Fatalf("UDP payload = %q err=%v", buf[:n], err)
 	}
 }
 

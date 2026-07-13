@@ -77,8 +77,24 @@ func TestValidateProxyRequiresUpstream(t *testing.T) {
 	m2 := NewManager(&Config{Outbounds: []*Outbound{
 		{Tag: "ok", Mode: ModeProxy, Upstream: &UpstreamConfig{Protocol: "trojan", Server: "x:443"}},
 	}})
-	if err := m2.Validate(); err != nil {
-		t.Fatalf("Validate should pass: %v", err)
+	if err := m2.Validate(); err == nil {
+		t.Fatal("Validate should reject unsupported proxy protocol")
+	}
+	m3 := NewManager(&Config{Outbounds: []*Outbound{
+		{Tag: "ok", Mode: ModeProxy, Upstream: &UpstreamConfig{Protocol: "socks", Server: "127.0.0.1:1080"}},
+	}})
+	if err := m3.Validate(); err != nil {
+		t.Fatalf("Validate should accept SOCKS: %v", err)
+	}
+}
+
+func TestValidateRejectsDuplicateTags(t *testing.T) {
+	m := NewManager(&Config{Outbounds: []*Outbound{
+		{Tag: "direct", Mode: ModeFreedom},
+		{Tag: "direct", Mode: ModeBlackhole},
+	}})
+	if err := m.Validate(); err == nil {
+		t.Fatal("duplicate outbound tags must be rejected")
 	}
 }
 

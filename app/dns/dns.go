@@ -27,6 +27,7 @@ type DNS struct {
 	hosts                  *StaticHosts
 	clients                []*Client
 	ctx                    context.Context
+	cancel                 context.CancelFunc
 	domainMatcher          geodata.DomainMatcher
 	matcherInfos           []*DomainMatcherInfo
 	checkSystem            bool
@@ -40,6 +41,13 @@ type DomainMatcherInfo struct {
 
 // New creates a new DNS server with given configuration.
 func New(ctx context.Context, config *Config) (*DNS, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	success := false
+	defer func() {
+		if !success {
+			cancel()
+		}
+	}()
 	var clientIP net.IP
 	switch len(config.ClientIp) {
 	case 0, net.IPv4len, net.IPv6len:
@@ -168,18 +176,21 @@ func New(ctx context.Context, config *Config) (*DNS, error) {
 		clients = append(clients, NewLocalDNSClient(ipOption))
 	}
 
-	return &DNS{
+	server := &DNS{
 		hosts:                  hosts,
 		ipOption:               &ipOption,
 		clients:                clients,
 		ctx:                    ctx,
+		cancel:                 cancel,
 		domainMatcher:          domainMatcher,
 		matcherInfos:           matcherInfos,
 		disableFallback:        config.DisableFallback,
 		disableFallbackIfMatch: config.DisableFallbackIfMatch,
 		enableParallelQuery:    config.EnableParallelQuery,
 		checkSystem:            checkSystem,
-	}, nil
+	}
+	success = true
+	return server, nil
 }
 
 // Type implements common.HasType.
@@ -194,6 +205,14 @@ func (s *DNS) Start() error {
 
 // Close implements common.Closable.
 func (s *DNS) Close() error {
+	if s.cancel != nil {
+		s.cancel()
+	}
+	for _, client := range s.clients {
+		if closer, ok := client.server.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
+	}
 	return nil
 }
 
@@ -461,7 +480,7 @@ func asyncQueryAll(domain string, option dns.IPOption, clients []*Client, ctx co
 		go func(i int, c *Client) {
 			qctx := ctx
 			if !c.server.IsDisableCache() {
-				nctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.timeoutMs*2)
+				nctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.timeout*2)
 				qctx = nctx
 				defer cancel()
 			}

@@ -4,19 +4,20 @@
 // This file implements UDP TPROXY using IP_TRANSPARENT + IP_RECVORIGDSTADDR.
 //
 // UDP TPROXY flow:
-// 1. iptables TPROXY redirects UDP packets to this listener's port
-// 2. We create a socket with IP_TRANSPARENT + IP_RECVORIGDSTADDR
-// 3. ReadMsgUDP returns payload + OOB control message containing the
-//    original destination (IP_RECVORIGDSTADDR)
-// 4. We route by original dest, dial the outbound, and relay packets
-// 5. Return packets are written back with the original dest as source
-//    (IP_TRANSPARENT allows binding to non-local addresses)
+//  1. iptables TPROXY redirects UDP packets to this listener's port
+//  2. We create a socket with IP_TRANSPARENT + IP_RECVORIGDSTADDR
+//  3. ReadMsgUDP returns payload + OOB control message containing the
+//     original destination (IP_RECVORIGDSTADDR)
+//  4. We route by original dest, dial the outbound, and relay packets
+//  5. Return packets are written back with the original dest as source
+//     (IP_TRANSPARENT allows binding to non-local addresses)
 package inbound
 
 import (
 	"context"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -24,6 +25,7 @@ import (
 	"github.com/eugene/bypasscore/app/dispatcher"
 	"github.com/eugene/bypasscore/common/errors"
 	bcnet "github.com/eugene/bypasscore/common/net"
+	"github.com/eugene/bypasscore/common/session"
 	"golang.org/x/sys/unix"
 )
 
@@ -32,8 +34,8 @@ type udpTproxyListener struct {
 	cfg        *Config
 	dispatcher *dispatcher.Dispatcher
 
-	conn      *net.UDPConn
-	sessions  sync.Map // key: "srcAddr" → *udpSession
+	conn     *net.UDPConn
+	sessions sync.Map // key: "srcAddr|originalDst" → *udpSession
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -43,15 +45,22 @@ type udpTproxyListener struct {
 // udpSession represents one client's UDP relay: the outbound connection +
 // a goroutine copying return packets back to the client.
 type udpSession struct {
-	clientAddr  *net.UDPAddr  // client source address
+	key         string
+	clientAddr  *net.UDPAddr      // client source address
 	originalDst bcnet.Destination // original target (from TPROXY)
-	outbound    net.Conn      // outbound connection (to proxy/freedom)
-	dispatcher *dispatcher.Dispatcher
+	outbound    net.Conn          // outbound connection (to proxy/freedom)
+	replyConn   net.PacketConn    // transparent socket bound to originalDst
 	listener    *udpTproxyListener
+	ctx         context.Context
+	cancel      context.CancelFunc
+	packets     chan []byte
 
+	mu        sync.Mutex
 	closeOnce sync.Once
 	closed    chan struct{}
 }
+
+const udpSessionIdleTimeout = 2 * time.Minute
 
 // startUDP creates a UDP TPROXY listener.
 func startUDP(cfg *Config, d *dispatcher.Dispatcher) (*udpTproxyListener, error) {
@@ -108,7 +117,7 @@ func startUDP(cfg *Config, d *dispatcher.Dispatcher) (*udpTproxyListener, error)
 	l := &udpTproxyListener{
 		cfg:        cfg,
 		dispatcher: d,
-		conn:        udpConn,
+		conn:       udpConn,
 	}
 	l.ctx, l.cancel = context.WithCancel(context.Background())
 
@@ -154,19 +163,29 @@ func (l *udpTproxyListener) recvLoop() {
 		packet := make([]byte, n)
 		copy(packet, buf[:n])
 
-		// Get or create a session for this client.
-		key := srcAddr.String()
-		sess, _ := l.sessions.LoadOrStore(key, &udpSession{
+		// Match Xray's non-cone UDP key: the same client socket may talk to
+		// multiple destinations and those flows must not share one outbound.
+		key := srcAddr.String() + "|" + origDst.String()
+		ctx, cancel := context.WithCancel(l.ctx)
+		candidate := &udpSession{
+			key:         key,
 			clientAddr:  srcAddr,
 			originalDst: origDst,
-			dispatcher:  l.dispatcher,
 			listener:    l,
+			ctx:         ctx,
+			cancel:      cancel,
+			packets:     make(chan []byte, 256),
 			closed:      make(chan struct{}),
-		})
+		}
+		sess, loaded := l.sessions.LoadOrStore(key, candidate)
 		s := sess.(*udpSession)
-
-		// Forward the packet to the outbound (lazily dialed on first packet).
-		go s.relay(packet, origDst)
+		if loaded {
+			cancel()
+		} else {
+			l.wg.Add(1)
+			go s.run()
+		}
+		s.enqueue(packet)
 	}
 }
 
@@ -196,93 +215,169 @@ func retrieveOriginalDst(oob []byte) bcnet.Destination {
 	return bcnet.Destination{}
 }
 
-// relay sends a packet to the outbound and reads back the response.
-func (s *udpSession) relay(packet []byte, dest bcnet.Destination) {
-	// Dial the outbound (lazily, on first packet for this session).
-	if s.outbound == nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
+func (s *udpSession) enqueue(packet []byte) {
+	select {
+	case <-s.closed:
+		return
+	case s.packets <- packet:
+	default:
+		errors.LogWarning(context.Background(), "UDP relay queue full for ", s.key, ", dropping packet")
+	}
+}
 
-		// Route via the dispatcher's router to get the outbound tag.
-		// For UDP, we use the dispatcher directly — it will route + dial.
-		// But dispatcher.Dispatch expects a net.Conn (stream), not packets.
-		// For UDP we bypass the dispatcher and dial directly via the outbound.
-		// The dispatcher's OutboundManager gives us the dialer.
-		// Actually, we need a simpler path: dial the outbound dialer directly.
-		// Let's use the dispatcher's bridge approach but for UDP.
-		conn, err := s.dialOutbound(ctx, dest)
-		if err != nil {
-			errors.LogErrorInner(context.Background(), err, "UDP relay: outbound dial failed for ", dest.String())
-			s.close()
-			return
+type udpReadResult struct {
+	data []byte
+	err  error
+}
+
+// run serializes dialing, packet writes and return delivery for one flow. This
+// removes the per-packet goroutine/data race and gives the session an idle TTL.
+func (s *udpSession) run() {
+	defer s.listener.wg.Done()
+	defer s.close()
+
+	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
+	conn, err := s.listener.dispatcher.DialOutbound(s.routingContext(ctx), s.originalDst)
+	cancel()
+	if err != nil {
+		errors.LogErrorInner(context.Background(), err, "UDP relay: outbound dial failed for ", s.originalDst.String())
+		return
+	}
+	replyConn, err := listenTransparentReply(s.originalDst)
+	if err != nil {
+		conn.Close()
+		errors.LogErrorInner(context.Background(), err, "UDP relay: failed to create transparent reply socket")
+		return
+	}
+	if !s.setResources(conn, replyConn) {
+		return
+	}
+
+	reads := make(chan udpReadResult, 1)
+	go s.readUDPResponses(conn, reads)
+	timer := time.NewTimer(udpSessionIdleTimeout)
+	defer timer.Stop()
+	resetTimer := func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
 		}
-		s.outbound = conn
-
-		// Start a goroutine to read responses from the outbound and send
-		// them back to the client via the tproxy socket.
-		go s.returnLoop()
+		timer.Reset(udpSessionIdleTimeout)
 	}
 
-	// Write the packet to the outbound.
-	if _, err := s.outbound.Write(packet); err != nil {
-		errors.LogErrorInner(context.Background(), err, "UDP relay: write to outbound failed")
-		s.close()
-	}
-}
-
-// dialOutbound routes the destination and dials the outbound connection.
-func (s *udpSession) dialOutbound(ctx context.Context, dest bcnet.Destination) (net.Conn, error) {
-	// For now, use a direct dial — the dispatcher's routing will be applied
-	// via the router. We need access to the router + outbound manager.
-	// Since the dispatcher has them, we'll add a helper method.
-	return s.dispatcher.DialOutbound(ctx, dest)
-}
-
-// returnLoop reads packets from the outbound connection and writes them
-// back to the client via the tproxy socket (with source address spoofing).
-func (s *udpSession) returnLoop() {
-	buf := make([]byte, 65535)
 	for {
 		select {
-		case <-s.closed:
+		case <-s.ctx.Done():
 			return
-		default:
+		case <-timer.C:
+			return
+		case packet := <-s.packets:
+			resetTimer()
+			if _, err := conn.Write(packet); err != nil {
+				errors.LogErrorInner(context.Background(), err, "UDP relay: write to outbound failed")
+				return
+			}
+		case result := <-reads:
+			if result.err != nil {
+				return
+			}
+			resetTimer()
+			if _, err := replyConn.WriteTo(result.data, s.clientAddr); err != nil {
+				errors.LogErrorInner(context.Background(), err, "UDP return: transparent write back failed")
+				return
+			}
 		}
+	}
+}
 
-		n, err := s.outbound.Read(buf)
+func (s *udpSession) routingContext(ctx context.Context) context.Context {
+	ctx = session.ContextWithInbound(ctx, &session.Inbound{
+		Source: bcnet.UDPDestination(bcnet.IPAddress(s.clientAddr.IP), bcnet.Port(s.clientAddr.Port)),
+		Local:  bcnet.DestinationFromAddr(s.listener.conn.LocalAddr()),
+		Tag:    s.listener.cfg.Tag,
+	})
+	return session.ContextWithContent(ctx, new(session.Content))
+}
+
+func (s *udpSession) setResources(conn net.Conn, reply net.PacketConn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	select {
+	case <-s.closed:
+		conn.Close()
+		reply.Close()
+		return false
+	default:
+		s.outbound = conn
+		s.replyConn = reply
+		return true
+	}
+}
+
+func (s *udpSession) readUDPResponses(conn net.Conn, out chan<- udpReadResult) {
+	buf := make([]byte, 65535)
+	for {
+		n, err := conn.Read(buf)
+		result := udpReadResult{err: err}
+		if n > 0 {
+			result.data = append([]byte(nil), buf[:n]...)
+		}
+		select {
+		case out <- result:
+		case <-s.ctx.Done():
+			return
+		}
 		if err != nil {
-			s.close()
-			return
-		}
-
-		// Write back to the client via the tproxy UDP socket.
-		// We need to spoof the source address as the original destination
-		// so the client thinks the response came from the real server.
-		// This requires sendmsg with a custom source address (IP_TRANSPARENT allows it).
-		if err := s.listener.writeBack(buf[:n], s.clientAddr, s.originalDst); err != nil {
-			errors.LogErrorInner(context.Background(), err, "UDP return: write back failed")
-			s.close()
 			return
 		}
 	}
 }
 
-// writeBack sends a packet to the client. True source-address spoofing
-// (so the client sees the response coming from the original destination)
-// requires raw sendmsg with IP_TRANSPARENT. For now, WriteToUDP sends from
-// the listener's bound address — this works in REDIRECT mode but not in
-// true TPROXY mode. Full spoofing is a TODO.
-func (l *udpTproxyListener) writeBack(data []byte, client *net.UDPAddr, origDst bcnet.Destination) error {
-	_, err := l.conn.WriteToUDP(data, client)
-	return err
+// listenTransparentReply follows Xray's FakeUDP approach: create a transparent
+// socket bound to the intercepted destination, then send replies to the client.
+// The client therefore sees packets from the real original destination.
+func listenTransparentReply(dest bcnet.Destination) (net.PacketConn, error) {
+	network := "udp4"
+	if dest.Address.IP().To4() == nil {
+		network = "udp6"
+	}
+	lc := net.ListenConfig{Control: func(_, _ string, c syscall.RawConn) error {
+		var sockErr error
+		err := c.Control(func(fd uintptr) {
+			if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
+				sockErr = err
+				return
+			}
+			_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+			if strings.HasSuffix(network, "4") {
+				sockErr = unix.SetsockoptInt(int(fd), unix.SOL_IP, unix.IP_TRANSPARENT, 1)
+			} else {
+				sockErr = unix.SetsockoptInt(int(fd), unix.SOL_IPV6, unix.IPV6_TRANSPARENT, 1)
+			}
+		})
+		if err != nil {
+			return err
+		}
+		return sockErr
+	}}
+	return lc.ListenPacket(context.Background(), network, dest.NetAddr())
 }
 
 // close shuts down the session.
 func (s *udpSession) close() {
 	s.closeOnce.Do(func() {
 		close(s.closed)
+		s.cancel()
+		s.listener.sessions.CompareAndDelete(s.key, s)
+		s.mu.Lock()
+		defer s.mu.Unlock()
 		if s.outbound != nil {
 			s.outbound.Close()
+		}
+		if s.replyConn != nil {
+			s.replyConn.Close()
 		}
 	})
 }

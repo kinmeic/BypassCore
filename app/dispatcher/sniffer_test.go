@@ -1,11 +1,15 @@
 package dispatcher
 
 import (
+	"context"
 	"crypto/tls"
 	"io"
 	"net"
 	"testing"
 	"time"
+
+	bcnet "github.com/eugene/bypasscore/common/net"
+	bcsession "github.com/eugene/bypasscore/common/session"
 )
 
 // TestSniff_Disabled_ReturnsConnUnchanged verifies that a disabled sniffer
@@ -133,6 +137,42 @@ func TestSniff_HTTP_HostWithPort(t *testing.T) {
 		t.Fatalf("sniffed domain = %q, want example.com (port stripped)", domain)
 	}
 	_ = wrappedConn
+}
+
+func TestSniff_HTTP_SegmentedHost(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	go func() {
+		_, _ = client.Write([]byte("GET / HTTP/1.1\r\nHo"))
+		time.Sleep(20 * time.Millisecond)
+		_, _ = client.Write([]byte("st: segmented.example\r\n\r\n"))
+	}()
+	wrapped, domain, protocol := NewSniffer(true).SniffMetadata(server)
+	if domain != "segmented.example" || protocol != "http" {
+		t.Fatalf("segmented sniff = %q/%q", domain, protocol)
+	}
+	buf := make([]byte, len("GET / HTTP/1.1\r\nHost: segmented.example\r\n\r\n"))
+	if _, err := io.ReadFull(wrapped, buf); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBuildRoutingContext_RouteTargetPreservesOriginalIP(t *testing.T) {
+	original := bcnet.TCPDestination(bcnet.ParseAddress("203.0.113.9"), 443)
+	routeTarget := original
+	routeTarget.Address = bcnet.ParseAddress("route.example")
+	rctx := buildRoutingContext(context.Background(), &bcsession.Outbound{
+		OriginalTarget: original,
+		Target:         original,
+		RouteTarget:    routeTarget,
+	})
+	if got := rctx.GetTargetDomain(); got != "route.example" {
+		t.Fatalf("route domain = %q", got)
+	}
+	if got := rctx.GetTargetIPs(); len(got) != 1 || got[0].String() != "203.0.113.9" {
+		t.Fatalf("target IPs = %v", got)
+	}
 }
 
 // TestSniff_NoDomain_StillWraps verifies that when sniffing recovers no

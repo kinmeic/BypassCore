@@ -2,6 +2,7 @@ package conf
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"io"
 	"os"
@@ -61,7 +62,9 @@ func (c *NameServerConfig) UnmarshalJSON(data []byte) error {
 		FinalQuery      bool       `json:"finalQuery"`
 		UnexpectedIPs   StringList `json:"unexpectedIPs"`
 	}
-	if err := json.Unmarshal(data, &advanced); err == nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&advanced); err == nil {
 		c.Address = advanced.Address
 		c.ClientIP = advanced.ClientIP
 		c.Port = advanced.Port
@@ -86,6 +89,10 @@ func (c *NameServerConfig) UnmarshalJSON(data []byte) error {
 func (c *NameServerConfig) Build() (*dns.NameServer, error) {
 	if c.Address == nil {
 		return nil, errors.New("nameserver address is not specified")
+	}
+	queryStrategy, err := resolveQueryStrategy(c.QueryStrategy)
+	if err != nil {
+		return nil, err
 	}
 
 	domainRules, err := geodata.ParseDomainRules(c.Domains, geodata.Domain_Substr)
@@ -144,7 +151,7 @@ func (c *NameServerConfig) Build() (*dns.NameServer, error) {
 		SkipFallback:    c.SkipFallback,
 		Domain:          domainRules,
 		ExpectedIp:      expectedIPRules,
-		QueryStrategy:   resolveQueryStrategy(c.QueryStrategy),
+		QueryStrategy:   queryStrategy,
 		ActPrior:        actPrior,
 		Tag:             c.Tag,
 		TimeoutMs:       c.TimeoutMs,
@@ -266,6 +273,10 @@ type DNSConfig struct {
 
 // Build converts the JSON DNSConfig to a proto dns.Config.
 func (c *DNSConfig) Build() (*dns.Config, error) {
+	queryStrategy, err := resolveQueryStrategy(c.QueryStrategy)
+	if err != nil {
+		return nil, err
+	}
 	config := &dns.Config{
 		Tag:                    c.Tag,
 		DisableCache:           c.DisableCache,
@@ -274,7 +285,7 @@ func (c *DNSConfig) Build() (*dns.Config, error) {
 		DisableFallback:        c.DisableFallback,
 		DisableFallbackIfMatch: c.DisableFallbackIfMatch,
 		EnableParallelQuery:    c.EnableParallelQuery,
-		QueryStrategy:          resolveQueryStrategy(c.QueryStrategy),
+		QueryStrategy:          queryStrategy,
 	}
 
 	if c.ClientIP != nil {
@@ -367,18 +378,18 @@ func (c *DNSConfig) Build() (*dns.Config, error) {
 	return config, nil
 }
 
-func resolveQueryStrategy(queryStrategy string) dns.QueryStrategy {
-	switch strings.ToLower(queryStrategy) {
-	case "useip", "use_ip", "use-ip":
-		return dns.QueryStrategy_USE_IP
+func resolveQueryStrategy(queryStrategy string) (dns.QueryStrategy, error) {
+	switch strings.ToLower(strings.TrimSpace(queryStrategy)) {
+	case "", "useip", "use_ip", "use-ip":
+		return dns.QueryStrategy_USE_IP, nil
 	case "useip4", "useipv4", "use_ip4", "use_ipv4", "use_ip_v4", "use-ip4", "use-ipv4", "use-ip-v4":
-		return dns.QueryStrategy_USE_IP4
+		return dns.QueryStrategy_USE_IP4, nil
 	case "useip6", "useipv6", "use_ip6", "use_ipv6", "use_ip_v6", "use-ip6", "use-ipv6", "use-ip-v6":
-		return dns.QueryStrategy_USE_IP6
+		return dns.QueryStrategy_USE_IP6, nil
 	case "usesys", "usesystem", "use_sys", "use_system", "use-sys", "use-system":
-		return dns.QueryStrategy_USE_SYS
+		return dns.QueryStrategy_USE_SYS, nil
 	default:
-		return dns.QueryStrategy_USE_IP
+		return dns.QueryStrategy_USE_IP, errors.New("unknown DNS query strategy: " + queryStrategy)
 	}
 }
 

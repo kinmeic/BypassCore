@@ -10,7 +10,6 @@ import (
 	"github.com/eugene/bypasscore/common"
 	"github.com/eugene/bypasscore/common/errors"
 	"github.com/eugene/bypasscore/common/net"
-	"github.com/eugene/bypasscore/common/session"
 	dns_feature "github.com/eugene/bypasscore/features/dns"
 
 	"golang.org/x/net/dns/dnsmessage"
@@ -62,7 +61,6 @@ type dnsRequest struct {
 	reqType dnsmessage.Type
 	domain  string
 	start   time.Time
-	expire  time.Time
 	msg     *dnsmessage.Message
 }
 
@@ -251,17 +249,4 @@ L:
 	}
 
 	return ipRecord, nil
-}
-
-// toDnsContext returns a background context that carries the inbound/content
-// session info of the parent context (for logging). Detached so DNS queries
-// don't get cancelled by the caller's context.
-func toDnsContext(ctx context.Context, addr string) context.Context {
-	// Detach from caller cancellation: DNS lookups should outlive the request.
-	bg := context.Background()
-	if inbound := session.InboundFromContext(ctx); inbound != nil {
-		bg = session.ContextWithInbound(bg, inbound)
-	}
-	bg = session.ContextWithContent(bg, session.ContentFromContext(ctx))
-	return bg
 }

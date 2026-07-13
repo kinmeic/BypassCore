@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/eugene/bypasscore/app/router"
+	"github.com/eugene/bypasscore/common/net"
 )
 
 // --- RouterConfig.Build end-to-end ---
@@ -34,6 +35,30 @@ func TestRouterConfig_BuildMinimal(t *testing.T) {
 	}
 }
 
+func TestRouterRuleStrictFieldsAndDomainAliasesMerge(t *testing.T) {
+	rule, err := parseRule(json.RawMessage(`{
+		"domain":["full:a.example"],
+		"domains":["full:b.example"],
+		"outboundTag":"direct"
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rule.Domain) != 2 {
+		t.Fatalf("domain aliases should merge, got %d rules", len(rule.Domain))
+	}
+	if _, err := parseRule(json.RawMessage(`{"domian":["a.example"],"outboundTag":"direct"}`)); err == nil {
+		t.Fatal("unknown routing-rule field must be rejected")
+	}
+}
+
+func TestNameServerRejectsUnknownField(t *testing.T) {
+	var ns NameServerConfig
+	if err := json.Unmarshal([]byte(`{"address":"1.1.1.1","adress":"8.8.8.8"}`), &ns); err == nil {
+		t.Fatal("unknown nameserver field must be rejected")
+	}
+}
+
 func TestRouterConfig_DomainStrategy(t *testing.T) {
 	cases := []struct {
 		in   string
@@ -45,13 +70,16 @@ func TestRouterConfig_DomainStrategy(t *testing.T) {
 		{"IpIfNonMatch", router.Config_IpIfNonMatch},
 		{"ipondemand", router.Config_IpOnDemand},
 		{"IpOnDemand", router.Config_IpOnDemand},
-		{"unknown", router.Config_AsIs},
 	}
 	for _, c := range cases {
 		rc := &RouterConfig{DomainStrategy: &c.in}
-		got := rc.getDomainStrategy()
-		// getDomainStrategy is lowercase-only; test via Build for the public path.
-		_ = got
+		got, err := rc.getDomainStrategy()
+		if err != nil {
+			t.Fatalf("getDomainStrategy(%q): %v", c.in, err)
+		}
+		if got != c.want {
+			t.Errorf("getDomainStrategy(%q) = %v, want %v", c.in, got, c.want)
+		}
 	}
 	// Verify through Build for representative cases.
 	ds := "ipondemand"
@@ -62,6 +90,20 @@ func TestRouterConfig_DomainStrategy(t *testing.T) {
 	}
 	if cfg.DomainStrategy != router.Config_IpOnDemand {
 		t.Errorf("DomainStrategy = %v, want IpOnDemand", cfg.DomainStrategy)
+	}
+	unknown := "unknown"
+	if _, err := (&RouterConfig{DomainStrategy: &unknown}).Build(); err == nil {
+		t.Error("unknown domain strategy must be rejected")
+	}
+}
+
+func TestDNSConfigRejectsUnknownQueryStrategy(t *testing.T) {
+	if _, err := (&DNSConfig{QueryStrategy: "unexpected"}).Build(); err == nil {
+		t.Error("unknown top-level DNS query strategy must be rejected")
+	}
+	server := &NameServerConfig{Address: &Address{Address: net.ParseAddress("1.1.1.1")}, QueryStrategy: "unexpected"}
+	if _, err := server.Build(); err == nil {
+		t.Error("unknown nameserver query strategy must be rejected")
 	}
 }
 
@@ -112,9 +154,9 @@ func TestBalancingRule_Build_StrategyNormalization(t *testing.T) {
 	}
 	for _, c := range cases {
 		br := &BalancingRule{
-			Tag:      "b",
+			Tag:       "b",
 			Selectors: StringList{"wan"},
-			Strategy: StrategyConfig{Type: c.in},
+			Strategy:  StrategyConfig{Type: c.in},
 		}
 		got, err := br.Build()
 		if err != nil {

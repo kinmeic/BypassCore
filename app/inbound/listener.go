@@ -10,6 +10,8 @@ import (
 
 	"github.com/eugene/bypasscore/app/dispatcher"
 	"github.com/eugene/bypasscore/common/errors"
+	bcnet "github.com/eugene/bypasscore/common/net"
+	"github.com/eugene/bypasscore/common/session"
 )
 
 // Listener is a transparent proxy listener supporting both TCP (redirect/tproxy)
@@ -25,7 +27,7 @@ type Listener struct {
 	// activeConns tracks accepted TCP connections so Close() can force-close
 	// them, unblocking handleConn→Dispatch→Bridge goroutines that would
 	// otherwise block wg.Wait() forever.
-	connMu     sync.Mutex
+	connMu      sync.Mutex
 	activeConns map[net.Conn]struct{}
 
 	ctx    context.Context
@@ -35,8 +37,8 @@ type Listener struct {
 // New creates a Listener.
 func New(cfg *Config, d *dispatcher.Dispatcher) *Listener {
 	return &Listener{
-		cfg:        cfg,
-		dispatcher: d,
+		cfg:         cfg,
+		dispatcher:  d,
 		activeConns: make(map[net.Conn]struct{}),
 	}
 }
@@ -44,18 +46,28 @@ func New(cfg *Config, d *dispatcher.Dispatcher) *Listener {
 // Start begins listening on TCP and/or UDP based on the network config.
 func (l *Listener) Start() error {
 	l.ctx, l.cancel = context.WithCancel(context.Background())
-
-	netCfg := strings.ToLower(l.cfg.Network)
-	if netCfg == "" {
-		netCfg = "tcp"
+	typeCfg := strings.ToLower(strings.TrimSpace(l.cfg.Type))
+	if typeCfg == "" {
+		typeCfg = "redirect"
+	}
+	if typeCfg != "redirect" && typeCfg != "tproxy" {
+		return errors.New("inbound: type must be redirect or tproxy")
 	}
 
-	wantTCP := strings.Contains(netCfg, "tcp")
-	wantUDP := strings.Contains(netCfg, "udp")
+	if l.cfg.Port < 1 || l.cfg.Port > 65535 {
+		return errors.New("inbound: port must be between 1 and 65535")
+	}
+	wantTCP, wantUDP, err := parseInboundNetworks(l.cfg.Network)
+	if err != nil {
+		return err
+	}
+	if wantUDP && typeCfg != "tproxy" {
+		return errors.New("inbound: UDP requires type=tproxy")
+	}
 
 	if wantTCP {
 		addr := net.JoinHostPort(l.cfg.Listen, strconv.Itoa(l.cfg.Port))
-		ln, err := net.Listen("tcp", addr)
+		ln, err := listenTCP(l.cfg, addr)
 		if err != nil {
 			return errors.New("inbound TCP listen failed: ", addr).Base(err)
 		}
@@ -82,6 +94,24 @@ func (l *Listener) Start() error {
 	}
 
 	return nil
+}
+
+func parseInboundNetworks(value string) (bool, bool, error) {
+	if strings.TrimSpace(value) == "" {
+		return true, false, nil
+	}
+	var tcp, udp bool
+	for _, item := range strings.Split(strings.ToLower(value), ",") {
+		switch strings.TrimSpace(item) {
+		case "tcp":
+			tcp = true
+		case "udp":
+			udp = true
+		default:
+			return false, false, errors.New("inbound: network must contain only tcp and/or udp")
+		}
+	}
+	return tcp, udp, nil
 }
 
 // Close stops all listeners and force-closes active connections so that
@@ -147,16 +177,30 @@ func (l *Listener) handleConn(conn net.Conn) {
 	}
 	l.connMu.Unlock()
 
-	// Get original destination via SO_ORIGINAL_DST (TCP redirect/tproxy).
-	dest, err := getOriginalDst(conn)
-	if err != nil {
-		errors.LogErrorInner(context.Background(), err, "inbound failed to get original dest")
-		conn.Close()
-		return
+	var dest bcnet.Destination
+	var err error
+	if strings.EqualFold(l.cfg.Type, "tproxy") {
+		// As in Xray, a transparent TCP socket exposes the intercepted target as
+		// the accepted connection's local address.
+		dest = bcnet.DestinationFromAddr(conn.LocalAddr())
+	} else {
+		dest, err = getOriginalDst(conn)
+		if err != nil {
+			errors.LogErrorInner(context.Background(), err, "inbound failed to get original dest")
+			conn.Close()
+			return
+		}
 	}
 
+	ctx := session.ContextWithInbound(l.ctx, &session.Inbound{
+		Source: bcnet.DestinationFromAddr(conn.RemoteAddr()),
+		Local:  bcnet.DestinationFromAddr(conn.LocalAddr()),
+		Tag:    l.cfg.Tag,
+	})
+	ctx = session.ContextWithContent(ctx, new(session.Content))
+
 	// Dispatch blocks until the connection is fully proxied.
-	if err := l.dispatcher.Dispatch(l.ctx, conn, dest); err != nil {
+	if err := l.dispatcher.Dispatch(ctx, conn, dest); err != nil {
 		errors.LogErrorInner(context.Background(), err, "inbound dispatch failed for ", dest.String())
 	}
 }

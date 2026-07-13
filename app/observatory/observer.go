@@ -18,8 +18,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/eugene/bypasscore/app/dialer"
 	appoutbound "github.com/eugene/bypasscore/app/outbound"
 	"github.com/eugene/bypasscore/common/errors"
+	bcnet "github.com/eugene/bypasscore/common/net"
 	"github.com/eugene/bypasscore/features/extension"
 	"google.golang.org/protobuf/proto"
 )
@@ -33,6 +35,8 @@ type Observer struct {
 
 	statusLock sync.Mutex
 	status     []*OutboundStatus
+	startOnce  sync.Once
+	wg         sync.WaitGroup
 
 	ohm *appoutbound.Manager
 }
@@ -41,8 +45,10 @@ type Observer struct {
 func (o *Observer) GetObservation(_ context.Context) (proto.Message, error) {
 	o.statusLock.Lock()
 	defer o.statusLock.Unlock()
-	out := make([]*OutboundStatus, len(o.status))
-	copy(out, o.status)
+	out := make([]*OutboundStatus, 0, len(o.status))
+	for _, status := range o.status {
+		out = append(out, proto.Clone(status).(*OutboundStatus))
+	}
 	return &ObservationResult{Status: out}, nil
 }
 
@@ -54,7 +60,13 @@ func (o *Observer) Start() error {
 	if o.config == nil || len(o.config.SubjectSelector) == 0 {
 		return nil
 	}
-	go o.background()
+	o.startOnce.Do(func() {
+		o.wg.Add(1)
+		go func() {
+			defer o.wg.Done()
+			o.background()
+		}()
+	})
 	return nil
 }
 
@@ -63,6 +75,7 @@ func (o *Observer) Close() error {
 	if o.cancel != nil {
 		o.cancel()
 	}
+	o.wg.Wait()
 	return nil
 }
 
@@ -143,17 +156,18 @@ func (o *Observer) probe(outboundTag string) ProbeResult {
 		probeURL = o.config.ProbeUrl
 	}
 
-	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	if ob := o.ohm.GetOutbound(outboundTag); ob != nil && ob.Bind != nil {
-		applyBinding(dialer, ob.Bind)
+	outboundDialer := o.ohm.GetDialer(outboundTag)
+	if outboundDialer == nil {
+		return ProbeResult{Alive: false, LastErrorReason: "outbound dialer not found: " + outboundTag}
 	}
 
 	transport := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           dialer.DialContext,
+		Proxy:                 nil,
+		DialContext:           outboundHTTPDialContext(outboundDialer),
 		TLSHandshakeTimeout:   5 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
+	defer transport.CloseIdleConnections()
 	client := &http.Client{
 		Transport: transport,
 		Timeout:   5 * time.Second,
@@ -185,6 +199,23 @@ func (o *Observer) probe(outboundTag string) ProbeResult {
 	delay := time.Since(start)
 	errors.LogInfo(o.ctx, "outbound ", outboundTag, " is alive: ", delay.Seconds())
 	return ProbeResult{Alive: true, Delay: delay.Milliseconds()}
+}
+
+func outboundHTTPDialContext(outboundDialer dialer.Dialer) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		if network != "tcp" && network != "tcp4" && network != "tcp6" {
+			return nil, fmt.Errorf("unsupported probe network %q", network)
+		}
+		host, portText, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, err
+		}
+		port, err := bcnet.PortFromString(portText)
+		if err != nil {
+			return nil, err
+		}
+		return outboundDialer.Dial(ctx, bcnet.TCPDestination(bcnet.ParseAddress(host), port))
+	}
 }
 
 // applyBinding configures the dialer to use the outbound's bound local IP.

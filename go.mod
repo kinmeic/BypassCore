@@ -2,6 +2,8 @@ module github.com/eugene/bypasscore
 
 go 1.26
 
+toolchain go1.26.5
+
 require (
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba
 	golang.org/x/net v0.57.0

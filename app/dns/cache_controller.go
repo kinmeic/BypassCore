@@ -40,6 +40,11 @@ type CacheController struct {
 	requestGroup  singleflight.Group
 }
 
+func (c *CacheController) Close() error {
+	_ = c.cacheCleanup.Close()
+	return c.pub.Close()
+}
+
 func NewCacheController(name string, disableCache bool, serveStale bool, serveExpiredTTL uint32) *CacheController {
 	c := &CacheController{
 		name:            name,

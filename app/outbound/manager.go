@@ -2,6 +2,7 @@ package outbound
 
 import (
 	"context"
+	"net"
 	"strings"
 	"sync"
 
@@ -25,12 +26,13 @@ type Manager struct {
 	handlers map[string]*handler
 	// order preserves insertion order so the first registered outbound is the
 	// default.
-	order []string
+	order         []string
+	duplicateTags map[string]struct{}
 }
 
 // NewManager creates a Manager from an outbound descriptor config.
 func NewManager(cfg *Config) *Manager {
-	m := &Manager{handlers: make(map[string]*handler)}
+	m := &Manager{handlers: make(map[string]*handler), duplicateTags: make(map[string]struct{})}
 	if cfg != nil {
 		for _, ob := range cfg.Outbounds {
 			m.Add(ob)
@@ -48,6 +50,8 @@ func (m *Manager) Add(ob *Outbound) {
 	defer m.mu.Unlock()
 	if _, exists := m.handlers[ob.Tag]; !exists {
 		m.order = append(m.order, ob.Tag)
+	} else {
+		m.duplicateTags[ob.Tag] = struct{}{}
 	}
 	m.handlers[ob.Tag] = &handler{ob: ob}
 }
@@ -152,9 +156,24 @@ func (m *Manager) Validate() error {
 	if len(m.handlers) == 0 {
 		return errors.New("no outbound configured")
 	}
+	for tag := range m.duplicateTags {
+		return errors.New("duplicate outbound tag: ", tag)
+	}
 	for tag, h := range m.handlers {
 		if h.ob.Mode == ModeProxy && (h.ob.Upstream == nil || h.ob.Upstream.Server == "") {
 			return errors.New("proxy outbound ", tag, " requires upstream.server")
+		}
+		if h.ob.Mode == ModeProxy {
+			protocol := strings.TrimSpace(h.ob.Upstream.Protocol)
+			if protocol != "" && !strings.EqualFold(protocol, "socks") {
+				return errors.New("proxy outbound ", tag, " only supports upstream.protocol=socks")
+			}
+			if _, _, err := net.SplitHostPort(h.ob.Upstream.Server); err != nil {
+				return errors.New("proxy outbound ", tag, " has invalid upstream.server").Base(err)
+			}
+		}
+		if h.ob.Bind != nil && h.ob.Bind.LocalIP != "" && net.ParseIP(h.ob.Bind.LocalIP) == nil {
+			return errors.New("outbound ", tag, " has invalid bind.localIP")
 		}
 	}
 	return nil
@@ -193,7 +212,6 @@ func (m *Manager) RemoveHandler(_ context.Context, tag string) error {
 	}
 	return nil
 }
-
 
 // GetDialer returns the Dialer for the given outbound tag, or nil.
 func (m *Manager) GetDialer(tag string) dialer.Dialer {

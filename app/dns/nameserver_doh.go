@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/eugene/bypasscore/common/errors"
-	bcnet "github.com/eugene/bypasscore/common/net"
 	"github.com/eugene/bypasscore/common/log"
+	bcnet "github.com/eugene/bypasscore/common/net"
 	dns_feature "github.com/eugene/bypasscore/features/dns"
 )
 
@@ -146,7 +146,22 @@ func (s *DoHNameServer) dohHTTPSContext(ctx context.Context, b []byte) ([]byte, 
 		_, _ = io.Copy(io.Discard, resp.Body)
 		return nil, fmt.Errorf("DOH server returned code %d", resp.StatusCode)
 	}
-	return io.ReadAll(resp.Body)
+	const maxDNSMessageSize = 65535
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxDNSMessageSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxDNSMessageSize {
+		return nil, fmt.Errorf("DOH response exceeds %d bytes", maxDNSMessageSize)
+	}
+	return data, nil
+}
+
+func (s *DoHNameServer) Close() error {
+	if transport, ok := s.httpClient.Transport.(*http.Transport); ok {
+		transport.CloseIdleConnections()
+	}
+	return s.cacheController.Close()
 }
 
 // QueryIP implements Server.

@@ -10,6 +10,8 @@ import (
 // bypassing its strategy. Equivalent to SetOverrideTarget but kept for API
 // compatibility with callers that expect the explicit override verb.
 func (r *Router) OverrideBalancer(balancer string, target string) error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	b, found := r.balancers[balancer]
 	if !found {
 		return errors.New("balancer '", balancer, "' not found")
