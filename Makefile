@@ -6,8 +6,9 @@ CONFIG ?= examples/config.example.json
 build:
 	go build -o bin/$(BINARY) ./cmd/bypasscore
 
+# daemon 模式: 启动 tproxy 监听 + 路由 + 出站
 run: build
-	./bin/$(BINARY) -config $(CONFIG)
+	./bin/$(BINARY) -config $(CONFIG) -run
 
 # 路由决策演示: make run-test DEST=tcp:www.google.com:443
 run-test: build
