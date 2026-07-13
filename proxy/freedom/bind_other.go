@@ -2,8 +2,12 @@
 
 package freedom
 
-import "net"
+import "syscall"
 
-// bindInterface is a no-op on non-Linux platforms (SO_BINDTODEVICE is
+// makeBindControl is a no-op on non-Linux platforms (SO_BINDTODEVICE is
 // Linux-specific). The localIP binding (LocalAddr) still works everywhere.
-func bindInterface(_ net.Conn, _ string) error { return nil }
+// On non-Linux, interface binding is silently skipped — callers that need
+// it should run on Linux.
+func makeBindControl(_ string) func(network, address string, c syscall.RawConn) error {
+	return nil
+}

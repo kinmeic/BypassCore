@@ -154,6 +154,14 @@ func (ctx *Context) GetSkipDNSResolve() bool {
 // AsRoutingContext creates a context from context.context with session info.
 func AsRoutingContext(ctx context.Context) routing.Context {
 	outbounds := session.OutboundsFromContext(ctx)
+	if len(outbounds) == 0 {
+		// No outbound in the session — return a minimal context so callers
+		// get a usable (if empty) routing.Context instead of a panic.
+		return &Context{
+			Inbound: session.InboundFromContext(ctx),
+			Content: session.ContentFromContext(ctx),
+		}
+	}
 	ob := outbounds[len(outbounds)-1]
 	return &Context{
 		Inbound:  session.InboundFromContext(ctx),

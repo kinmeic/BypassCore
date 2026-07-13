@@ -67,12 +67,14 @@ func (h *Handler) Tag() string { return h.tag }
 // Dial connects to the SOCKS5 server, performs the handshake, and returns a
 // tunnelled connection to dest.
 func (h *Handler) Dial(ctx context.Context, dest bcnet.Destination) (net.Conn, error) {
-	network := "tcp"
 	if dest.Network == bcnet.Network_UDP {
-		// SOCKS5 UDP associate is more complex; fall back to TCP for now.
-		network = "tcp"
+		// SOCKS5 UDP ASSOCIATE is not yet implemented; TCP CONNECT cannot
+		// carry UDP. Reject explicitly so the caller gets a clear error
+		// instead of silently misrouting UDP traffic as TCP.
+		return nil, errors.New("socks5: UDP associate not supported")
 	}
 
+	network := "tcp"
 	d := net.Dialer{Timeout: h.timeout}
 	conn, err := d.DialContext(ctx, network, h.server)
 	if err != nil {

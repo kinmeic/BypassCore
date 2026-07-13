@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/eugene/bypasscore/app/dispatcher"
 	"github.com/eugene/bypasscore/common/errors"
@@ -21,13 +22,23 @@ type Listener struct {
 	udpListener *udpTproxyListener
 	wg          sync.WaitGroup
 
+	// activeConns tracks accepted TCP connections so Close() can force-close
+	// them, unblocking handleConn→Dispatch→Bridge goroutines that would
+	// otherwise block wg.Wait() forever.
+	connMu     sync.Mutex
+	activeConns map[net.Conn]struct{}
+
 	ctx    context.Context
 	cancel context.CancelFunc
 }
 
 // New creates a Listener.
 func New(cfg *Config, d *dispatcher.Dispatcher) *Listener {
-	return &Listener{cfg: cfg, dispatcher: d}
+	return &Listener{
+		cfg:        cfg,
+		dispatcher: d,
+		activeConns: make(map[net.Conn]struct{}),
+	}
 }
 
 // Start begins listening on TCP and/or UDP based on the network config.
@@ -73,7 +84,8 @@ func (l *Listener) Start() error {
 	return nil
 }
 
-// Close stops all listeners.
+// Close stops all listeners and force-closes active connections so that
+// blocked handleConn goroutines unblock and wg.Wait() returns promptly.
 func (l *Listener) Close() error {
 	if l.cancel != nil {
 		l.cancel()
@@ -84,6 +96,14 @@ func (l *Listener) Close() error {
 	if l.udpListener != nil {
 		_ = l.udpListener.Close()
 	}
+	// Force-close all active connections so Dispatch→Bridge goroutines
+	// unblock (io.Copy returns when a conn is closed).
+	l.connMu.Lock()
+	for conn := range l.activeConns {
+		_ = conn.Close()
+	}
+	l.activeConns = nil // prevent further tracking
+	l.connMu.Unlock()
 	l.wg.Wait()
 	return nil
 }
@@ -98,6 +118,12 @@ func (l *Listener) acceptLoop() {
 				return
 			}
 			errors.LogErrorInner(context.Background(), err, "inbound accept failed")
+			// Back off on persistent errors (e.g. EMFILE) to avoid burning CPU.
+			select {
+			case <-l.ctx.Done():
+				return
+			case <-time.After(100 * time.Millisecond):
+			}
 			continue
 		}
 		l.wg.Add(1)
@@ -108,6 +134,18 @@ func (l *Listener) acceptLoop() {
 // handleConn recovers the original destination and dispatches.
 func (l *Listener) handleConn(conn net.Conn) {
 	defer l.wg.Done()
+
+	// Track the connection so Close() can force-close it to unblock Bridge.
+	l.connMu.Lock()
+	if l.activeConns != nil {
+		l.activeConns[conn] = struct{}{}
+		defer func() {
+			l.connMu.Lock()
+			delete(l.activeConns, conn)
+			l.connMu.Unlock()
+		}()
+	}
+	l.connMu.Unlock()
 
 	// Get original destination via SO_ORIGINAL_DST (TCP redirect/tproxy).
 	dest, err := getOriginalDst(conn)

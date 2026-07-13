@@ -4,6 +4,7 @@ package blackhole
 
 import (
 	"context"
+	"io"
 	"net"
 	"time"
 
@@ -24,24 +25,26 @@ func New(tag string) *Handler {
 // Tag returns the outbound tag.
 func (h *Handler) Tag() string { return h.tag }
 
-// Dial returns a closed connection, effectively dropping the traffic.
-// The returned net.Conn is immediately useless (already closed), so
-// transport.Bridge will copy nothing and close the inbound side.
+// Dial returns a discard connection, effectively dropping the traffic.
+// The returned net.Conn accepts writes (discarding them) and returns EOF
+// on read, so transport.Bridge cleanly closes the inbound side without
+// logging spurious errors.
 func (h *Handler) Dial(_ context.Context, dest bcnet.Destination) (net.Conn, error) {
 	errors.LogInfo(context.Background(), "blackhole[", h.tag, "] dropping ", dest.String())
-	// Return a closed pipe — Bridge will see EOF and close the inbound.
-	return &closedConn{}, nil
+	return &discardConn{}, nil
 }
 
-// closedConn is a net.Conn that is already closed. Reads return EOF, writes
-// return an error.
-type closedConn struct{}
+// discardConn is a net.Conn that discards all writes and signals EOF on read.
+// This is the correct sink for a blackhole: io.Copy treats io.EOF as a
+// normal completion, so Bridge returns nil (not an error) and the inbound
+// side is cleanly closed.
+type discardConn struct{}
 
-func (*closedConn) Read([]byte) (int, error)         { return 0, net.ErrClosed }
-func (*closedConn) Write([]byte) (int, error)        { return 0, net.ErrClosed }
-func (*closedConn) Close() error                      { return nil }
-func (*closedConn) LocalAddr() net.Addr               { return &net.IPAddr{} }
-func (*closedConn) RemoteAddr() net.Addr              { return &net.IPAddr{} }
-func (*closedConn) SetDeadline(t time.Time) error   { return nil }
-func (*closedConn) SetReadDeadline(t time.Time) error  { return nil }
-func (*closedConn) SetWriteDeadline(t time.Time) error { return nil }
+func (*discardConn) Read([]byte) (int, error)          { return 0, io.EOF }
+func (*discardConn) Write(p []byte) (int, error)       { return len(p), nil }
+func (*discardConn) Close() error                      { return nil }
+func (*discardConn) LocalAddr() net.Addr               { return &net.IPAddr{} }
+func (*discardConn) RemoteAddr() net.Addr              { return &net.IPAddr{} }
+func (*discardConn) SetDeadline(t time.Time) error     { return nil }
+func (*discardConn) SetReadDeadline(t time.Time) error  { return nil }
+func (*discardConn) SetWriteDeadline(t time.Time) error { return nil }

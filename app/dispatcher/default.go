@@ -28,12 +28,6 @@ type Dispatcher struct {
 	sniffer *Sniffer
 }
 
-// DialerManager looks up a Dialer by tag.
-type OutboundManager interface {
-	GetDialer(tag string) dialer.Dialer
-	GetDefaultDialer() dialer.Dialer
-}
-
 // New creates a Dispatcher.
 func New(router routing.Router, ohm DialerManager, sniffer *Sniffer) *Dispatcher {
 	return &Dispatcher{
@@ -54,8 +48,12 @@ func (d *Dispatcher) Dispatch(ctx context.Context, conn net.Conn, dest bcnet.Des
 	rctx := buildRoutingContext(ctx, dest)
 
 	// Sniff the first bytes to recover the domain (if enabled).
+	// Sniff returns a new conn that replays the consumed bytes, so the
+	// outbound stream is not truncated.
 	if d.sniffer != nil {
-		if sniffed := d.sniffer.Sniff(conn); sniffed != "" {
+		var sniffed string
+		conn, sniffed = d.sniffer.Sniff(conn)
+		if sniffed != "" {
 			errors.LogInfo(ctx, "sniffed domain: ", sniffed, " for ", dest.String())
 			// Override destination address with sniffed domain.
 			dest.Address = bcnet.ParseAddress(sniffed)

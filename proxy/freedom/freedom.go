@@ -10,6 +10,7 @@ package freedom
 import (
 	"context"
 	"net"
+	"time"
 
 	"github.com/eugene/bypasscore/common/errors"
 	bcnet "github.com/eugene/bypasscore/common/net"
@@ -17,8 +18,8 @@ import (
 
 // Handler is a freedom (direct-connect) outbound dialer.
 type Handler struct {
-	tag      string
-	bindIP   net.IP  // source IP to dial from (sendThrough)
+	tag       string
+	bindIP    net.IP // source IP to dial from (sendThrough)
 	bindIface string // network interface to bind to (Linux only)
 }
 
@@ -47,7 +48,9 @@ func (h *Handler) Dial(ctx context.Context, dest bcnet.Destination) (net.Conn, e
 
 	errors.LogInfo(ctx, "freedom[", h.tag, "] dialing ", network, "://", address)
 
-	dialer := &net.Dialer{}
+	dialer := &net.Dialer{
+		Timeout: 10 * time.Second, // default so unreachable hosts don't hang forever
+	}
 	if h.bindIP != nil {
 		// Bind to source IP (sendThrough).
 		if dest.Network == bcnet.Network_TCP {
@@ -57,17 +60,17 @@ func (h *Handler) Dial(ctx context.Context, dest bcnet.Destination) (net.Conn, e
 		}
 	}
 
+	// Bind to interface (Linux only, via SO_BINDTODEVICE). This must be done
+	// BEFORE connect (in the Control callback) so the kernel selects the
+	// correct egress interface for the route. Setting it post-connect has no
+	// effect on the existing connection.
+	if h.bindIface != "" {
+		dialer.Control = makeBindControl(h.bindIface)
+	}
+
 	conn, err := dialer.DialContext(ctx, network, address)
 	if err != nil {
 		return nil, errors.New("freedom dial failed: ", address).Base(err)
-	}
-
-	// Bind to interface (Linux only, via SO_BINDTODEVICE).
-	if h.bindIface != "" {
-		if err := bindInterface(conn, h.bindIface); err != nil {
-			conn.Close()
-			return nil, errors.New("freedom bind interface ", h.bindIface, " failed").Base(err)
-		}
 	}
 
 	return conn, nil
