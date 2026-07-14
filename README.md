@@ -24,6 +24,10 @@
 # 编译（产出 bin/bypasscore）
 make build
 
+# 查看版本
+./bin/bypasscore --version
+./bin/bypasscore -V
+
 # daemon 模式（启动 tproxy 监听 + 路由 + 出站）
 make run
 

@@ -42,6 +42,9 @@ type Config struct {
 	Observatory *observatory.Config     `json:"observatory"`
 }
 
+// version is overridden by release builds with -ldflags=-X main.version=... .
+var version = "dev"
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -55,7 +58,14 @@ func run() error {
 	resolve := flag.String("resolve", "", `resolve a domain via DNS, e.g. "example.com"`)
 	observe := flag.Bool("observe", false, "run a single observatory probe round")
 	runMode := flag.Bool("run", false, "run as a daemon (listen + dispatch)")
+	showVersion := false
+	flag.BoolVar(&showVersion, "version", false, "print version and exit")
+	flag.BoolVar(&showVersion, "V", false, "print version and exit")
 	flag.Parse()
+	if showVersion {
+		fmt.Println("BypassCore", version)
+		return nil
+	}
 
 	cfg, err := loadConfig(*configPath)
 	if err != nil {

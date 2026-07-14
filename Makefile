@@ -2,9 +2,11 @@
 
 BINARY := bypasscore
 CONFIG ?= examples/config.example.json
+VERSION ?= dev
+LDFLAGS ?= -X main.version=$(VERSION)
 
 build:
-	go build -o bin/$(BINARY) ./cmd/bypasscore
+	go build -ldflags="$(LDFLAGS)" -o bin/$(BINARY) ./cmd/bypasscore
 
 # daemon 模式: 启动 tproxy 监听 + 路由 + 出站
 run: build

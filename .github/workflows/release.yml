@@ -26,7 +26,8 @@ jobs:
       - name: Build all targets
         run: |
           mkdir -p dist
-          LDFLAGS="-s -w"
+          VERSION="${GITHUB_REF_NAME#v}"
+          LDFLAGS="-s -w -X main.version=${VERSION}"
 
           # linux x86_64
           CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 GOAMD64=v1 go build -ldflags="$LDFLAGS" -o dist/bypasscore-linux-x86_64                 ./cmd/bypasscore
@@ -49,7 +50,7 @@ jobs:
 
       - name: Build OpenWrt .ipk + .apk installable packages
         run: |
-          # Version from the tag name (strip leading 'v'); e.g. v1.0.2 -> 1.0.2
+          # Version from the tag name (strip leading 'v'); e.g. v1.0.5 -> 1.0.5
           VERSION="${GITHUB_REF_NAME#v}"
           mkdir -p dist/pkgout
 
