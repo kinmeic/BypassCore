@@ -39,23 +39,23 @@ sudo ip netns add bc-server
 sudo ip link add bc-client type veth peer name eth0 netns bc-client
 sudo ip link add bc-server type veth peer name eth0 netns bc-server
 sudo ip addr add 10.10.0.1/24 dev bc-client
-sudo ip addr add fd00:10::1/64 dev bc-client
+sudo ip addr add fd00:10::1/64 dev bc-client nodad
 sudo ip addr add 10.20.0.1/24 dev bc-server
-sudo ip addr add fd00:20::1/64 dev bc-server
+sudo ip addr add fd00:20::1/64 dev bc-server nodad
 sudo ip link set bc-client up
 sudo ip link set bc-server up
 
 sudo ip netns exec bc-client ip link set lo up
 sudo ip netns exec bc-client ip link set eth0 up
 sudo ip netns exec bc-client ip addr add 10.10.0.2/24 dev eth0
-sudo ip netns exec bc-client ip addr add fd00:10::2/64 dev eth0
+sudo ip netns exec bc-client ip addr add fd00:10::2/64 dev eth0 nodad
 sudo ip netns exec bc-client ip route add default via 10.10.0.1
 sudo ip netns exec bc-client ip -6 route add default via fd00:10::1
 
 sudo ip netns exec bc-server ip link set lo up
 sudo ip netns exec bc-server ip link set eth0 up
 sudo ip netns exec bc-server ip addr add 10.20.0.2/24 dev eth0
-sudo ip netns exec bc-server ip addr add fd00:20::2/64 dev eth0
+sudo ip netns exec bc-server ip addr add fd00:20::2/64 dev eth0 nodad
 sudo ip netns exec bc-server ip route add default via 10.20.0.1
 sudo ip netns exec bc-server ip -6 route add default via fd00:20::1
 sudo ip netns exec bc-server iptables -A INPUT -p udp --dport 20000:21999 -j DROP
