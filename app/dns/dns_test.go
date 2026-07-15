@@ -10,6 +10,21 @@ import (
 	dns_feature "github.com/eugene/bypasscore/features/dns"
 )
 
+type rawSelectionServer struct {
+	name  string
+	calls int
+}
+
+func (s *rawSelectionServer) Name() string       { return s.name }
+func (*rawSelectionServer) IsDisableCache() bool { return true }
+func (*rawSelectionServer) QueryIP(context.Context, string, dns_feature.IPOption) ([]bcnet.IP, uint32, error) {
+	return nil, 0, dns_feature.ErrEmptyResponse
+}
+func (s *rawSelectionServer) QueryRaw(_ context.Context, query []byte) ([]byte, error) {
+	s.calls++
+	return append([]byte(nil), query...), nil
+}
+
 func TestLookupIPContextHonorsCancellation(t *testing.T) {
 	server, err := New(context.Background(), &Config{
 		QueryStrategy: QueryStrategy_USE_IP,
@@ -27,6 +42,38 @@ func TestLookupIPContextHonorsCancellation(t *testing.T) {
 	_, _, err = server.LookupIPContext(ctx, "cancel.test", dns_feature.IPOption{IPv4Enable: true})
 	if !goerrors.Is(err, context.Canceled) {
 		t.Fatalf("LookupIPContext error=%v, want context.Canceled", err)
+	}
+}
+
+func TestLookupRawHonorsDomainSpecificFinalAndDefaultFallback(t *testing.T) {
+	rules, err := geodata.ParseDomainRules([]string{"domain:cn"}, geodata.Domain_Substr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	matcher, err := geodata.DomainReg.BuildDomainMatcher(rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	direct := &rawSelectionServer{name: "direct"}
+	remote := &rawSelectionServer{name: "remote"}
+	server := &DNS{
+		ctx:           context.Background(),
+		clients:       []*Client{{server: direct, skipFallback: true, finalQuery: true}, {server: remote}},
+		domainMatcher: matcher,
+		matcherInfos:  []*DomainMatcherInfo{{clientIdx: 0, domainRule: "domain:cn"}},
+	}
+
+	if _, err := server.LookupRawContext(context.Background(), "www.example.com", []byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	if direct.calls != 0 || remote.calls != 1 {
+		t.Fatalf("unmatched raw query used direct=%d remote=%d", direct.calls, remote.calls)
+	}
+	if _, err := server.LookupRawContext(context.Background(), "www.example.cn", []byte{2}); err != nil {
+		t.Fatal(err)
+	}
+	if direct.calls != 1 || remote.calls != 1 {
+		t.Fatalf("matched raw query used direct=%d remote=%d", direct.calls, remote.calls)
 	}
 }
 

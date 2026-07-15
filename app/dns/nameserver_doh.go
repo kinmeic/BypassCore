@@ -218,6 +218,11 @@ func (s *DoHNameServer) QueryIP(ctx context.Context, domain string, option dns_f
 	return queryIP(ctx, s, domain, option)
 }
 
+// QueryRaw forwards an arbitrary DNS wire message using RFC 8484.
+func (s *DoHNameServer) QueryRaw(ctx context.Context, query []byte) ([]byte, error) {
+	return s.dohHTTPSContext(ctx, query)
+}
+
 // randBetween returns a random int in [lo, hi).
 func randBetween(lo, hi int) int {
 	if hi <= lo {

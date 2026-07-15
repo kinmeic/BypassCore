@@ -13,7 +13,7 @@
   - `blackhole` — 丢弃
   - `proxy` — SOCKS5 client 拨到本地 naiveproxy/sing-box 的 socks 端口
 - **DNS 子系统**：多上游 DNS + 缓存 + 域名分流 + IP 过滤，UDP / TCP / DoT(RFC 7858) / DoH(RFC 8484)
-- **DNS 监听服务**：通过普通 UDP/TCP 端口向 dnsmasq 或局域网客户端提供内部 DNS 解析能力
+- **DNS 监听服务**：通过普通 UDP/TCP 端口提供 A/AAAA 解析，并将 MX/TXT/SRV/PTR/CAA 等记录类型沿相同 tagged outbound 转发
 - **负载均衡**：random / roundrobin / leastping / leastload + Observatory 健康探测
 - **进程匹配**：按源进程名/路径分流（Linux/macOS/Windows）
 - **domainStrategy**：AsIs / IpIfNonMatch / IpOnDemand
@@ -135,9 +135,10 @@ transport.Bridge (双向拷贝)
 }
 ```
 
-监听器支持普通 UDP DNS 和带两字节长度帧的 TCP DNS。A/AAAA 查询通过内部 DNS
-客户端解析；其他类型默认返回空的 NOERROR 响应，与 Xray DNS outbound 的默认行为
-一致。UDP 响应会遵守客户端声明的 EDNS 报文大小（最大 4096 字节），需要 TCP
+监听器支持普通 UDP DNS 和带两字节长度帧的 TCP DNS。A/AAAA 查询使用内部 IP
+解析与缓存路径；MX、TXT、SRV、PTR、CAA 等其他记录类型会作为经过校验的 DNS
+wire message，经所选 UDP、TCP、DoT 或 DoH 服务器及相同 tagged outbound/域名策略
+转发。UDP 响应会遵守客户端声明的 EDNS 报文大小（最大 4096 字节），需要 TCP
 重试时设置截断标志。监听 53 端口通常需要 root 权限或 `CAP_NET_BIND_SERVICE`。
 `maxQueryBytes` 用于限制单个请求解析时的内存占用，默认为 4096。
 DNS inbound 未设置 `listen` 时会安全地默认监听 `127.0.0.1`。

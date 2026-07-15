@@ -18,7 +18,8 @@ domain through sniffing, match routing rules, and forward through an outbound.
   `blackhole`, and a SOCKS5 `proxy` for naiveproxy or sing-box
 - DNS subsystem with multiple upstreams, caching, domain routing, IP filtering,
   UDP, TCP, DoT (RFC 7858), and DoH (RFC 8484)
-- A local UDP/TCP DNS listening service backed by the same DNS subsystem
+- A local UDP/TCP DNS listening service with routed A/AAAA and raw
+  MX/TXT/SRV/PTR/CAA forwarding through the same tagged outbound policy
 - Load balancing with random, round-robin, least-ping, and least-load policies,
   plus Observatory health checks
 - Process matching on Linux, macOS, and Windows
@@ -140,11 +141,12 @@ To expose the internal resolver to dnsmasq or LAN clients, add a DNS inbound:
 }
 ```
 
-The listener implements standard UDP DNS and length-prefixed DNS over TCP. It
-resolves A and AAAA records through the configured internal DNS clients; other
-query types receive an empty NOERROR response, matching Xray's default DNS
-outbound behavior. UDP replies honor the client's advertised EDNS size (capped
-at 4096 bytes) and set the truncation flag when a TCP retry is required. Binding
+The listener implements standard UDP DNS and length-prefixed DNS over TCP. A
+and AAAA records use the internal IP lookup/cache path. Other record types such
+as MX, TXT, SRV, PTR and CAA are forwarded as validated DNS wire messages over
+the selected UDP, TCP, DoT or DoH server, using the same tagged outbound and
+domain policy. UDP replies honor the client's advertised EDNS size (capped at
+4096 bytes) and set the truncation flag when a TCP retry is required. Binding
 port 53 normally requires root privileges or `CAP_NET_BIND_SERVICE`.
 `maxQueryBytes` limits memory used to parse one request and defaults to 4096.
 If `listen` is omitted, a DNS inbound binds to `127.0.0.1` for safety.

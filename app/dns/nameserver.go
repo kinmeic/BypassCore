@@ -32,6 +32,10 @@ type routedNameServer interface {
 	SetDialer(Dialer)
 }
 
+type rawNameServer interface {
+	QueryRaw(context.Context, []byte) ([]byte, error)
+}
+
 // Client wraps a Server with policy: expected/unexpected IP filters, timeout,
 // query-strategy overrides, and fallback behavior.
 type Client struct {
@@ -223,6 +227,21 @@ func (c *Client) QueryIP(ctx context.Context, domain string, option dns_feature.
 		}
 	}
 	return ips, ttl, nil
+}
+
+// QueryRaw forwards one complete DNS wire message through the same tagged
+// routing context as QueryIP. Record-type-agnostic forwarding deliberately
+// bypasses the IP cache and expected-IP filters, which only apply to A/AAAA.
+func (c *Client) QueryRaw(ctx context.Context, query []byte) ([]byte, error) {
+	server, ok := c.server.(rawNameServer)
+	if !ok {
+		return nil, errors.New("DNS server ", c.Name(), " does not support raw queries")
+	}
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	ctx = session.ContextWithInbound(ctx, &session.Inbound{Tag: c.tag})
+	ctx = session.ContextWithContent(ctx, &session.Content{Protocol: "dns", SkipDNSResolve: true})
+	return server.QueryRaw(ctx, query)
 }
 
 func isLocalDNSAddress(dest bcnet.Destination) bool {

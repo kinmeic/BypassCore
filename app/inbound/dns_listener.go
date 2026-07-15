@@ -430,9 +430,28 @@ func (l *DNSListener) handleQuery(raw []byte, udp bool) ([]byte, error) {
 	case dnsmessage.TypeAAAA:
 		option.IPv6Enable = true
 	default:
-		// Match Xray's default DNS outbound policy: non-IP query types are
-		// acknowledged with an empty NOERROR response.
-		return responseFor(&request, dnsmessage.RCodeSuccess, nil, udp, edns), nil
+		client, ok := l.client.(dnsfeature.RawContextClient)
+		if !ok {
+			return responseFor(&request, dnsmessage.RCodeNotImplemented, nil, udp, edns), nil
+		}
+		response, err := client.LookupRawContext(l.ctx, question.Name.String(), raw)
+		if err != nil {
+			return responseFor(&request, dnsmessage.RCodeServerFailure, nil, udp, edns), nil
+		}
+		if err := validateRawResponse(&request, response); err != nil {
+			errors.LogErrorInner(context.Background(), err, "DNS inbound rejected an invalid raw upstream response")
+			return responseFor(&request, dnsmessage.RCodeServerFailure, nil, udp, edns), nil
+		}
+		if udp {
+			limit := 512
+			if edns != nil {
+				limit = edns.payload
+			}
+			if len(response) > limit {
+				return truncatedResponseFor(&request, edns), nil
+			}
+		}
+		return response, nil
 	}
 
 	var ips []net.IP
@@ -485,6 +504,57 @@ func (l *DNSListener) handleQuery(raw []byte, udp bool) ([]byte, error) {
 		}
 	}
 	return responseFor(&request, rcode, answers, udp, edns), nil
+}
+
+func validateRawResponse(request *dnsmessage.Message, response []byte) error {
+	if len(response) < 12 || len(response) > maxDNSMessageSize {
+		return errors.New("invalid raw DNS response length")
+	}
+	var parser dnsmessage.Parser
+	header, err := parser.Start(response)
+	if err != nil {
+		return err
+	}
+	if !header.Response || header.ID != request.ID || header.OpCode != request.OpCode {
+		return errors.New("raw DNS response does not match request header")
+	}
+	questions, err := parser.AllQuestions()
+	if err != nil || len(questions) != len(request.Questions) {
+		return errors.New("raw DNS response does not match request question")
+	}
+	for i := range questions {
+		// DNS names are case-insensitive. Some resolvers preserve the query's
+		// original case while others normalize it, so an exact Name struct
+		// comparison would reject an otherwise valid associated response.
+		if !strings.EqualFold(questions[i].Name.String(), request.Questions[i].Name.String()) ||
+			questions[i].Type != request.Questions[i].Type || questions[i].Class != request.Questions[i].Class {
+			return errors.New("raw DNS response does not match request question")
+		}
+	}
+	return nil
+}
+
+func truncatedResponseFor(request *dnsmessage.Message, edns *ednsRequest) []byte {
+	response := dnsmessage.Message{
+		Header: dnsmessage.Header{
+			ID: request.ID, Response: true, OpCode: request.OpCode, Truncated: true,
+			RecursionDesired: request.RecursionDesired, RecursionAvailable: true,
+			CheckingDisabled: request.CheckingDisabled,
+		},
+		Questions: append([]dnsmessage.Question(nil), request.Questions...),
+	}
+	if edns != nil {
+		var header dnsmessage.ResourceHeader
+		if err := header.SetEDNS0(edns.payload, dnsmessage.RCodeSuccess, false); err != nil {
+			return nil
+		}
+		response.Additionals = []dnsmessage.Resource{{Header: header, Body: &dnsmessage.OPTResource{}}}
+	}
+	packed, err := response.AppendPack(nil)
+	if err != nil {
+		return nil
+	}
+	return packed
 }
 
 type ednsRequest struct {

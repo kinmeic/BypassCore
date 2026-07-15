@@ -34,6 +34,7 @@ type DNS struct {
 }
 
 var _ dns.ContextClient = (*DNS)(nil)
+var _ dns.RawContextClient = (*DNS)(nil)
 
 // DomainMatcherInfo contains information attached to index returned by Server.domainMatcher.
 type DomainMatcherInfo struct {
@@ -270,6 +271,44 @@ func (s *DNS) LookupIPContext(ctx context.Context, domain string, option dns.IPO
 		cancel()
 	}()
 	return s.lookupIP(ctx, domain, option)
+}
+
+// LookupRawContext forwards an arbitrary DNS wire query through the same
+// ordered server selection and tagged outbound routing used by IP lookups.
+func (s *DNS) LookupRawContext(ctx context.Context, domain string, query []byte) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := s.ctx.Err(); err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(s.ctx, cancel)
+	defer func() {
+		stop()
+		cancel()
+	}()
+
+	domain = strings.TrimSuffix(domain, ".")
+	if domain == "" {
+		return nil, errors.New("empty domain name")
+	}
+	var lastErr error
+	for _, client := range s.sortClients(domain) {
+		response, err := client.QueryRaw(ctx, query)
+		if err == nil && len(response) > 0 {
+			return response, nil
+		}
+		if err != nil {
+			lastErr = err
+		} else {
+			lastErr = dns.ErrEmptyResponse
+		}
+	}
+	if lastErr == nil {
+		lastErr = dns.ErrEmptyResponse
+	}
+	return nil, lastErr
 }
 
 func (s *DNS) lookupIP(ctx context.Context, domain string, option dns.IPOption) ([]net.IP, uint32, error) {

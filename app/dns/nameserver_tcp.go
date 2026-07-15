@@ -185,4 +185,58 @@ func (s *TCPNameServer) QueryIP(ctx context.Context, domain string, option dns_f
 	return queryIP(ctx, s, domain, option)
 }
 
+// QueryRaw forwards an arbitrary DNS message over TCP or, for an embedded
+// DOTNameServer, over the TLS-wrapped dial function.
+func (s *TCPNameServer) QueryRaw(ctx context.Context, query []byte) ([]byte, error) {
+	return exchangeRawTCP(ctx, query, s.dial)
+}
+
+func exchangeRawTCP(ctx context.Context, query []byte, dial func(context.Context) (net.Conn, error)) ([]byte, error) {
+	if len(query) == 0 || len(query) > 65535 {
+		return nil, errors.New("invalid raw DNS query length")
+	}
+	conn, err := dial(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(5 * time.Second)
+	}
+	_ = conn.SetDeadline(deadline)
+	if err := binary.Write(conn, binary.BigEndian, uint16(len(query))); err != nil {
+		return nil, err
+	}
+	if err := writeDNSPayload(conn, query); err != nil {
+		return nil, err
+	}
+	var length uint16
+	if err := binary.Read(conn, binary.BigEndian, &length); err != nil {
+		return nil, err
+	}
+	if length == 0 {
+		return nil, errors.New("empty DNS over TCP response")
+	}
+	response := make([]byte, int(length))
+	if _, err := io.ReadFull(conn, response); err != nil {
+		return nil, err
+	}
+	return response, nil
+}
+
+func writeDNSPayload(writer io.Writer, payload []byte) error {
+	for len(payload) > 0 {
+		n, err := writer.Write(payload)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrUnexpectedEOF
+		}
+		payload = payload[n:]
+	}
+	return nil
+}
+
 func (s *TCPNameServer) Close() error { return s.cacheController.Close() }

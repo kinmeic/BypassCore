@@ -27,6 +27,19 @@ type contextStubDNSClient struct {
 	started chan struct{}
 }
 
+type rawStubDNSClient struct {
+	stubDNSClient
+	raw func(context.Context, string, []byte) ([]byte, error)
+}
+
+func (c *rawStubDNSClient) LookupIPContext(_ context.Context, domain string, option dnsfeature.IPOption) ([]bcnet.IP, uint32, error) {
+	return c.LookupIP(domain, option)
+}
+
+func (c *rawStubDNSClient) LookupRawContext(ctx context.Context, domain string, query []byte) ([]byte, error) {
+	return c.raw(ctx, domain, query)
+}
+
 func (c *contextStubDNSClient) LookupIPContext(ctx context.Context, _ string, _ dnsfeature.IPOption) ([]bcnet.IP, uint32, error) {
 	close(c.started)
 	<-ctx.Done()
@@ -129,13 +142,25 @@ func TestDNSListenerErrorAndNonIPResponses(t *testing.T) {
 		t.Fatalf("rcode=%v, want NXDOMAIN", got)
 	}
 
-	nonIP := NewDNS(&Config{}, &stubDNSClient{})
+	nonIP := NewDNS(&Config{}, &rawStubDNSClient{raw: func(_ context.Context, domain string, query []byte) ([]byte, error) {
+		if domain != "example.test." {
+			t.Fatalf("raw query domain=%q", domain)
+		}
+		response := unpackDNS(t, query)
+		response.Response = true
+		response.RecursionAvailable = true
+		response.Answers = []dnsmessage.Resource{{
+			Header: dnsmessage.ResourceHeader{Name: response.Questions[0].Name, Type: dnsmessage.TypeTXT, Class: dnsmessage.ClassINET, TTL: 60},
+			Body:   &dnsmessage.TXTResource{TXT: []string{"raw-response"}},
+		}}
+		return response.AppendPack(nil)
+	}})
 	raw, err = nonIP.handleQuery(dnsQuery(t, 8, dnsmessage.TypeTXT), false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	response := unpackDNS(t, raw)
-	if response.RCode != dnsmessage.RCodeSuccess || len(response.Answers) != 0 {
+	if response.RCode != dnsmessage.RCodeSuccess || len(response.Answers) != 1 {
 		t.Fatalf("non-IP response: rcode=%v answers=%d", response.RCode, len(response.Answers))
 	}
 
@@ -146,6 +171,33 @@ func TestDNSListenerErrorAndNonIPResponses(t *testing.T) {
 	}
 	if got := unpackDNS(t, raw).RCode; got != dnsmessage.RCodeServerFailure {
 		t.Fatalf("rcode=%v, want SERVFAIL", got)
+	}
+}
+
+func TestValidateRawResponseAcceptsQuestionNameCaseChanges(t *testing.T) {
+	request := unpackDNS(t, dnsQuery(t, 91, dnsmessage.TypeTXT))
+	mixed, err := dnsmessage.NewName("MiXeD.Example.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lower, err := dnsmessage.NewName("mixed.example.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Questions[0].Name = mixed
+	response := request
+	response.Response = true
+	response.Questions = []dnsmessage.Question{{
+		Name:  lower,
+		Type:  request.Questions[0].Type,
+		Class: request.Questions[0].Class,
+	}}
+	raw, err := response.AppendPack(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateRawResponse(&request, raw); err != nil {
+		t.Fatalf("case-only question-name change rejected: %v", err)
 	}
 }
 

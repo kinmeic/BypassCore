@@ -31,6 +31,14 @@ type ContextClient interface {
 	LookupIPContext(ctx context.Context, domain string, option IPOption) ([]net.IP, uint32, error)
 }
 
+// RawContextClient is implemented by DNS clients that can forward an arbitrary
+// DNS wire-format query. It is used by the native DNS inbound for record types
+// which cannot be represented by LookupIP, such as MX, TXT, SRV, PTR and CAA.
+type RawContextClient interface {
+	ContextClient
+	LookupRawContext(ctx context.Context, domain string, query []byte) ([]byte, error)
+}
+
 // ClientType returns the type of Client interface.
 func ClientType() interface{} {
 	return (*Client)(nil)

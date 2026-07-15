@@ -25,7 +25,7 @@ jobs:
       - name: Build static binaries for both OpenWrt archs
         run: |
           mkdir -p dist
-          VERSION="1.0.7"
+          VERSION="1.0.8"
           LDFLAGS="-s -w -X main.version=${VERSION}"
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOAMD64=v1 go build -ldflags="$LDFLAGS" -o dist/bypasscore-openwrt-x86_64             ./cmd/bypasscore
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64              go build -ldflags="$LDFLAGS" -o dist/bypasscore-openwrt-aarch64_cortex-a53 ./cmd/bypasscore
@@ -33,23 +33,23 @@ jobs:
       - name: Package x86_64 (.ipk + .apk)
         run: |
           mkdir -p pkgout
-          scripts/package-openwrt.sh dist/bypasscore-openwrt-x86_64 x86_64 1.0.7 pkgout
+          scripts/package-openwrt.sh dist/bypasscore-openwrt-x86_64 x86_64 1.0.8 pkgout
 
       - name: Package aarch64_cortex-a53 (.ipk + .apk)
         run: |
-          scripts/package-openwrt.sh dist/bypasscore-openwrt-aarch64_cortex-a53 aarch64_cortex-a53 1.0.7 pkgout
+          scripts/package-openwrt.sh dist/bypasscore-openwrt-aarch64_cortex-a53 aarch64_cortex-a53 1.0.8 pkgout
 
       - name: Verify packages are well-formed
         run: |
           echo "--- .ipk contents (x86_64) ---"
-          mkdir -p /tmp/ipk && tar xzf pkgout/bypasscore_1.0.7_x86_64.ipk -C /tmp/ipk
+          mkdir -p /tmp/ipk && tar xzf pkgout/bypasscore_1.0.8_x86_64.ipk -C /tmp/ipk
           echo "debian-binary: $(cat /tmp/ipk/debian-binary)"
           echo "control.tar.gz members:"; tar tzf /tmp/ipk/control.tar.gz
           echo "data.tar.gz members:";     tar tzf /tmp/ipk/data.tar.gz
           echo
           echo "--- .apk header (x86_64) ---"
           # apk v3 uses an ADB container (magic 'ADBd'), not a plain tar.
-          xxd pkgout/bypasscore-1.0.7_x86_64.apk | head -1
+          xxd pkgout/bypasscore-1.0.8_x86_64.apk | head -1
           echo
           ls -la pkgout/
 
@@ -62,7 +62,7 @@ jobs:
           docker run --rm \
             -v "$PWD/pkgout:/pkg:ro" \
             alpine:edge \
-            sh -c "apk manifest /pkg/bypasscore-1.0.7_x86_64.apk; echo 'exit code:' \$?"
+            sh -c "apk manifest /pkg/bypasscore-1.0.8_x86_64.apk; echo 'exit code:' \$?"
 
       - name: Upload packages as CI artifacts
         uses: actions/upload-artifact@v4

@@ -179,3 +179,38 @@ func (s *ClassicNameServer) Close() error { return s.cacheController.Close() }
 func (s *ClassicNameServer) QueryIP(ctx context.Context, domain string, option dns_feature.IPOption) ([]bcnet.IP, uint32, error) {
 	return queryIP(ctx, s, domain, option)
 }
+
+// QueryRaw forwards an arbitrary DNS message over the configured UDP
+// transport. The caller validates the response association and handles
+// client-facing UDP truncation.
+func (s *ClassicNameServer) QueryRaw(ctx context.Context, query []byte) ([]byte, error) {
+	conn, err := s.dial(ctx, s.address)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(8 * time.Second)
+	}
+	_ = conn.SetDeadline(deadline)
+	if _, err := conn.Write(query); err != nil {
+		return nil, err
+	}
+	response := make([]byte, 65535)
+	n, err := conn.Read(response)
+	if err != nil {
+		return nil, err
+	}
+	response = append([]byte(nil), response[:n]...)
+	if n >= 4 && response[2]&0x02 != 0 {
+		tcpDestination := bcnet.TCPDestination(s.address.Address, s.address.Port)
+		tcpResponse, tcpErr := exchangeRawTCP(ctx, query, func(ctx context.Context) (net.Conn, error) {
+			return s.dial(ctx, tcpDestination)
+		})
+		if tcpErr == nil {
+			return tcpResponse, nil
+		}
+	}
+	return response, nil
+}
