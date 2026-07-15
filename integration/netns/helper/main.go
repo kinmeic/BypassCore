@@ -11,10 +11,12 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/dns/dnsmessage"
 )
 
 func main() {
-	mode := flag.String("mode", "", "serve, socks, tcp-client, udp-client, flood")
+	mode := flag.String("mode", "", "serve, socks, tcp-client, udp-client, dns-client, flood")
 	listen := flag.String("listen", "", "listen address")
 	tcpPorts := flag.String("tcp-ports", "", "comma-separated TCP ports")
 	udpPorts := flag.String("udp-ports", "", "comma-separated UDP ports")
@@ -22,6 +24,9 @@ func main() {
 	payload := flag.String("payload", "netns-ok", "test payload")
 	startPort := flag.Int("start-port", 20000, "flood start port")
 	count := flag.Int("count", 1200, "flood destination count")
+	network := flag.String("network", "udp", "client network")
+	domain := flag.String("domain", "", "DNS query domain")
+	wantIP := flag.String("want-ip", "", "expected DNS response IP")
 	flag.Parse()
 
 	var err error
@@ -34,6 +39,8 @@ func main() {
 		err = tcpClient(*target, []byte(*payload))
 	case "udp-client":
 		err = udpClient(*target, []byte(*payload))
+	case "dns-client":
+		err = dnsClient(*target, *network, *domain, *wantIP)
 	case "flood":
 		err = flood(*target, *startPort, *count)
 	default:
@@ -43,6 +50,104 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func dnsClient(target, network, domain, wantIP string) error {
+	want := net.ParseIP(wantIP)
+	if want == nil {
+		return fmt.Errorf("invalid expected IP %q", wantIP)
+	}
+	qType := dnsmessage.TypeAAAA
+	if want.To4() != nil {
+		qType = dnsmessage.TypeA
+	}
+	name, err := dnsmessage.NewName(strings.TrimSuffix(domain, ".") + ".")
+	if err != nil {
+		return err
+	}
+	query := dnsmessage.Message{
+		Header:    dnsmessage.Header{ID: 0x4250, RecursionDesired: true},
+		Questions: []dnsmessage.Question{{Name: name, Type: qType, Class: dnsmessage.ClassINET}},
+	}
+	payload, err := query.AppendPack(nil)
+	if err != nil {
+		return err
+	}
+
+	conn, err := net.DialTimeout(network, target, 3*time.Second)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+
+	var response []byte
+	switch network {
+	case "udp", "udp4", "udp6":
+		if _, err := conn.Write(payload); err != nil {
+			return err
+		}
+		buf := make([]byte, 4096)
+		n, err := conn.Read(buf)
+		if err != nil {
+			return err
+		}
+		response = append([]byte(nil), buf[:n]...)
+	case "tcp", "tcp4", "tcp6":
+		var length [2]byte
+		binary.BigEndian.PutUint16(length[:], uint16(len(payload)))
+		if err := writeAll(conn, length[:]); err != nil {
+			return err
+		}
+		if err := writeAll(conn, payload); err != nil {
+			return err
+		}
+		if _, err := io.ReadFull(conn, length[:]); err != nil {
+			return err
+		}
+		response = make([]byte, binary.BigEndian.Uint16(length[:]))
+		if _, err := io.ReadFull(conn, response); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unsupported DNS network %q", network)
+	}
+
+	var message dnsmessage.Message
+	if err := message.Unpack(response); err != nil {
+		return err
+	}
+	if message.ID != query.ID || message.RCode != dnsmessage.RCodeSuccess {
+		return fmt.Errorf("DNS response id=%d rcode=%v", message.ID, message.RCode)
+	}
+	for _, answer := range message.Answers {
+		var got net.IP
+		switch body := answer.Body.(type) {
+		case *dnsmessage.AResource:
+			got = net.IP(body.A[:])
+		case *dnsmessage.AAAAResource:
+			got = net.IP(body.AAAA[:])
+		}
+		if got != nil && got.Equal(want) {
+			fmt.Printf("dns network=%s domain=%s ip=%s\n", network, domain, got)
+			return nil
+		}
+	}
+	return fmt.Errorf("DNS response did not contain %s", want)
+}
+
+func writeAll(writer io.Writer, payload []byte) error {
+	for len(payload) > 0 {
+		n, err := writer.Write(payload)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrUnexpectedEOF
+		}
+		payload = payload[n:]
+	}
+	return nil
 }
 
 func ports(value string) ([]int, error) {

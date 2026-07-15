@@ -8,11 +8,20 @@
     }
   ],
   "inbounds": [
+    {"tag": "dns4", "type": "dns", "listen": "10.10.0.1", "port": 1053, "network": "tcp,udp"},
+    {"tag": "dns6", "type": "dns", "listen": "fd00:10::1", "port": 1053, "network": "tcp,udp"},
     {"tag": "redirect", "type": "redirect", "listen": "0.0.0.0", "port": 12345, "network": "tcp", "sniffing": true},
     {"tag": "tproxy", "type": "tproxy", "listen": "0.0.0.0", "port": 12346, "network": "tcp,udp", "sniffing": true},
     {"tag": "tproxy6", "type": "tproxy", "listen": "::", "port": 12348, "network": "tcp,udp", "sniffing": true},
     {"tag": "udp_socks", "type": "tproxy", "listen": "0.0.0.0", "port": 12347, "network": "udp", "sniffing": true}
   ],
+  "dns": {
+    "hosts": {
+      "listener.test": "192.0.2.53",
+      "listener6.test": "2001:db8::53"
+    },
+    "queryStrategy": "UseIP"
+  },
   "routing": {
     "domainStrategy": "AsIs",
     "rules": [

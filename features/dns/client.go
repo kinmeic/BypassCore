@@ -2,6 +2,7 @@
 package dns // import "github.com/eugene/bypasscore/features/dns"
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/eugene/bypasscore/common/errors"
@@ -21,6 +22,13 @@ type Client interface {
 	features.Feature
 	// LookupIP returns IP addresses for the given domain.
 	LookupIP(domain string, option IPOption) ([]net.IP, uint32, error)
+}
+
+// ContextClient is implemented by DNS clients that can cancel an in-flight
+// lookup when its caller disconnects or the listener shuts down.
+type ContextClient interface {
+	Client
+	LookupIPContext(ctx context.Context, domain string, option IPOption) ([]net.IP, uint32, error)
 }
 
 // ClientType returns the type of Client interface.

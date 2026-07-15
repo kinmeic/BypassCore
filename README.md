@@ -18,6 +18,7 @@ domain through sniffing, match routing rules, and forward through an outbound.
   `blackhole`, and a SOCKS5 `proxy` for naiveproxy or sing-box
 - DNS subsystem with multiple upstreams, caching, domain routing, IP filtering,
   UDP, TCP, DoT (RFC 7858), and DoH (RFC 8484)
+- A local UDP/TCP DNS listening service backed by the same DNS subsystem
 - Load balancing with random, round-robin, least-ping, and least-load policies,
   plus Observatory health checks
 - Process matching on Linux, macOS, and Windows
@@ -124,11 +125,35 @@ queries outside the routing core. `localhost` always uses the system resolver.
 DNS routing carries `protocol: dns` and a recursion guard, allowing dedicated
 protocol or inboundTag rules.
 
+To expose the internal resolver to dnsmasq or LAN clients, add a DNS inbound:
+
+```json
+{
+  "tag": "dns-in",
+  "type": "dns",
+  "listen": "127.0.0.1",
+  "port": 1053,
+  "network": "tcp,udp",
+  "maxConcurrentQueries": 256,
+  "maxTCPConnections": 128,
+  "maxQueryBytes": 4096
+}
+```
+
+The listener implements standard UDP DNS and length-prefixed DNS over TCP. It
+resolves A and AAAA records through the configured internal DNS clients; other
+query types receive an empty NOERROR response, matching Xray's default DNS
+outbound behavior. UDP replies honor the client's advertised EDNS size (capped
+at 4096 bytes) and set the truncation flag when a TCP retry is required. Binding
+port 53 normally requires root privileges or `CAP_NET_BIND_SERVICE`.
+`maxQueryBytes` limits memory used to parse one request and defaults to 4096.
+If `listen` is omitted, a DNS inbound binds to `127.0.0.1` for safety.
+
 ## Configuration
 
 See `examples/config.example.json` for a complete configuration containing
 direct, blocked, multi-WAN, and proxy outbounds, TCP REDIRECT and UDP TPROXY
-inbounds, routing, DNS, and Observatory settings.
+inbounds, a local UDP/TCP DNS inbound, routing, DNS, and Observatory settings.
 
 ## GeoData files
 
@@ -138,7 +163,8 @@ rules, download them into the working directory or `$BYPASSCORE_ASSETS` from
 
 ## Project structure
 
-The main packages are `app/inbound`, `app/dispatcher`, `app/dialer`,
+The main packages are `app/inbound` (transparent-proxy and DNS listeners),
+`app/dispatcher`, `app/dialer`,
 `app/outbound`, `app/router`, `app/observatory`, and `app/dns`; protocol
 sniffers live under `common/protocol`, outbound implementations under
 `proxy`, shared interfaces under `features`, transport under `transport`, and
@@ -149,7 +175,8 @@ JSON configuration under `infra/conf`. The CLI entry point is
 
 GitHub Actions validates a real network-namespace topology covering TCP
 REDIRECT, TCP/UDP TPROXY, IPv6, SOCKS5 UDP, transparent reply source-address
-restoration, and UDP session/FD/RSS resource limits. On a Linux host, run:
+restoration, the UDP/TCP DNS listener over IPv4/IPv6, and UDP session/FD/RSS
+resource limits. On a Linux host, run:
 
 ```bash
 sudo integration/netns/run.sh

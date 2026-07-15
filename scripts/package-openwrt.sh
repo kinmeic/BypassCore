@@ -5,7 +5,7 @@
 # Usage: scripts/package-openwrt.sh <binary> <openwrt-arch> <version> <dest-dir>
 #   <binary>       path to the static linux binary (e.g. dist/bypasscore-openwrt-x86_64)
 #   <openwrt-arch> OpenWrt architecture (e.g. x86_64, aarch64_cortex-a53)
-#   <version>      package version without leading 'v' (e.g. 1.0.6)
+#   <version>      package version without leading 'v' (e.g. 1.0.7)
 #                  — apk requires an r-suffix revision; this script appends '-r0'
 #                    to the apk metadata automatically when none is present.
 #   <dest-dir>     output directory

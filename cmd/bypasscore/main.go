@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -142,7 +143,7 @@ func run() error {
 	// Choose the requested operating mode.
 	switch {
 	case *runMode:
-		if err := runDaemon(r, ohm, cfg.Inbounds, baseCtx); err != nil {
+		if err := runDaemon(r, ohm, dnsClient, cfg.Inbounds, baseCtx); err != nil {
 			return errors.New("run: ").Base(err)
 		}
 	case *resolve != "":
@@ -345,26 +346,36 @@ func repeat(s string, n int) string {
 	return out
 }
 
-// runDaemon starts all inbound listeners and blocks until a signal is received.
-// This is the "bypasscore run -c config.json" mode: the process stays alive
-// as a transparent proxy, accepting tproxy/redirect connections and routing
-// them via the router to outbound handlers.
-func runDaemon(r *router.Router, ohm *appoutbound.Manager, inbounds []*appinbound.Config, baseCtx context.Context) error {
+// runDaemon starts all transparent-proxy and DNS inbound listeners and blocks
+// until a signal is received.
+func runDaemon(r *router.Router, ohm *appoutbound.Manager, dnsClient featdns.Client, inbounds []*appinbound.Config, baseCtx context.Context) error {
 	// Start all inbound listeners.
-	var listeners []*appinbound.Listener
+	type listener interface {
+		Start() error
+		Close() error
+	}
+	var listeners []listener
+	closeListeners := func() {
+		for i := len(listeners) - 1; i >= 0; i-- {
+			_ = listeners[i].Close()
+		}
+	}
 	for _, ibCfg := range inbounds {
 		if ibCfg == nil {
+			closeListeners()
 			return errors.New("nil inbound configuration")
 		}
-		// Sniffing is an inbound property. Give each listener its own dispatcher
-		// so enabling it on one inbound does not silently affect every other one.
-		d := dispatcher.New(r, ohm, dispatcher.NewSniffer(ibCfg.Sniffing))
-		ln := appinbound.New(ibCfg, d)
+		var ln listener
+		if strings.EqualFold(strings.TrimSpace(ibCfg.Type), "dns") {
+			ln = appinbound.NewDNS(ibCfg, dnsClient)
+		} else {
+			// Sniffing is an inbound property. Give each transparent listener its
+			// own dispatcher so one inbound cannot affect another.
+			d := dispatcher.New(r, ohm, dispatcher.NewSniffer(ibCfg.Sniffing))
+			ln = appinbound.New(ibCfg, d)
+		}
 		if err := ln.Start(); err != nil {
-			// Close already-started listeners before failing.
-			for _, l := range listeners {
-				_ = l.Close()
-			}
+			closeListeners()
 			return errors.New("failed to start inbound ", ibCfg.Tag).Base(err)
 		}
 		listeners = append(listeners, ln)
@@ -379,11 +390,13 @@ func runDaemon(r *router.Router, ohm *appoutbound.Manager, inbounds []*appinboun
 	// Block until SIGINT or SIGTERM.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh
+	defer signal.Stop(sigCh)
+	select {
+	case <-sigCh:
+	case <-baseCtx.Done():
+	}
 
 	fmt.Println("\nShutting down...")
-	for _, ln := range listeners {
-		_ = ln.Close()
-	}
+	closeListeners()
 	return nil
 }

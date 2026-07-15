@@ -36,6 +36,16 @@
   ],
   "inbounds": [
     {
+      "tag": "dns-in",
+      "type": "dns",
+      "listen": "127.0.0.1",
+      "port": 1053,
+      "network": "tcp,udp",
+      "maxConcurrentQueries": 256,
+      "maxTCPConnections": 128,
+      "maxQueryBytes": 4096
+    },
+    {
       "tag": "tcp_redir",
       "type": "redirect",
       "listen": "0.0.0.0",

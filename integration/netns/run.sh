@@ -103,6 +103,10 @@ sudo ip netns exec bc-client "$TMP/netns-helper" -mode udp-client -target 10.20.
 sudo ip netns exec bc-client "$TMP/netns-helper" -mode tcp-client -target '[fd00:20::2]:18083' -payload ipv6-tcp-ok
 sudo ip netns exec bc-client "$TMP/netns-helper" -mode udp-client -target '[fd00:20::2]:18084' -payload ipv6-udp-ok
 sudo ip netns exec bc-client "$TMP/netns-helper" -mode udp-client -target 10.20.0.2:18085 -payload socks-udp-ok
+sudo ip netns exec bc-client "$TMP/netns-helper" -mode dns-client -network udp -target 10.10.0.1:1053 -domain listener.test -want-ip 192.0.2.53
+sudo ip netns exec bc-client "$TMP/netns-helper" -mode dns-client -network tcp -target 10.10.0.1:1053 -domain listener.test -want-ip 192.0.2.53
+sudo ip netns exec bc-client "$TMP/netns-helper" -mode dns-client -network udp6 -target '[fd00:10::1]:1053' -domain listener6.test -want-ip 2001:db8::53
+sudo ip netns exec bc-client "$TMP/netns-helper" -mode dns-client -network tcp6 -target '[fd00:10::1]:1053' -domain listener6.test -want-ip 2001:db8::53
 
 sudo ip netns exec bc-client "$TMP/netns-helper" -mode flood -target 10.20.0.2 -start-port 20000 -count 1200
 sleep 2

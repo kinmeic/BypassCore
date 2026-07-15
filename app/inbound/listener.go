@@ -83,10 +83,9 @@ func (l *Listener) Start() error {
 	if wantUDP {
 		udpLn, err := startUDP(l.cfg, l.dispatcher)
 		if err != nil {
-			// Close TCP listener if already started.
-			if l.tcpListener != nil {
-				l.tcpListener.Close()
-			}
+			// A partially started TCP accept loop must be cancelled and joined;
+			// merely closing its socket leaves it retrying Accept forever.
+			_ = l.Close()
 			return errors.New("inbound UDP listen failed").Base(err)
 		}
 		l.udpListener = udpLn

@@ -1,12 +1,34 @@
 package dns
 
 import (
+	"context"
+	goerrors "errors"
 	"testing"
 
 	"github.com/eugene/bypasscore/common/geodata"
 	bcnet "github.com/eugene/bypasscore/common/net"
 	dns_feature "github.com/eugene/bypasscore/features/dns"
 )
+
+func TestLookupIPContextHonorsCancellation(t *testing.T) {
+	server, err := New(context.Background(), &Config{
+		QueryStrategy: QueryStrategy_USE_IP,
+		StaticHosts: []*Config_HostMapping{{
+			Domain: mustDomainRule(t, "cancel.test"), Ip: [][]byte{{192, 0, 2, 1}},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, err = server.LookupIPContext(ctx, "cancel.test", dns_feature.IPOption{IPv4Enable: true})
+	if !goerrors.Is(err, context.Canceled) {
+		t.Fatalf("LookupIPContext error=%v, want context.Canceled", err)
+	}
+}
 
 func mustDomainRule(t *testing.T, domain string) *geodata.DomainRule {
 	r, err := geodata.ParseDomainRule(domain, geodata.Domain_Full)
@@ -30,7 +52,7 @@ func TestStaticHostsBuild(t *testing.T) {
 				Ip:     [][]byte{{127, 0, 0, 1}},
 			},
 			{
-				Domain:         mustDomainRule(t, "alias.test"),
+				Domain:        mustDomainRule(t, "alias.test"),
 				ProxiedDomain: "local.test",
 			},
 		},
