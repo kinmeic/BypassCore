@@ -81,3 +81,13 @@ func TestSniffHost_TrailingWhitespace(t *testing.T) {
 		t.Errorf("SniffHost = %q, want spaced.com", got)
 	}
 }
+
+func TestSniffRequestAttributesAndValidation(t *testing.T) {
+	host, attrs := SniffRequest([]byte("GET /route HTTP/1.1\r\nHost: example.com:8080\r\nX-Region: wan1\r\n\r\n"))
+	if host != "example.com" || attrs[":method"] != "GET" || attrs[":path"] != "/route" || attrs["x-region"] != "wan1" {
+		t.Fatalf("host=%q attrs=%v", host, attrs)
+	}
+	if host := SniffHost([]byte("GET / HTTP/1.1\r\nHost: example.com:bad\r\n\r\n")); host != "" {
+		t.Fatalf("invalid host port accepted: %q", host)
+	}
+}

@@ -3,6 +3,7 @@ package conf
 import (
 	"bytes"
 	"encoding/json"
+	"regexp"
 	"strings"
 
 	"github.com/eugene/bypasscore/app/router"
@@ -52,8 +53,15 @@ func (r *BalancingRule) Build() (*router.BalancingRule, error) {
 	var ts proto.Message
 	if r.Strategy.Type == "leastload" {
 		var lc StrategyLeastLoadConfig
-		if err := json.Unmarshal(settings, &lc); err == nil {
-			ts, _ = lc.Build()
+		decoder := json.NewDecoder(bytes.NewReader(settings))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&lc); err != nil {
+			return nil, errors.New("invalid leastload settings").Base(err)
+		}
+		var err error
+		ts, err = lc.Build()
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -84,15 +92,32 @@ type StrategyWeight struct {
 
 // Build converts to router.StrategyLeastLoadConfig.
 func (c *StrategyLeastLoadConfig) Build() (*router.StrategyLeastLoadConfig, error) {
+	if c.MaxRTT < 0 {
+		return nil, errors.New("leastload maxRTT must be non-negative")
+	}
+	if c.Tolerance < 0 || c.Tolerance > 1 {
+		return nil, errors.New("leastload tolerance must be between 0 and 1")
+	}
 	out := &router.StrategyLeastLoadConfig{
 		Expected:  c.Expected,
 		MaxRTT:    int64(c.MaxRTT),
 		Tolerance: float32(c.Tolerance),
 	}
 	for _, b := range c.Baselines {
+		if b <= 0 {
+			return nil, errors.New("leastload baselines must be positive")
+		}
 		out.Baselines = append(out.Baselines, int64(b))
 	}
 	for _, w := range c.Costs {
+		if strings.TrimSpace(w.Match) == "" || w.Value < 0 {
+			return nil, errors.New("leastload costs require a match and non-negative value")
+		}
+		if w.Regexp {
+			if _, err := regexp.Compile(w.Match); err != nil {
+				return nil, errors.New("invalid leastload cost regexp").Base(err)
+			}
+		}
 		out.Costs = append(out.Costs, &router.StrategyWeight{
 			Regexp: w.Regexp,
 			Match:  w.Match,
@@ -157,18 +182,33 @@ func (c *RouterConfig) Build() (*router.Config, error) {
 	}
 	config.DomainStrategy = strategy
 
+	ruleTags := make(map[string]struct{}, len(c.RuleList))
 	for _, rawRule := range c.RuleList {
 		rule, err := parseRule(rawRule)
 		if err != nil {
 			return nil, err
 		}
+		if tag := rule.GetRuleTag(); tag != "" {
+			if _, exists := ruleTags[tag]; exists {
+				return nil, errors.New("duplicate ruleTag: " + tag)
+			}
+			ruleTags[tag] = struct{}{}
+		}
 		config.Rule = append(config.Rule, rule)
 	}
+	balancerTags := make(map[string]struct{}, len(c.Balancers))
 	for _, rawBalancer := range c.Balancers {
+		if rawBalancer == nil {
+			return nil, errors.New("null balancing rule")
+		}
 		balancer, err := rawBalancer.Build()
 		if err != nil {
 			return nil, err
 		}
+		if _, exists := balancerTags[balancer.Tag]; exists {
+			return nil, errors.New("duplicate balancer tag: " + balancer.Tag)
+		}
+		balancerTags[balancer.Tag] = struct{}{}
 		config.BalancingRule = append(config.BalancingRule, balancer)
 	}
 	return config, nil
@@ -210,6 +250,9 @@ func parseFieldRule(msg json.RawMessage) (*router.RoutingRule, error) {
 
 	rule := new(router.RoutingRule)
 	rule.RuleTag = rawFieldRule.RuleTag
+	if rawFieldRule.OutboundTag != "" && rawFieldRule.BalancerTag != "" {
+		return nil, errors.New("routing rule cannot specify both outboundTag and balancerTag")
+	}
 	switch {
 	case len(rawFieldRule.OutboundTag) > 0:
 		rule.TargetTag = &router.RoutingRule_Tag{Tag: rawFieldRule.OutboundTag}

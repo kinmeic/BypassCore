@@ -1,11 +1,13 @@
 package dispatcher
 
 import (
+	"bytes"
 	"io"
 	"net"
 	"time"
 
 	"github.com/eugene/bypasscore/common/protocol/http"
+	"github.com/eugene/bypasscore/common/protocol/quic"
 	"github.com/eugene/bypasscore/common/protocol/tls"
 )
 
@@ -14,6 +16,24 @@ import (
 // tproxy/redirect flows that arrive as IP:port.
 type Sniffer struct {
 	enabled bool
+}
+
+// SniffPacketMetadata inspects one or more consecutive UDP datagrams. QUIC
+// Initial packets may split CRYPTO data, so callers can append packets while
+// needMore is true, subject to their queue and time bounds.
+func (s *Sniffer) SniffPacketMetadata(packets [][]byte) (domain, protocol string, needMore bool) {
+	if s == nil || !s.enabled || len(packets) == 0 {
+		return "", "", false
+	}
+	data := bytes.Join(packets, nil)
+	if len(data) > maxSniffBytes {
+		data = data[:maxSniffBytes]
+	}
+	domain, needMore = quic.SniffSNI(data)
+	if domain != "" {
+		return domain, "quic", false
+	}
+	return "", "", needMore
 }
 
 // NewSniffer creates a Sniffer. If enabled is false, Sniff returns "".
@@ -57,7 +77,7 @@ func (s *Sniffer) SniffMetadata(conn net.Conn) (net.Conn, string, string) {
 		n, err := conn.Read(tmp)
 		if n > 0 {
 			data = append(data, tmp[:n]...)
-			if domain := tls.SniffSNI(data); domain != "" {
+			if domain, _ := tls.SniffSNIWithStatus(data); domain != "" {
 				return &prependConn{Conn: conn, buf: data}, domain, "tls"
 			}
 			if domain := http.SniffHost(data); domain != "" {
@@ -82,11 +102,8 @@ func sniffNeedsMore(data []byte) bool {
 		return true
 	}
 	if data[0] == 0x16 { // TLS handshake record
-		if len(data) < 5 {
-			return true
-		}
-		recordLen := int(data[3])<<8 | int(data[4])
-		return len(data) < 5+recordLen
+		_, needMore := tls.SniffSNIWithStatus(data)
+		return needMore
 	}
 	methods := []string{"GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "OPTIONS ", "CONNECT ", "PATCH "}
 	for _, method := range methods {
@@ -94,7 +111,7 @@ func sniffNeedsMore(data []byte) bool {
 		if prefixLen > len(method) {
 			prefixLen = len(method)
 		}
-		if string(data[:prefixLen]) == method[:prefixLen] {
+		if bytes.EqualFold(data[:prefixLen], []byte(method[:prefixLen])) {
 			return len(data) < maxSniffBytes && !containsHeaderEnd(data)
 		}
 	}
@@ -126,6 +143,40 @@ func (p *prependConn) Read(b []byte) (int, error) {
 		return n, nil
 	}
 	return p.Conn.Read(b)
+}
+
+// WriteTo preserves io.Copy's fast path while replaying the bytes consumed by
+// the sniffer first. It also avoids hiding the underlying TCP connection's
+// optimized transfer implementation behind this wrapper.
+func (p *prependConn) WriteTo(w io.Writer) (int64, error) {
+	var written int64
+	for len(p.buf) > 0 {
+		n, err := w.Write(p.buf)
+		written += int64(n)
+		p.buf = p.buf[n:]
+		if err != nil {
+			return written, err
+		}
+		if n == 0 {
+			return written, io.ErrShortWrite
+		}
+	}
+	n, err := io.Copy(w, p.Conn)
+	return written + n, err
+}
+
+func (p *prependConn) CloseRead() error {
+	if conn, ok := p.Conn.(interface{ CloseRead() error }); ok {
+		return conn.CloseRead()
+	}
+	return nil
+}
+
+func (p *prependConn) CloseWrite() error {
+	if conn, ok := p.Conn.(interface{ CloseWrite() error }); ok {
+		return conn.CloseWrite()
+	}
+	return nil
 }
 
 // Ensure prependConn satisfies net.Conn.

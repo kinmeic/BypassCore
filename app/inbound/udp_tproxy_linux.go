@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -36,6 +37,8 @@ type udpTproxyListener struct {
 
 	conn     *net.UDPConn
 	sessions sync.Map // key: "srcAddr|originalDst" → *udpSession
+	createMu sync.Mutex
+	count    atomic.Int64
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -54,13 +57,24 @@ type udpSession struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	packets     chan []byte
+	queuedBytes atomic.Int64
 
 	mu        sync.Mutex
 	closeOnce sync.Once
 	closed    chan struct{}
 }
 
-const udpSessionIdleTimeout = 2 * time.Minute
+const (
+	udpSessionIdleTimeout = 2 * time.Minute
+	// Bound both per-flow memory and the number of sockets/goroutines an
+	// untrusted UDP source can create. A single maximum-size datagram still
+	// fits, while bursts overflow instead of growing memory without bound.
+	udpSessionQueueBytes = 64 * 1024
+	udpSessionQueueSlots = 64
+	udpMaxSessions       = 1024
+	udpSniffWait         = 25 * time.Millisecond
+	udpSniffMaxPackets   = 4
+)
 
 // startUDP creates a UDP TPROXY listener.
 func startUDP(cfg *Config, d *dispatcher.Dispatcher) (*udpTproxyListener, error) {
@@ -103,7 +117,15 @@ func startUDP(cfg *Config, d *dispatcher.Dispatcher) (*udpTproxyListener, error)
 		},
 	}
 
-	pc, err := lc.ListenPacket(context.Background(), "udp", addr)
+	network := "udp"
+	if ip := net.ParseIP(strings.Trim(cfg.Listen, "[]")); ip != nil {
+		if ip.To4() != nil {
+			network = "udp4"
+		} else {
+			network = "udp6"
+		}
+	}
+	pc, err := lc.ListenPacket(context.Background(), network, addr)
 	if err != nil {
 		return nil, errors.New("UDP tproxy listen failed: ", addr).Base(err)
 	}
@@ -160,33 +182,47 @@ func (l *udpTproxyListener) recvLoop() {
 			continue
 		}
 
-		packet := make([]byte, n)
-		copy(packet, buf[:n])
-
 		// Match Xray's non-cone UDP key: the same client socket may talk to
 		// multiple destinations and those flows must not share one outbound.
 		key := srcAddr.String() + "|" + origDst.String()
-		ctx, cancel := context.WithCancel(l.ctx)
-		candidate := &udpSession{
-			key:         key,
-			clientAddr:  srcAddr,
-			originalDst: origDst,
-			listener:    l,
-			ctx:         ctx,
-			cancel:      cancel,
-			packets:     make(chan []byte, 256),
-			closed:      make(chan struct{}),
+		s := l.getOrCreateSession(key, srcAddr, origDst)
+		if s == nil {
+			errors.LogWarning(context.Background(), "UDP relay session limit reached, dropping packet")
+			continue
 		}
-		sess, loaded := l.sessions.LoadOrStore(key, candidate)
-		s := sess.(*udpSession)
-		if loaded {
-			cancel()
-		} else {
-			l.wg.Add(1)
-			go s.run()
-		}
-		s.enqueue(packet)
+		s.enqueue(buf[:n])
 	}
+}
+
+func (l *udpTproxyListener) getOrCreateSession(key string, src *net.UDPAddr, dst bcnet.Destination) *udpSession {
+	if value, ok := l.sessions.Load(key); ok {
+		return value.(*udpSession)
+	}
+
+	l.createMu.Lock()
+	defer l.createMu.Unlock()
+	if value, ok := l.sessions.Load(key); ok {
+		return value.(*udpSession)
+	}
+	if l.ctx.Err() != nil || l.count.Load() >= udpMaxSessions {
+		return nil
+	}
+	ctx, cancel := context.WithCancel(l.ctx)
+	s := &udpSession{
+		key:         key,
+		clientAddr:  src,
+		originalDst: dst,
+		listener:    l,
+		ctx:         ctx,
+		cancel:      cancel,
+		packets:     make(chan []byte, udpSessionQueueSlots),
+		closed:      make(chan struct{}),
+	}
+	l.sessions.Store(key, s)
+	l.count.Add(1)
+	l.wg.Add(1)
+	go s.run()
+	return s
 }
 
 // retrieveOriginalDest parses the IP_RECVORIGDSTADDR control message from OOB data.
@@ -215,12 +251,25 @@ func retrieveOriginalDst(oob []byte) bcnet.Destination {
 	return bcnet.Destination{}
 }
 
-func (s *udpSession) enqueue(packet []byte) {
+func (s *udpSession) enqueue(data []byte) {
+	size := int64(len(data))
+	for {
+		queued := s.queuedBytes.Load()
+		if queued+size > udpSessionQueueBytes {
+			errors.LogWarning(context.Background(), "UDP relay byte queue full for ", s.key, ", dropping packet")
+			return
+		}
+		if s.queuedBytes.CompareAndSwap(queued, queued+size) {
+			break
+		}
+	}
+	packet := append([]byte(nil), data...)
 	select {
 	case <-s.closed:
-		return
+		s.queuedBytes.Add(-size)
 	case s.packets <- packet:
 	default:
+		s.queuedBytes.Add(-size)
 		errors.LogWarning(context.Background(), "UDP relay queue full for ", s.key, ", dropping packet")
 	}
 }
@@ -236,8 +285,47 @@ func (s *udpSession) run() {
 	defer s.listener.wg.Done()
 	defer s.close()
 
+	// Route using the first datagram. QUIC CRYPTO data can cross Initial
+	// packets; collect only when the sniffer explicitly requests more data and
+	// keep the wait tightly bounded for latency-sensitive UDP protocols.
+	var pending [][]byte
+	select {
+	case <-s.ctx.Done():
+		return
+	case packet := <-s.packets:
+		s.queuedBytes.Add(-int64(len(packet)))
+		pending = append(pending, packet)
+	}
+collectLoop:
+	for len(pending) < udpSniffMaxPackets {
+		_, _, needMore := s.listener.dispatcher.SniffPacketMetadata(pending)
+		if !needMore {
+			break
+		}
+		timer := time.NewTimer(udpSniffWait)
+		select {
+		case packet := <-s.packets:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			s.queuedBytes.Add(-int64(len(packet)))
+			pending = append(pending, packet)
+		case <-timer.C:
+			break collectLoop
+		case <-s.ctx.Done():
+			timer.Stop()
+			return
+		}
+		if len(pending) == 0 || len(pending) >= udpSniffMaxPackets {
+			break
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
-	conn, err := s.listener.dispatcher.DialOutbound(s.routingContext(ctx), s.originalDst)
+	conn, err := s.listener.dispatcher.DialOutboundPackets(s.routingContext(ctx), s.originalDst, pending)
 	cancel()
 	if err != nil {
 		errors.LogErrorInner(context.Background(), err, "UDP relay: outbound dial failed for ", s.originalDst.String())
@@ -251,6 +339,12 @@ func (s *udpSession) run() {
 	}
 	if !s.setResources(conn, replyConn) {
 		return
+	}
+	for _, packet := range pending {
+		if _, err := conn.Write(packet); err != nil {
+			errors.LogErrorInner(context.Background(), err, "UDP relay: initial write to outbound failed")
+			return
+		}
 	}
 
 	reads := make(chan udpReadResult, 1)
@@ -274,6 +368,7 @@ func (s *udpSession) run() {
 		case <-timer.C:
 			return
 		case packet := <-s.packets:
+			s.queuedBytes.Add(-int64(len(packet)))
 			resetTimer()
 			if _, err := conn.Write(packet); err != nil {
 				errors.LogErrorInner(context.Background(), err, "UDP relay: write to outbound failed")
@@ -370,7 +465,9 @@ func (s *udpSession) close() {
 	s.closeOnce.Do(func() {
 		close(s.closed)
 		s.cancel()
-		s.listener.sessions.CompareAndDelete(s.key, s)
+		if s.listener.sessions.CompareAndDelete(s.key, s) {
+			s.listener.count.Add(-1)
+		}
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		if s.outbound != nil {

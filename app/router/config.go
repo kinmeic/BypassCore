@@ -62,7 +62,11 @@ func (rr *RoutingRule) BuildCondition() (Condition, error) {
 	}
 
 	if len(rr.UserEmail) > 0 {
-		conds.Add(NewUserMatcher(rr.UserEmail))
+		matcher, err := NewUserMatcherChecked(rr.UserEmail)
+		if err != nil {
+			return nil, err
+		}
+		conds.Add(matcher)
 	}
 
 	if len(rr.Attributes) > 0 {
@@ -139,6 +143,9 @@ func (br *BalancingRule) Build(ohm outbound.Manager, dispatcher routing.Dispatch
 			ohm:         ohm,
 		}, nil
 	case "leastload":
+		if br.StrategySettings == nil {
+			return nil, errors.New("leastload strategy requires settings")
+		}
 		i, err := br.StrategySettings.GetInstance()
 		if err != nil {
 			return nil, err

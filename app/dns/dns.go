@@ -203,6 +203,23 @@ func (s *DNS) Start() error {
 	return nil
 }
 
+// SetDialer sends every non-+local DNS transport through the configured
+// routing/outbound data plane. It is intended to be called during startup,
+// before queries are served.
+func (s *DNS) SetDialer(dial Dialer) {
+	if dial == nil {
+		return
+	}
+	for _, client := range s.clients {
+		if client.localDirect {
+			continue
+		}
+		if server, ok := client.server.(routedNameServer); ok {
+			server.SetDialer(dial)
+		}
+	}
+}
+
 // Close implements common.Closable.
 func (s *DNS) Close() error {
 	if s.cancel != nil {

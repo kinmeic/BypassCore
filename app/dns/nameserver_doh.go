@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"time"
@@ -15,29 +16,57 @@ import (
 	"github.com/eugene/bypasscore/common/log"
 	bcnet "github.com/eugene/bypasscore/common/net"
 	dns_feature "github.com/eugene/bypasscore/features/dns"
+	"golang.org/x/net/http2"
 )
 
 // DoHNameServer implements DNS over HTTPS (RFC 8484) wire format using the
-// standard library net/http client with crypto/tls. The fingerprinting (utls)
-// and routed-HTTP paths of the original are dropped: queries go out directly.
+// standard library net/http client with crypto/tls. Its transport dialer can
+// be replaced so remote DNS follows the normal routing/outbound policy.
 type DoHNameServer struct {
 	cacheController *CacheController
 	httpClient      *http.Client
 	dohURL          string
 	clientIP        bcnet.IP
+	destination     bcnet.Destination
+	dial            Dialer
 }
 
-// NewDoHNameServer creates a DoH client. h2c selects HTTP/2 cleartext (unused
-// by callers currently but kept for parity). The `dispatcher`/`h2c` arguments
-// from the original are dropped — BypassCore only supports local direct mode.
-func NewDoHNameServer(u *url.URL, _ bool, disableCache bool, serveStale bool, serveExpiredTTL uint32, clientIP bcnet.IP) *DoHNameServer {
-	u.Scheme = "https"
+// NewDoHNameServer creates a DoH client. h2c selects HTTP/2 cleartext.
+func NewDoHNameServer(u *url.URL, h2c bool, disableCache bool, serveStale bool, serveExpiredTTL uint32, clientIP bcnet.IP) *DoHNameServer {
+	u = cloneURL(u)
 	mode := "DOH"
+	port := bcnet.Port(443)
+	if h2c {
+		u.Scheme = "http"
+		mode = "DOH-H2C"
+		port = 80
+	} else {
+		u.Scheme = "https"
+	}
+	if u.Port() != "" {
+		if parsed, err := bcnet.PortFromString(u.Port()); err == nil {
+			port = parsed
+		}
+	}
 	errors.LogInfo(context.Background(), "DNS: created ", mode, " client for ", u.String())
 	s := &DoHNameServer{
 		cacheController: NewCacheController(mode+"//"+u.Host, disableCache, serveStale, serveExpiredTTL),
 		dohURL:          u.String(),
 		clientIP:        clientIP,
+		destination:     bcnet.TCPDestination(bcnet.ParseAddress(u.Hostname()), port),
+	}
+	s.dial = func(ctx context.Context, dest bcnet.Destination) (net.Conn, error) {
+		d := net.Dialer{}
+		return d.DialContext(ctx, "tcp", dest.NetAddr())
+	}
+	if h2c {
+		s.httpClient = &http.Client{Transport: &http2.Transport{
+			AllowHTTP: true,
+			DialTLSContext: func(ctx context.Context, _, _ string, _ *tls.Config) (net.Conn, error) {
+				return s.dial(ctx, s.destination)
+			},
+		}, Timeout: 8 * time.Second}
+		return s
 	}
 	transport := &http.Transport{
 		ForceAttemptHTTP2:     true,
@@ -48,10 +77,20 @@ func NewDoHNameServer(u *url.URL, _ bool, disableCache bool, serveStale bool, se
 			ServerName: u.Hostname(),
 			MinVersion: tls.VersionTLS12,
 		},
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return s.dial(ctx, s.destination)
+		},
 	}
 	s.httpClient = &http.Client{Transport: transport, Timeout: 8 * time.Second}
 	return s
 }
+
+func cloneURL(u *url.URL) *url.URL {
+	copy := *u
+	return &copy
+}
+
+func (s *DoHNameServer) SetDialer(dial Dialer) { s.dial = dial }
 
 // Name implements Server.
 func (s *DoHNameServer) Name() string { return s.cacheController.name }
@@ -67,7 +106,7 @@ func (s *DoHNameServer) getCacheController() *CacheController { return s.cacheCo
 
 // sendQuery implements CachedNameserver.
 func (s *DoHNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- error, fqdn string, option dns_feature.IPOption) {
-	errors.LogInfo(ctx, s.Name(), " querying: ", fqdn)
+	errors.LogDebug(ctx, s.Name(), " querying: ", fqdn)
 
 	// Random EDNS0 padding to obscure traffic patterns (RFC 8467 best effort).
 	reqs, err := buildReqMsgs(fqdn, option, s.newReqID, genEDNS0Options(s.clientIP, randBetween(100, 300)))
@@ -112,9 +151,16 @@ func (s *DoHNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 				}
 				return
 			}
-			rec, err := parseResponse(resp)
+			rec, err := parseResponseForRequest(resp, r)
 			if err != nil {
 				errors.LogErrorInner(ctx, err, "failed to handle DOH response for ", fqdn)
+				if noResponseErrCh != nil {
+					noResponseErrCh <- err
+				}
+				return
+			}
+			if rec.RawHeader.Truncated {
+				err := errors.New("truncated DOH response")
 				if noResponseErrCh != nil {
 					noResponseErrCh <- err
 				}
@@ -159,6 +205,9 @@ func (s *DoHNameServer) dohHTTPSContext(ctx context.Context, b []byte) ([]byte, 
 
 func (s *DoHNameServer) Close() error {
 	if transport, ok := s.httpClient.Transport.(*http.Transport); ok {
+		transport.CloseIdleConnections()
+	}
+	if transport, ok := s.httpClient.Transport.(*http2.Transport); ok {
 		transport.CloseIdleConnections()
 	}
 	return s.cacheController.Close()

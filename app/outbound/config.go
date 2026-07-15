@@ -12,6 +12,7 @@ package outbound
 import (
 	"strings"
 
+	"github.com/eugene/bypasscore/app/dialer"
 	"github.com/eugene/bypasscore/common/errors"
 	"github.com/eugene/bypasscore/features/outbound"
 )
@@ -106,13 +107,30 @@ type Config struct {
 // handler wraps an Outbound so it satisfies the features/outbound.Handler
 // interface (which only needs Tag() plus the Feature lifecycle methods).
 type handler struct {
-	ob *Outbound
+	ob       *Outbound
+	external outbound.Handler
+	dialer   dialer.Dialer
 }
 
-func (h *handler) Tag() string              { return h.ob.Tag }
-func (h *handler) Type() interface{}        { return outbound.ManagerType() }
-func (h *handler) Start() error             { return nil }
-func (h *handler) Close() error             { return nil }
+func (h *handler) Tag() string { return h.ob.Tag }
+func (h *handler) Type() interface{} {
+	if h.external != nil {
+		return h.external.Type()
+	}
+	return outbound.ManagerType()
+}
+func (h *handler) Start() error {
+	if h.external != nil {
+		return h.external.Start()
+	}
+	return nil
+}
+func (h *handler) Close() error {
+	if h.external != nil {
+		return h.external.Close()
+	}
+	return nil
+}
 
 // GetOutbound returns the raw descriptor for a tag, or nil.
 func (m *Manager) GetOutbound(tag string) *Outbound {

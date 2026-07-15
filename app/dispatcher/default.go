@@ -10,11 +10,14 @@ package dispatcher
 
 import (
 	"context"
+	stderrors "errors"
 	"net"
 
 	"github.com/eugene/bypasscore/app/dialer"
+	"github.com/eugene/bypasscore/common"
 	"github.com/eugene/bypasscore/common/errors"
 	bcnet "github.com/eugene/bypasscore/common/net"
+	httpproto "github.com/eugene/bypasscore/common/protocol/http"
 	bcsession "github.com/eugene/bypasscore/common/session"
 	"github.com/eugene/bypasscore/features/routing"
 	routingsession "github.com/eugene/bypasscore/features/routing/session"
@@ -59,8 +62,13 @@ func (d *Dispatcher) Dispatch(ctx context.Context, conn net.Conn, dest bcnet.Des
 		var sniffed, protocol string
 		conn, sniffed, protocol = d.sniffer.SniffMetadata(conn)
 		content.Protocol = protocol
+		if protocol == "http" {
+			if replay, ok := conn.(*prependConn); ok {
+				_, content.Attributes = httpproto.SniffRequest(replay.buf)
+			}
+		}
 		if sniffed != "" {
-			errors.LogInfo(ctx, "sniffed domain: ", sniffed, " for ", dest.String())
+			errors.LogDebug(ctx, "sniffed domain: ", sniffed, " for ", dest.String())
 			// Match Xray's routeOnly semantics: the untrusted SNI/Host is used for
 			// routing, while the actual dial target remains the kernel-recovered
 			// original destination.
@@ -75,6 +83,10 @@ func (d *Dispatcher) Dispatch(ctx context.Context, conn net.Conn, dest bcnet.Des
 	route, err := d.router.PickRoute(rctx)
 	var outTag string
 	if err != nil {
+		if !stderrors.Is(err, common.ErrNoClue) {
+			_ = conn.Close()
+			return errors.New("routing failed for ", dest.String()).Base(err)
+		}
 		errors.LogInfoInner(ctx, err, "no matching route, using default outbound")
 		// Fall back to default handler.
 		dialer := d.ohm.GetDefaultDialer()
@@ -85,7 +97,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, conn net.Conn, dest bcnet.Des
 		return d.bridge(ctx, conn, dialer, originalDest)
 	}
 	outTag = route.GetOutboundTag()
-	errors.LogInfo(ctx, "route: ", dest.String(), " → ", outTag)
+	errors.LogDebug(ctx, "route: ", dest.String(), " → ", outTag)
 
 	// Look up the outbound dialer.
 	dialer := d.ohm.GetDialer(outTag)
@@ -135,13 +147,48 @@ type DialerManager interface {
 // The returned net.Conn is a raw TCP/UDP connection to the outbound; the
 // caller manages I/O directly.
 func (d *Dispatcher) DialOutbound(ctx context.Context, dest bcnet.Destination) (net.Conn, error) {
+	return d.dialOutboundPackets(ctx, dest, nil)
+}
+
+// DialOutboundPackets applies UDP protocol/domain sniffing before routing but
+// keeps the kernel-recovered IP as the actual dial target (routeOnly).
+func (d *Dispatcher) DialOutboundPackets(ctx context.Context, dest bcnet.Destination, packets [][]byte) (net.Conn, error) {
+	return d.dialOutboundPackets(ctx, dest, packets)
+}
+
+// SniffPacketMetadata exposes the bounded packet sniffer to the UDP session so
+// it can collect another Initial packet only when the parser asks for it.
+func (d *Dispatcher) SniffPacketMetadata(packets [][]byte) (string, string, bool) {
+	if d.sniffer == nil {
+		return "", "", false
+	}
+	return d.sniffer.SniffPacketMetadata(packets)
+}
+
+func (d *Dispatcher) dialOutboundPackets(ctx context.Context, dest bcnet.Destination, packets [][]byte) (net.Conn, error) {
 	// Build routing context.
-	rctx := buildRoutingContext(ctx, &bcsession.Outbound{OriginalTarget: dest, Target: dest})
+	outboundSession := &bcsession.Outbound{OriginalTarget: dest, Target: dest}
+	if domain, protocol, _ := d.SniffPacketMetadata(packets); domain != "" {
+		routeDest := dest
+		routeDest.Address = bcnet.ParseAddress(domain)
+		outboundSession.RouteTarget = routeDest
+		content := bcsession.ContentFromContext(ctx)
+		if content == nil {
+			content = new(bcsession.Content)
+			ctx = bcsession.ContextWithContent(ctx, content)
+		}
+		content.Protocol = protocol
+		errors.LogDebug(ctx, "sniffed UDP domain: ", domain, " for ", dest.String())
+	}
+	rctx := buildRoutingContext(ctx, outboundSession)
 
 	// Route.
 	route, err := d.router.PickRoute(rctx)
 	var dialer dialer.Dialer
 	if err != nil {
+		if !stderrors.Is(err, common.ErrNoClue) {
+			return nil, errors.New("routing failed for ", dest.String()).Base(err)
+		}
 		// Fall back to default.
 		dialer = d.ohm.GetDefaultDialer()
 		if dialer == nil {

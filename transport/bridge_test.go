@@ -78,6 +78,20 @@ func TestBridge_BothClosedReturns(t *testing.T) {
 	}
 }
 
+func TestBridgeOneSidedEOFWithoutHalfCloseDoesNotLeak(t *testing.T) {
+	a, peerA := net.Pipe()
+	b, peerB := net.Pipe()
+	defer peerB.Close()
+	done := make(chan error, 1)
+	go func() { done <- Bridge(a, b) }()
+	_ = peerA.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Bridge retained the opposite copy after one-sided EOF")
+	}
+}
+
 // TestNewConnLink verifies the Link wrapper reads through the conn.
 func TestNewConnLink(t *testing.T) {
 	server, client := net.Pipe()

@@ -4,7 +4,6 @@ import (
 	"context"
 
 	"github.com/eugene/bypasscore/app/observatory"
-	"github.com/eugene/bypasscore/common"
 	"github.com/eugene/bypasscore/common/errors"
 	"github.com/eugene/bypasscore/core"
 	"github.com/eugene/bypasscore/features/extension"
@@ -21,10 +20,10 @@ func (l *LeastPingStrategy) GetPrincipleTarget(strings []string) []string {
 
 func (l *LeastPingStrategy) InjectContext(ctx context.Context) {
 	l.ctx = ctx
-	common.Must(core.RequireFeatures(l.ctx, func(observatory extension.Observatory) error {
+	_ = core.RequireFeatures(l.ctx, func(observatory extension.Observatory) error {
 		l.observatory = observatory
 		return nil
-	}))
+	})
 }
 
 func (l *LeastPingStrategy) PickOutbound(strings []string) string {

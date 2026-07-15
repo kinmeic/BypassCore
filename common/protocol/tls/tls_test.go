@@ -17,7 +17,7 @@ func buildClientHello(sni string) []byte {
 	listLen := make([]byte, 2)
 	binary.BigEndian.PutUint16(listLen, uint16(1+2+len(hostBytes)))
 	sniExt = append(sniExt, listLen...)
-	sniExt = append(sniExt, 0x00)                                  // name_type = host_name
+	sniExt = append(sniExt, 0x00) // name_type = host_name
 	nameLen := make([]byte, 2)
 	binary.BigEndian.PutUint16(nameLen, uint16(len(hostBytes)))
 	sniExt = append(sniExt, nameLen...)
@@ -142,6 +142,23 @@ func TestSniffSNI_FragmentedClamped(t *testing.T) {
 	// It may or may not find the SNI (depends on where the truncation falls),
 	// but it must NOT panic.
 	_ = SniffSNI(half)
+}
+
+func TestSniffSNI_ClientHelloAcrossRecords(t *testing.T) {
+	original := buildClientHello("fragmented.example")
+	payload := original[5:]
+	cut := len(payload) / 2
+	fragmented := append([]byte{0x16, 0x03, 0x01, byte(cut >> 8), byte(cut)}, payload[:cut]...)
+	rest := len(payload) - cut
+	fragmented = append(fragmented, 0x16, 0x03, 0x01, byte(rest>>8), byte(rest))
+	fragmented = append(fragmented, payload[cut:]...)
+
+	if got := SniffSNI(fragmented); got != "fragmented.example" {
+		t.Fatalf("SniffSNI(fragmented) = %q", got)
+	}
+	if _, needMore := SniffSNIWithStatus(fragmented[:len(fragmented)-1]); !needMore {
+		t.Fatal("truncated second TLS record should request more data")
+	}
 }
 
 // --- helpers ---

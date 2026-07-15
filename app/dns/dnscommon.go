@@ -1,7 +1,6 @@
 package dns
 
 import (
-	"context"
 	"encoding/binary"
 	"math"
 	"strings"
@@ -202,12 +201,11 @@ func parseResponse(payload []byte) (*IPRecord, error) {
 		}
 	}()
 
-L:
 	for {
 		ah, err := parser.AnswerHeader()
 		if err != nil {
 			if err != dnsmessage.ErrSectionDone {
-				errors.LogInfoInner(context.Background(), err, "failed to parse answer section for domain: ", ah.Name.String())
+				return nil, errors.New("failed to parse DNS answer header for ", ah.Name.String()).Base(err)
 			}
 			break
 		}
@@ -225,15 +223,13 @@ L:
 		case dnsmessage.TypeA:
 			ans, err := parser.AResource()
 			if err != nil {
-				errors.LogInfoInner(context.Background(), err, "failed to parse A record for domain: ", ah.Name)
-				break L
+				return nil, errors.New("failed to parse A record for ", ah.Name).Base(err)
 			}
 			ipRecord.IP = append(ipRecord.IP, net.IPAddress(ans.A[:]).IP())
 		case dnsmessage.TypeAAAA:
 			ans, err := parser.AAAAResource()
 			if err != nil {
-				errors.LogInfoInner(context.Background(), err, "failed to parse AAAA record for domain: ", ah.Name)
-				break L
+				return nil, errors.New("failed to parse AAAA record for ", ah.Name).Base(err)
 			}
 			newIP := net.IPAddress(ans.AAAA[:]).IP()
 			if len(newIP) == net.IPv6len {
@@ -241,12 +237,43 @@ L:
 			}
 		default:
 			if err := parser.SkipAnswer(); err != nil {
-				errors.LogInfoInner(context.Background(), err, "failed to skip answer")
-				break L
+				return nil, errors.New("failed to skip DNS answer").Base(err)
 			}
 			continue
 		}
 	}
 
 	return ipRecord, nil
+}
+
+// parseResponseForRequest rejects unsolicited, stale, or malformed DNS
+// responses before they can enter the cache.
+func parseResponseForRequest(payload []byte, req *dnsRequest) (*IPRecord, error) {
+	if req == nil || req.msg == nil || len(req.msg.Questions) != 1 {
+		return nil, errors.New("invalid DNS request metadata")
+	}
+	var parser dnsmessage.Parser
+	header, err := parser.Start(payload)
+	if err != nil {
+		return nil, errors.New("failed to parse DNS response header").Base(err)
+	}
+	if !header.Response {
+		return nil, errors.New("DNS message is not a response")
+	}
+	if header.ID != req.msg.ID {
+		return nil, errors.New("DNS response ID mismatch")
+	}
+	question, err := parser.Question()
+	if err != nil {
+		return nil, errors.New("DNS response has no matching question").Base(err)
+	}
+	expected := req.msg.Questions[0]
+	if !strings.EqualFold(question.Name.String(), expected.Name.String()) ||
+		question.Type != expected.Type || question.Class != expected.Class {
+		return nil, errors.New("DNS response question mismatch")
+	}
+	if _, err := parser.Question(); err != dnsmessage.ErrSectionDone {
+		return nil, errors.New("DNS response contains unexpected questions")
+	}
+	return parseResponse(payload)
 }

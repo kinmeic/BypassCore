@@ -1,0 +1,22 @@
+{
+  "outbounds": [
+    {"tag": "direct", "mode": "freedom"},
+    {
+      "tag": "socks",
+      "mode": "proxy",
+      "upstream": {"protocol": "socks", "server": "10.20.0.2:1080", "settings": {}}
+    }
+  ],
+  "inbounds": [
+    {"tag": "redirect", "type": "redirect", "listen": "0.0.0.0", "port": 12345, "network": "tcp", "sniffing": true},
+    {"tag": "tproxy", "type": "tproxy", "listen": "0.0.0.0", "port": 12346, "network": "tcp,udp", "sniffing": true},
+    {"tag": "tproxy6", "type": "tproxy", "listen": "::", "port": 12348, "network": "tcp,udp", "sniffing": true},
+    {"tag": "udp_socks", "type": "tproxy", "listen": "0.0.0.0", "port": 12347, "network": "udp", "sniffing": true}
+  ],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      {"inboundTag": ["udp_socks"], "outboundTag": "socks"}
+    ]
+  }
+}

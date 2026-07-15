@@ -106,9 +106,9 @@ type fakeDNSClient struct {
 func (f *fakeDNSClient) LookupIP(_ string, _ dns_feature.IPOption) ([]bcnet.IP, uint32, error) {
 	return f.ips, 60, nil
 }
-func (f *fakeDNSClient) Type() interface{}    { return dns_feature.ClientType() }
-func (f *fakeDNSClient) Start() error         { return nil }
-func (f *fakeDNSClient) Close() error         { return nil }
+func (f *fakeDNSClient) Type() interface{} { return dns_feature.ClientType() }
+func (f *fakeDNSClient) Start() error      { return nil }
+func (f *fakeDNSClient) Close() error      { return nil }
 
 // buildTestRouterWithDNS is like buildTestRouter but injects a fake DNS client
 // and lets the caller pick the domainStrategy.
@@ -349,6 +349,24 @@ func TestReloadRules_DuplicateRuleTagRejected(t *testing.T) {
 		if rule.RuleTag == "new" {
 			t.Error("rolled-back rule 'new' should not be present")
 		}
+	}
+}
+
+func TestReloadRulesFailureIsTransactional(t *testing.T) {
+	oldDomains, _ := geodata.ParseDomainRules([]string{"full:old.example"}, geodata.Domain_Substr)
+	newDomains, _ := geodata.ParseDomainRules([]string{"full:new.example"}, geodata.Domain_Substr)
+	r := new(Router)
+	if err := r.Init(context.Background(), &Config{Rule: []*RoutingRule{{
+		TargetTag: &RoutingRule_Tag{Tag: "direct"}, Domain: oldDomains,
+	}}}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	bad := &RoutingRule{TargetTag: &RoutingRule_BalancingTag{BalancingTag: "missing"}, Domain: newDomains}
+	if err := r.ReloadRules(&Config{Rule: []*RoutingRule{bad}}, false); err == nil {
+		t.Fatal("invalid replacement unexpectedly succeeded")
+	}
+	if _, err := r.PickRoute(&testContext{targetDomain: "old.example"}); err != nil {
+		t.Fatalf("old rules were lost after failed replacement: %v", err)
 	}
 }
 

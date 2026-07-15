@@ -9,6 +9,7 @@ import (
 	"log"
 	"runtime"
 	"strings"
+	"sync/atomic"
 )
 
 // trim is the prefix length used to shorten caller names. Callers are reported
@@ -34,12 +35,35 @@ func callerName(skip int) string {
 type Severity int
 
 const (
-	Severity_Debug Severity = -4
-	Severity_Info  Severity = -3
+	Severity_Debug   Severity = -4
+	Severity_Info    Severity = -3
 	Severity_Warning Severity = -2
-	Severity_Error Severity = -1
-	severity_Print Severity = 0 // never logged through Log* directly
+	Severity_Error   Severity = -1
+	severity_Print   Severity = 0 // never logged through Log* directly
 )
+
+var minimumLogSeverity atomic.Int32
+
+func init() { minimumLogSeverity.Store(int32(Severity_Info)) }
+
+// SetLogLevel changes the process-wide minimum level.
+func SetLogLevel(level string) error {
+	var severity Severity
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "debug":
+		severity = Severity_Debug
+	case "", "info":
+		severity = Severity_Info
+	case "warning", "warn":
+		severity = Severity_Warning
+	case "error":
+		severity = Severity_Error
+	default:
+		return fmt.Errorf("unknown log level %q", level)
+	}
+	minimumLogSeverity.Store(int32(severity))
+	return nil
+}
 
 func (s Severity) String() string {
 	switch s {
@@ -183,8 +207,7 @@ func doLog(_ context.Context, inner error, severity Severity, msg ...interface{}
 	if severity < Severity_Debug {
 		return // unknown, bail out
 	}
-	if severity == Severity_Debug {
-		// Debug is off by default to keep output clean.
+	if severity < Severity(minimumLogSeverity.Load()) {
 		return
 	}
 	err := &Error{

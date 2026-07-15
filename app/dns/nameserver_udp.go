@@ -26,6 +26,7 @@ type ClassicNameServer struct {
 	address         bcnet.Destination
 	clientIP        bcnet.IP
 	reqID           uint32
+	dial            Dialer
 }
 
 // NewClassicNameServer creates a UDP DNS server.
@@ -37,10 +38,16 @@ func NewClassicNameServer(address bcnet.Destination, disableCache bool, serveSta
 		cacheController: NewCacheController(strings.ToUpper(address.String()), disableCache, serveStale, serveExpiredTTL),
 		address:         address,
 		clientIP:        clientIP,
+		dial: func(ctx context.Context, dest bcnet.Destination) (net.Conn, error) {
+			d := net.Dialer{}
+			return d.DialContext(ctx, "udp", dest.NetAddr())
+		},
 	}
 	errors.LogInfo(context.Background(), "DNS: created UDP client for ", address.NetAddr())
 	return s
 }
+
+func (s *ClassicNameServer) SetDialer(dial Dialer) { s.dial = dial }
 
 // Name implements Server.
 func (s *ClassicNameServer) Name() string { return s.cacheController.name }
@@ -69,7 +76,7 @@ func packMessage(msg *dnsmessage.Message) ([]byte, error) {
 // sendQuery implements CachedNameserver. It sends A/AAAA queries and delivers
 // responses to the noResponseErrCh / pubsub subscribers set up by doFetch.
 func (s *ClassicNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- error, fqdn string, option dns_feature.IPOption) {
-	errors.LogInfo(ctx, s.Name(), " querying DNS for: ", fqdn)
+	errors.LogDebug(ctx, s.Name(), " querying DNS for: ", fqdn)
 
 	reqs, err := buildReqMsgs(fqdn, option, s.newReqID, genEDNS0Options(s.clientIP, 0))
 	if err != nil {
@@ -96,8 +103,7 @@ func (s *ClassicNameServer) sendOneQuery(ctx context.Context, noResponseErrCh ch
 	if !ok {
 		deadline = time.Now().Add(8 * time.Second)
 	}
-	dialer := net.Dialer{}
-	conn, err := dialer.DialContext(ctx, "udp", s.address.NetAddr())
+	conn, err := s.dial(ctx, s.address)
 	if err != nil {
 		if noResponseErrCh != nil {
 			noResponseErrCh <- err
@@ -134,7 +140,7 @@ func (s *ClassicNameServer) sendOneQuery(ctx context.Context, noResponseErrCh ch
 		return
 	}
 
-	ipRec, err := parseResponse(respBuf[:n])
+	ipRec, err := parseResponseForRequest(respBuf[:n], req)
 	if err != nil {
 		errors.LogErrorInner(ctx, err, s.Name(), " failed to parse dns response")
 		if noResponseErrCh != nil {
@@ -154,6 +160,13 @@ func (s *ClassicNameServer) sendOneQuery(ctx context.Context, noResponseErrCh ch
 		retryReq := *req
 		retryReq.msg = &newMsg
 		s.sendOneQuery(ctx, noResponseErrCh, &retryReq)
+		return
+	}
+	if ipRec.RawHeader.Truncated {
+		err := errors.New("DNS UDP response remains truncated after EDNS retry")
+		if noResponseErrCh != nil {
+			noResponseErrCh <- err
+		}
 		return
 	}
 

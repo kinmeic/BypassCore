@@ -1,0 +1,41 @@
+name: Linux network integration
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: netns-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  netns:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Install network namespace tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq iproute2 iptables
+          sudo modprobe xt_TPROXY || true
+          sudo modprobe nf_tproxy_ipv4 || true
+          sudo modprobe nf_tproxy_ipv6 || true
+
+      - name: Unit and race tests
+        run: go test -race -count=1 ./...
+
+      - name: Run REDIRECT, TPROXY, IPv6 and SOCKS UDP tests
+        run: integration/netns/run.sh

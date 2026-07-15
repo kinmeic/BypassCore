@@ -31,10 +31,16 @@ func NewDOTNameServer(u *url.URL, disableCache bool, serveStale bool, serveExpir
 	if port == "" {
 		port = "853"
 	}
-	addr := net.JoinHostPort(host, port)
+	base.destination.Port = bcnet.Port(853)
+	if port != "853" {
+		parsed, err := bcnet.PortFromString(port)
+		if err != nil {
+			return nil, err
+		}
+		base.destination.Port = parsed
+	}
 	base.dial = func(ctx context.Context) (net.Conn, error) {
-		d := net.Dialer{}
-		rawConn, err := d.DialContext(ctx, "tcp", addr)
+		rawConn, err := base.rawDial(ctx, base.destination)
 		if err != nil {
 			return nil, err
 		}

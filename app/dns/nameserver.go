@@ -2,6 +2,7 @@ package dns
 
 import (
 	"context"
+	"net"
 	"net/url"
 	"strings"
 	"time"
@@ -24,6 +25,13 @@ type Server interface {
 	QueryIP(ctx context.Context, domain string, option dns_feature.IPOption) ([]bcnet.IP, uint32, error)
 }
 
+// Dialer routes a DNS transport connection to its configured destination.
+type Dialer func(context.Context, bcnet.Destination) (net.Conn, error)
+
+type routedNameServer interface {
+	SetDialer(Dialer)
+}
+
 // Client wraps a Server with policy: expected/unexpected IP filters, timeout,
 // query-strategy overrides, and fallback behavior.
 type Client struct {
@@ -39,17 +47,16 @@ type Client struct {
 	ipOption      *dns_feature.IPOption
 	checkSystem   bool
 	policyID      uint32
+	localDirect   bool
 }
 
 // NewServer creates a transport Server from a destination URL. It dispatches on
-// the address scheme. BypassCore only supports local-direct mode (no proxy
-// dispatcher), so `+local` suffixes are accepted but treated as equivalent to
-// their non-local counterparts.
+// the address scheme. Servers marked `+local` dial directly; other transports
+// can be attached to the routing data plane through DNS.SetDialer.
 func NewServer(dest bcnet.Destination, disableCache bool, serveStale bool, serveExpiredTTL uint32, clientIP bcnet.IP) (Server, error) {
 	if address := dest.Address; address.Family().IsDomain() {
 		raw := address.Domain()
-		// Normalize +local suffix to plain scheme (we only do local direct).
-		raw = strings.ReplaceAll(raw, "+local", "")
+		raw = stripLocalScheme(raw)
 		u, err := url.Parse(raw)
 		if err != nil {
 			return nil, err
@@ -63,6 +70,18 @@ func NewServer(dest bcnet.Destination, disableCache bool, serveStale bool, serve
 			return NewDOTNameServer(u, disableCache, serveStale, serveExpiredTTL, clientIP)
 		case strings.EqualFold(u.Scheme, "tcp"):
 			return NewTCPNameServer(u, disableCache, serveStale, serveExpiredTTL, clientIP)
+		case strings.EqualFold(u.Scheme, "udp"):
+			port := bcnet.Port(53)
+			if u.Port() != "" {
+				port, err = bcnet.PortFromString(u.Port())
+				if err != nil {
+					return nil, err
+				}
+			}
+			if u.Hostname() == "" {
+				return nil, errors.New("UDP nameserver has empty host")
+			}
+			return NewClassicNameServer(bcnet.UDPDestination(bcnet.ParseAddress(u.Hostname()), port), disableCache, serveStale, serveExpiredTTL, clientIP), nil
 		}
 	}
 	if dest.Network == bcnet.Network_Unknown {
@@ -128,6 +147,7 @@ func NewClient(
 	}
 
 	client.server = server
+	client.localDirect = isLocalDNSAddress(ns.Address.AsDestination())
 	client.skipFallback = ns.SkipFallback
 	client.expectedIPs = expectedMatcher
 	client.unexpectedIPs = unexpectedMatcher
@@ -163,6 +183,7 @@ func (c *Client) QueryIP(ctx context.Context, domain string, option dns_feature.
 
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	ctx = session.ContextWithInbound(ctx, &session.Inbound{Tag: c.tag})
+	ctx = session.ContextWithContent(ctx, &session.Content{Protocol: "dns", SkipDNSResolve: true})
 	ips, ttl, err := c.server.QueryIP(ctx, domain, option)
 	cancel()
 
@@ -202,6 +223,26 @@ func (c *Client) QueryIP(ctx context.Context, domain string, option dns_feature.
 		}
 	}
 	return ips, ttl, nil
+}
+
+func isLocalDNSAddress(dest bcnet.Destination) bool {
+	if !dest.Address.Family().IsDomain() {
+		return false
+	}
+	raw := strings.ToLower(dest.Address.Domain())
+	if raw == "localhost" {
+		return true
+	}
+	separator := strings.Index(raw, "://")
+	return separator > 0 && strings.HasSuffix(raw[:separator], "+local")
+}
+
+func stripLocalScheme(raw string) string {
+	separator := strings.Index(raw, "://")
+	if separator <= 0 || !strings.HasSuffix(strings.ToLower(raw[:separator]), "+local") {
+		return raw
+	}
+	return raw[:separator-len("+local")] + raw[separator:]
 }
 
 // ResolveIpOptionOverride applies a query strategy to narrow an IPOption.

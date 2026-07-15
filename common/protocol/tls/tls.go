@@ -1,59 +1,90 @@
-// Package tls implements TLS ClientHello SNI sniffing. Given the first bytes
-// of a TCP connection, it parses the TLS ClientHello to extract the Server
-// Name Indication (SNI) extension value, enabling domain-based routing for
-// transparent proxy flows that arrive as IP:port.
+// Package tls implements bounded TLS ClientHello SNI sniffing for transparent
+// proxy connections.
 package tls
 
-import (
-	"encoding/binary"
-)
+import "encoding/binary"
 
-// SniffSNI parses a TLS ClientHello from the given bytes and returns the SNI
-// hostname, or "" if the bytes are not a valid ClientHello or no SNI is present.
-//
-// TLS record: ContentType(1) Version(2) Length(2) → Handshake:
-// HandshakeType(1) Length(3) Version(2) Random(32) SessionID(1+var)
-// CipherSuites(2+var) CompressionMethods(1+var) Extensions(2+var)
+const maxTLSHandshake = 1 << 20
+
+// SniffSNI returns the SNI hostname from a complete TLS ClientHello.
 func SniffSNI(data []byte) string {
-	if len(data) < 5 {
-		return ""
+	host, _ := SniffSNIWithStatus(data)
+	return host
+}
+
+// SniffClientHelloHandshake parses TLS handshake bytes without a TLS record
+// wrapper. QUIC CRYPTO frames carry ClientHello in this form.
+func SniffClientHelloHandshake(data []byte) (host string, needMore bool) {
+	if len(data) < 4 {
+		return "", true
 	}
-	// TLS record header
-	if data[0] != 0x16 { // ContentType = Handshake
-		return ""
+	if data[0] != 0x01 {
+		return "", false
 	}
-	// record length
-	recLen := int(binary.BigEndian.Uint16(data[3:5]))
-	if recLen < 4 || len(data) < 5+recLen {
-		// May be a fragmented ClientHello; try with what we have.
-		recLen = len(data) - 5
-		if recLen < 4 {
-			return ""
+	length := int(data[1])<<16 | int(data[2])<<8 | int(data[3])
+	if length < 34 || length > maxTLSHandshake {
+		return "", false
+	}
+	if len(data) < 4+length {
+		return "", true
+	}
+	return parseClientHello(data[4 : 4+length]), false
+}
+
+// SniffSNIWithStatus returns the hostname and whether a valid-looking TLS
+// ClientHello needs more bytes. Handshake bytes are reassembled across TLS
+// records instead of assuming the ClientHello is contained in the first one.
+func SniffSNIWithStatus(data []byte) (host string, needMore bool) {
+	if len(data) == 0 {
+		return "", true
+	}
+	if data[0] != 0x16 {
+		return "", false
+	}
+
+	handshake := make([]byte, 0, len(data))
+	for offset := 0; ; {
+		if len(data)-offset < 5 {
+			return "", true
+		}
+		if data[offset] != 0x16 {
+			return "", false
+		}
+		recordLen := int(binary.BigEndian.Uint16(data[offset+3 : offset+5]))
+		if recordLen == 0 || recordLen > 18432 {
+			return "", false
+		}
+		if len(data)-offset-5 < recordLen {
+			return "", true
+		}
+		handshake = append(handshake, data[offset+5:offset+5+recordLen]...)
+		offset += 5 + recordLen
+
+		if len(handshake) >= 1 && handshake[0] != 0x01 {
+			return "", false
+		}
+		if len(handshake) >= 4 {
+			handshakeLen := int(handshake[1])<<16 | int(handshake[2])<<8 | int(handshake[3])
+			if handshakeLen < 34 || handshakeLen > maxTLSHandshake {
+				return "", false
+			}
+			if len(handshake) >= 4+handshakeLen {
+				return parseClientHello(handshake[4 : 4+handshakeLen]), false
+			}
+		}
+		if offset == len(data) {
+			return "", true
 		}
 	}
-	data = data[5 : 5+recLen]
+}
 
-	// Handshake header
-	if data[0] != 0x01 { // HandshakeType = ClientHello
-		return ""
-	}
-	// handshake length (3 bytes)
-	hsLen := int(data[1])<<16 | int(data[2])<<8 | int(data[3])
-	if hsLen > len(data)-4 {
-		hsLen = len(data) - 4
-	}
-	data = data[4 : 4+hsLen]
-
+func parseClientHello(data []byte) string {
 	// Version(2) + Random(32)
-	if len(data) < 34 {
+	if len(data) < 35 {
 		return ""
 	}
 	data = data[34:]
 
-	// Session ID
-	if len(data) < 1 {
-		return ""
-	}
 	sidLen := int(data[0])
 	data = data[1:]
 	if len(data) < sidLen+2 {
@@ -61,71 +92,81 @@ func SniffSNI(data []byte) string {
 	}
 	data = data[sidLen:]
 
-	// Cipher suites (2-byte length)
 	csLen := int(binary.BigEndian.Uint16(data[:2]))
 	data = data[2:]
-	if len(data) < csLen+1 {
+	if csLen == 0 || csLen%2 != 0 || len(data) < csLen+1 {
 		return ""
 	}
 	data = data[csLen:]
 
-	// Compression methods (1-byte length)
-	cmLen := int(data[0])
+	compressionLen := int(data[0])
 	data = data[1:]
-	if len(data) < cmLen+2 {
+	if compressionLen == 0 || len(data) < compressionLen {
 		return ""
 	}
-	data = data[cmLen:]
-
-	// Extensions (2-byte total length)
-	extTotalLen := int(binary.BigEndian.Uint16(data[:2]))
-	data = data[2:]
-	if extTotalLen > len(data) {
-		extTotalLen = len(data)
+	data = data[compressionLen:]
+	if len(data) == 0 { // Extensions are optional in old ClientHello messages.
+		return ""
 	}
-	data = data[:extTotalLen]
+	if len(data) < 2 {
+		return ""
+	}
+	extensionsLen := int(binary.BigEndian.Uint16(data[:2]))
+	data = data[2:]
+	if extensionsLen != len(data) {
+		return ""
+	}
 
-	// Iterate extensions
-	for len(data) >= 4 {
-		extType := binary.BigEndian.Uint16(data[:2])
-		extLen := int(binary.BigEndian.Uint16(data[2:4]))
-		if len(data) < 4+extLen {
-			break
+	for len(data) > 0 {
+		if len(data) < 4 {
+			return ""
 		}
-		extData := data[4 : 4+extLen]
-		data = data[4+extLen:]
-
-		if extType == 0x0000 { // server_name extension
-			return parseSNIExtension(extData)
+		typ := binary.BigEndian.Uint16(data[:2])
+		length := int(binary.BigEndian.Uint16(data[2:4]))
+		data = data[4:]
+		if len(data) < length {
+			return ""
 		}
+		if typ == 0 {
+			return parseSNIExtension(data[:length])
+		}
+		data = data[length:]
 	}
 	return ""
 }
 
-// parseSNIExtension extracts the hostname from the server_name extension data.
 func parseSNIExtension(data []byte) string {
-	// server_name list length (2 bytes)
 	if len(data) < 2 {
 		return ""
 	}
 	listLen := int(binary.BigEndian.Uint16(data[:2]))
 	data = data[2:]
-	if listLen > len(data) {
-		listLen = len(data)
-	}
-	data = data[:listLen]
-
-	// Each entry: name_type(1) + name_length(2) + name
-	if len(data) < 3 {
+	if listLen != len(data) {
 		return ""
 	}
-	// name_type must be 0 (host_name)
-	if data[0] != 0 {
-		return ""
+	for len(data) > 0 {
+		if len(data) < 3 {
+			return ""
+		}
+		nameType := data[0]
+		nameLen := int(binary.BigEndian.Uint16(data[1:3]))
+		data = data[3:]
+		if nameLen == 0 || len(data) < nameLen {
+			return ""
+		}
+		if nameType == 0 {
+			name := data[:nameLen]
+			for _, char := range name {
+				if char <= ' ' {
+					return ""
+				}
+			}
+			if name[len(name)-1] == '.' {
+				return ""
+			}
+			return string(name)
+		}
+		data = data[nameLen:]
 	}
-	nameLen := int(binary.BigEndian.Uint16(data[1:3]))
-	if len(data) < 3+nameLen {
-		return ""
-	}
-	return string(data[3 : 3+nameLen])
+	return ""
 }

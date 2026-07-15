@@ -1,57 +1,86 @@
-// Package http implements HTTP Host header sniffing. Given the first bytes of
-// a TCP connection, it parses the HTTP request to extract the Host header,
-// enabling domain-based routing for transparent proxy flows.
+// Package http implements bounded HTTP/1 request metadata sniffing.
 package http
 
 import (
 	"bytes"
+	"net"
+	"strconv"
 	"strings"
 )
 
-// SniffHost parses an HTTP request from the given bytes and returns the Host
-// header value (without port), or "" if the bytes are not an HTTP request or
-// no Host header is present.
-func SniffHost(data []byte) string {
-	// Quick check: HTTP methods
-	methods := []string{"GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "OPTIONS ", "CONNECT ", "PATCH "}
-	isHTTP := false
-	for _, m := range methods {
-		if len(data) >= len(m) && string(data[:len(m)]) == m {
-			isHTTP = true
-			break
-		}
-	}
-	if !isHTTP {
-		return ""
-	}
+var methods = []string{"GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "CONNECT", "PATCH"}
 
-	// Find the end of headers (CRLF CRLF) or just the first line + Host line
-	// within the first buffer. We only need the Host header.
-	lines := bytes.Split(data, []byte("\n"))
-	for _, line := range lines {
-		line = bytes.TrimRight(line, "\r")
-		// Case-insensitive "Host:" prefix
-		if len(line) > 5 {
-			prefix := strings.ToLower(string(line[:5]))
-			if prefix == "host:" {
-				host := strings.TrimSpace(string(line[5:]))
-				// Strip port if present
-				if idx := strings.LastIndex(host, ":"); idx > 0 {
-					// Check if it's an IPv6 address (contains multiple colons)
-					if strings.Count(host, ":") > 1 {
-						// IPv6: [::1]:8080 or ::1
-						if host[0] == '[' {
-							if idx := strings.Index(host, "]"); idx > 0 {
-								return host[1:idx]
-							}
-						}
-					} else {
-						host = host[:idx]
-					}
-				}
-				return host
+// SniffHost returns the normalized Host header without its port.
+func SniffHost(data []byte) string {
+	host, _ := SniffRequest(data)
+	return host
+}
+
+// SniffRequest extracts Host plus lowercase HTTP headers and request-line
+// attributes. Callers should provide a complete header block so segmented
+// attributes cannot bypass routing conditions.
+func SniffRequest(data []byte) (string, map[string]string) {
+	headerEnd := bytes.Index(data, []byte("\r\n\r\n"))
+	if headerEnd < 0 {
+		return "", nil
+	}
+	lines := bytes.Split(data[:headerEnd], []byte("\r\n"))
+	if len(lines) == 0 {
+		return "", nil
+	}
+	request := strings.Fields(string(lines[0]))
+	if len(request) != 3 || !knownMethod(request[0]) || !strings.HasPrefix(request[2], "HTTP/1.") {
+		return "", nil
+	}
+	attributes := map[string]string{":method": request[0], ":path": request[1]}
+	host := ""
+	for _, line := range lines[1:] {
+		parts := bytes.SplitN(line, []byte{':'}, 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(string(parts[0])))
+		value := strings.TrimSpace(string(parts[1]))
+		if key == "" || strings.ContainsAny(key, " \t\r\n") || strings.ContainsAny(value, "\r\n\x00") {
+			return "", nil
+		}
+		attributes[key] = value
+		if key == "host" {
+			host = normalizeHost(value)
+			if host == "" {
+				return "", nil
 			}
 		}
 	}
-	return ""
+	return host, attributes
+}
+
+func knownMethod(method string) bool {
+	for _, candidate := range methods {
+		if strings.EqualFold(method, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeHost(value string) string {
+	if host, portText, err := net.SplitHostPort(value); err == nil {
+		port, err := strconv.Atoi(portText)
+		if err != nil || port < 1 || port > 65535 {
+			return ""
+		}
+		return strings.Trim(host, "[]")
+	}
+	if strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]") {
+		value = strings.Trim(value, "[]")
+	}
+	if value == "" || strings.ContainsAny(value, " \t/\\") {
+		return ""
+	}
+	// An unbracketed IPv6 literal has multiple colons and no port.
+	if strings.Count(value, ":") == 1 {
+		return "" // malformed host:port
+	}
+	return value
 }

@@ -58,10 +58,14 @@ func run() error {
 	resolve := flag.String("resolve", "", `resolve a domain via DNS, e.g. "example.com"`)
 	observe := flag.Bool("observe", false, "run a single observatory probe round")
 	runMode := flag.Bool("run", false, "run as a daemon (listen + dispatch)")
+	logLevel := flag.String("log-level", "info", "log level: debug, info, warning, error")
 	showVersion := false
 	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 	flag.BoolVar(&showVersion, "V", false, "print version and exit")
 	flag.Parse()
+	if err := errors.SetLogLevel(*logLevel); err != nil {
+		return err
+	}
 	if showVersion {
 		fmt.Println("BypassCore", version)
 		return nil
@@ -73,11 +77,11 @@ func run() error {
 	}
 
 	// Build the outbound manager from the descriptor table.
+	registerDialerFactory()
 	ohm := appoutbound.NewManager(&appoutbound.Config{Outbounds: cfg.Outbounds})
 	if err := ohm.Validate(); err != nil {
 		return errors.New("outbound config: ").Base(err)
 	}
-	registerDialerFactory()
 
 	// Build the routing config.
 	routerCfg, err := cfg.Routing.Build()
@@ -93,6 +97,7 @@ func run() error {
 	// the system resolver.
 	baseCtx := context.Background()
 	var dnsClient featdns.Client
+	var routedDNS *appdns.DNS
 	if cfg.DNS != nil {
 		dnsCfg, err := cfg.DNS.Build()
 		if err != nil {
@@ -107,6 +112,7 @@ func run() error {
 		}
 		defer srv.Close()
 		dnsClient = srv
+		routedDNS = srv
 	} else {
 		dnsClient = appdns.NewLocal()
 	}
@@ -127,6 +133,10 @@ func run() error {
 	r := new(router.Router)
 	if err := r.Init(routerCtx, routerCfg, dnsClient, ohm, nil); err != nil {
 		return errors.New("init router: ").Base(err)
+	}
+	if routedDNS != nil {
+		dnsDispatcher := dispatcher.New(r, ohm, nil)
+		routedDNS.SetDialer(dnsDispatcher.DialOutbound)
 	}
 
 	// Choose the requested operating mode.

@@ -17,6 +17,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/eugene/bypasscore/common/errors"
@@ -30,6 +31,25 @@ type Handler struct {
 	username string
 	password string
 	timeout  time.Duration
+}
+
+var socksUDPPacketPool = sync.Pool{New: func() any {
+	buf := make([]byte, 65535)
+	return &buf
+}}
+
+func writeAll(conn net.Conn, data []byte) error {
+	for len(data) > 0 {
+		n, err := conn.Write(data)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+	}
+	return nil
 }
 
 // New creates a SOCKS5 client handler.
@@ -100,7 +120,7 @@ func (h *Handler) Dial(ctx context.Context, dest bcnet.Destination) (net.Conn, e
 	// Reset deadline — the caller (transport.Bridge) will manage I/O timeouts.
 	_ = conn.SetDeadline(time.Time{})
 
-	errors.LogInfo(ctx, "socks5[", h.tag, "] connected ", h.server, " → ", dest.NetAddr())
+	errors.LogDebug(ctx, "socks5[", h.tag, "] connected ", h.server, " → ", dest.NetAddr())
 	return conn, nil
 }
 
@@ -113,7 +133,7 @@ func (h *Handler) handshake(conn net.Conn, dest bcnet.Destination) error {
 	if err != nil {
 		return err
 	}
-	if _, err := conn.Write(req); err != nil {
+	if err := writeAll(conn, req); err != nil {
 		return errors.New("socks5 connect write failed").Base(err)
 	}
 	_, err = readCommandResponse(conn)
@@ -125,14 +145,14 @@ func (h *Handler) authenticate(conn net.Conn) error {
 	// Version 5, offer methods: no-auth (0x00) and/or user/pass (0x02)
 	methods := []byte{0x00} // no-auth
 	if h.username != "" || h.password != "" {
-		methods = append(methods, 0x02) // username/password
+		methods = []byte{0x02} // credentials make authentication mandatory
 	}
 
 	greeting := make([]byte, 0, 3+len(methods))
 	greeting = append(greeting, 0x05, byte(len(methods)))
 	greeting = append(greeting, methods...)
 
-	if _, err := conn.Write(greeting); err != nil {
+	if err := writeAll(conn, greeting); err != nil {
 		return errors.New("socks5 greeting write failed").Base(err)
 	}
 
@@ -149,6 +169,9 @@ func (h *Handler) authenticate(conn net.Conn) error {
 	// --- Authentication (if required) ---
 	switch method {
 	case 0x00: // no auth
+		if h.username != "" || h.password != "" {
+			return errors.New("socks5: server selected unoffered no-auth method")
+		}
 	case 0x02: // username/password
 		if err := h.doUserPassAuth(conn); err != nil {
 			return err
@@ -224,7 +247,7 @@ func (h *Handler) doUserPassAuth(conn net.Conn) error {
 	req = append(req, byte(len(pass)))
 	req = append(req, pass...)
 
-	if _, err := conn.Write(req); err != nil {
+	if err := writeAll(conn, req); err != nil {
 		return errors.New("socks5: user/pass write failed").Base(err)
 	}
 
@@ -293,7 +316,7 @@ func (h *Handler) udpAssociate(ctx context.Context, control net.Conn, dest bcnet
 	if err != nil {
 		return nil, err
 	}
-	if _, err := control.Write(req); err != nil {
+	if err := writeAll(control, req); err != nil {
 		return nil, errors.New("socks5 UDP ASSOCIATE write failed").Base(err)
 	}
 	relay, err := readCommandResponse(control)
@@ -342,14 +365,19 @@ func (c *udpAssociateConn) Write(payload []byte) (int, error) {
 }
 
 func (c *udpAssociateConn) Read(payload []byte) (int, error) {
-	packet := make([]byte, 65535)
+	bufp := socksUDPPacketPool.Get().(*[]byte)
+	packet := *bufp
+	defer socksUDPPacketPool.Put(bufp)
 	n, err := c.Conn.Read(packet)
 	if err != nil {
 		return 0, err
 	}
-	offset, err := socksUDPDataOffset(packet[:n])
+	offset, source, err := parseSocksUDPHeader(packet[:n])
 	if err != nil {
 		return 0, err
+	}
+	if source.Port != c.target.Port || (!c.target.Address.Family().IsDomain() && source.Address.String() != c.target.Address.String()) {
+		return 0, errors.New("socks5: UDP response source does not match association target")
 	}
 	return copy(payload, packet[offset:n]), nil
 }
@@ -364,29 +392,44 @@ func (c *udpAssociateConn) SetDeadline(t time.Time) error {
 	return c.Conn.SetDeadline(t)
 }
 
-func socksUDPDataOffset(packet []byte) (int, error) {
+func parseSocksUDPHeader(packet []byte) (int, bcnet.Destination, error) {
 	if len(packet) < 4 || packet[0] != 0 || packet[1] != 0 || packet[2] != 0 {
-		return 0, errors.New("socks5: malformed or fragmented UDP packet")
+		return 0, bcnet.Destination{}, errors.New("socks5: malformed or fragmented UDP packet")
 	}
 	offset := 4
+	var address bcnet.Address
 	switch packet[3] {
 	case 0x01:
+		if len(packet) < offset+4 {
+			return 0, bcnet.Destination{}, errors.New("socks5: truncated UDP IPv4 address")
+		}
+		address = bcnet.IPAddress(packet[offset : offset+4])
 		offset += 4
 	case 0x04:
+		if len(packet) < offset+16 {
+			return 0, bcnet.Destination{}, errors.New("socks5: truncated UDP IPv6 address")
+		}
+		address = bcnet.IPAddress(packet[offset : offset+16])
 		offset += 16
 	case 0x03:
 		if len(packet) < 5 {
-			return 0, errors.New("socks5: truncated UDP domain")
+			return 0, bcnet.Destination{}, errors.New("socks5: truncated UDP domain")
 		}
-		offset += 1 + int(packet[4])
+		length := int(packet[4])
+		if len(packet) < offset+1+length {
+			return 0, bcnet.Destination{}, errors.New("socks5: truncated UDP domain")
+		}
+		address = bcnet.DomainAddress(string(packet[offset+1 : offset+1+length]))
+		offset += 1 + length
 	default:
-		return 0, errors.New("socks5: invalid UDP address type")
+		return 0, bcnet.Destination{}, errors.New("socks5: invalid UDP address type")
 	}
+	if offset+2 > len(packet) {
+		return 0, bcnet.Destination{}, errors.New("socks5: truncated UDP packet")
+	}
+	port := bcnet.Port(binary.BigEndian.Uint16(packet[offset : offset+2]))
 	offset += 2
-	if offset > len(packet) {
-		return 0, errors.New("socks5: truncated UDP packet")
-	}
-	return offset, nil
+	return offset, bcnet.UDPDestination(address, port), nil
 }
 
 // replyCodeText maps SOCKS5 reply codes to human-readable text.

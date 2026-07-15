@@ -12,6 +12,14 @@ import (
 )
 
 func listenTCP(cfg *Config, addr string) (net.Listener, error) {
+	network := "tcp"
+	if ip := net.ParseIP(strings.Trim(cfg.Listen, "[]")); ip != nil {
+		if ip.To4() != nil {
+			network = "tcp4"
+		} else {
+			network = "tcp6"
+		}
+	}
 	lc := net.ListenConfig{}
 	if strings.EqualFold(cfg.Type, "tproxy") {
 		lc.Control = func(_, _ string, c syscall.RawConn) error {
@@ -28,5 +36,5 @@ func listenTCP(cfg *Config, addr string) (net.Listener, error) {
 			return sockErr
 		}
 	}
-	return lc.Listen(context.Background(), "tcp", addr)
+	return lc.Listen(context.Background(), network, addr)
 }

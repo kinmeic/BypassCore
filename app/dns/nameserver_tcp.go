@@ -1,6 +1,7 @@
 package dns
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"io"
@@ -20,6 +21,7 @@ type TCPNameServer struct {
 	destination     bcnet.Destination
 	reqID           uint32
 	dial            func(ctx context.Context) (net.Conn, error)
+	rawDial         Dialer
 	clientIP        bcnet.IP
 }
 
@@ -29,10 +31,7 @@ func NewTCPNameServer(u *url.URL, disableCache bool, serveStale bool, serveExpir
 	if err != nil {
 		return nil, err
 	}
-	s.dial = func(ctx context.Context) (net.Conn, error) {
-		d := net.Dialer{}
-		return d.DialContext(ctx, "tcp", s.destination.NetAddr())
-	}
+	s.dial = func(ctx context.Context) (net.Conn, error) { return s.rawDial(ctx, s.destination) }
 	errors.LogInfo(context.Background(), "DNS: created TCP client for ", u.String())
 	return s, nil
 }
@@ -50,9 +49,15 @@ func baseTCPNameServer(u *url.URL, prefix string, disableCache bool, serveStale 
 		cacheController: NewCacheController(prefix+"//"+dest.NetAddr(), disableCache, serveStale, serveExpiredTTL),
 		destination:     dest,
 		clientIP:        clientIP,
+		rawDial: func(ctx context.Context, dest bcnet.Destination) (net.Conn, error) {
+			d := net.Dialer{}
+			return d.DialContext(ctx, "tcp", dest.NetAddr())
+		},
 	}
 	return s, nil
 }
+
+func (s *TCPNameServer) SetDialer(dial Dialer) { s.rawDial = dial }
 
 // Name implements Server.
 func (s *TCPNameServer) Name() string { return s.cacheController.name }
@@ -69,7 +74,7 @@ func (s *TCPNameServer) newReqID() uint16 {
 
 // sendQuery implements CachedNameserver.
 func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- error, fqdn string, option dns_feature.IPOption) {
-	errors.LogInfo(ctx, s.Name(), " querying DNS for: ", fqdn)
+	errors.LogDebug(ctx, s.Name(), " querying DNS for: ", fqdn)
 
 	reqs, err := buildReqMsgs(fqdn, option, s.newReqID, genEDNS0Options(s.clientIP, 0))
 	if err != nil {
@@ -131,7 +136,7 @@ func (s *TCPNameServer) sendOneTCPQuery(ctx context.Context, noResponseErrCh cha
 		}
 		return
 	}
-	if _, err := conn.Write(b); err != nil {
+	if _, err := io.Copy(conn, bytes.NewReader(b)); err != nil {
 		errors.LogErrorInner(ctx, err, "failed to send query")
 		if noResponseErrCh != nil {
 			noResponseErrCh <- err
@@ -157,9 +162,16 @@ func (s *TCPNameServer) sendOneTCPQuery(ctx context.Context, noResponseErrCh cha
 		return
 	}
 
-	rec, err := parseResponse(respBuf)
+	rec, err := parseResponseForRequest(respBuf, req)
 	if err != nil {
 		errors.LogErrorInner(ctx, err, "failed to parse DNS over TCP response")
+		if noResponseErrCh != nil {
+			noResponseErrCh <- err
+		}
+		return
+	}
+	if rec.RawHeader.Truncated {
+		err := errors.New("truncated DNS response over TCP")
 		if noResponseErrCh != nil {
 			noResponseErrCh <- err
 		}

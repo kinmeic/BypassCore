@@ -1,48 +1,75 @@
 package transport
 
 import (
+	"errors"
 	"io"
 	"net"
-	"sync"
+	"time"
 )
+
+const bridgeDrainTimeout = 30 * time.Second
 
 // ConnLink wraps a net.Conn into both sides of a Link. This is the simplest
 // approach: the inbound connection's Read side becomes Link.Reader, its Write
 // side becomes Link.Writer. The dispatcher bridges inbound.Conn ↔ outbound.Conn.
 //
 // For the dispatcher flow:
-//   inboundConn → [Link.Reader] → outboundConn (client → remote)
-//   outboundConn → [Link.Writer] ← inboundConn (remote → client)
+//
+//	inboundConn → [Link.Reader] → outboundConn (client → remote)
+//	outboundConn → [Link.Writer] ← inboundConn (remote → client)
 //
 // Bridge copies data bidirectionally between two net.Conns until either side
 // closes.
 func Bridge(a, b net.Conn) error {
-	var wg sync.WaitGroup
 	errCh := make(chan error, 2)
 
 	copyFn := func(dst net.Conn, src net.Conn) {
-		defer wg.Done()
 		_, err := io.Copy(dst, src)
 		// Close the write side of dst to signal EOF to the peer.
 		if dc, ok := dst.(interface{ CloseWrite() error }); ok {
 			_ = dc.CloseWrite()
+		} else {
+			// A connection without half-close support cannot signal EOF while
+			// remaining writable. Fully close it so the peer copy cannot leak.
+			_ = dst.Close()
 		}
 		errCh <- err
 	}
 
-	wg.Add(2)
 	go copyFn(b, a) // a→b (client → remote)
 	go copyFn(a, b) // b→a (remote → client)
 
-	wg.Wait()
-	close(errCh)
-	// Return the first non-nil error (if any)
-	for err := range errCh {
-		if err != nil && err != io.EOF {
-			return err
-		}
+	firstErr := <-errCh
+	if !isBridgeCloseError(firstErr) {
+		// A fatal error cannot be recovered by draining the other direction.
+		// Closing both sides also guarantees that the second io.Copy exits.
+		_ = a.Close()
+		_ = b.Close()
+		<-errCh
+		return firstErr
 	}
-	return nil
+
+	// Preserve TCP half-close semantics after a clean EOF so a peer can still
+	// send its final response. Bound the drain period so a peer that never
+	// closes cannot retain the bridge and its goroutines forever.
+	timer := time.NewTimer(bridgeDrainTimeout)
+	defer timer.Stop()
+	select {
+	case secondErr := <-errCh:
+		if !isBridgeCloseError(secondErr) {
+			return secondErr
+		}
+		return nil
+	case <-timer.C:
+		_ = a.Close()
+		_ = b.Close()
+		<-errCh
+		return nil
+	}
+}
+
+func isBridgeCloseError(err error) bool {
+	return err == nil || err == io.EOF || errors.Is(err, net.ErrClosed)
 }
 
 // NewConnLink creates a Link from a single net.Conn. This is used when the

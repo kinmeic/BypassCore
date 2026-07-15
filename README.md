@@ -5,7 +5,7 @@
 ## 特性
 
 - **透明代理入站**：TCP REDIRECT（SO_ORIGINAL_DST）+ UDP TPROXY（IP_TRANSPARENT + IP_RECVORIGDSTADDR）
-- **TLS/HTTP 嗅探**：从纯 IP 连接恢复域名（SNI / Host 头），让域名路由规则对 tproxy 流量生效
+- **TLS/HTTP/QUIC 嗅探**：从纯 IP 连接恢复域名（TLS SNI / HTTP Host / QUIC Initial），让 TCP/UDP 域名规则对透明代理流量生效
 - **规则匹配引擎**：domain / IP(CIDR+GeoIP) / 端口 / 网络(TCP/UDP) / 协议 / inboundTag / user / process / 属性
 - **GeoData 支持**：`geosite:` / `geoip:` 规则，支持 `geoip.dat` / `geosite.dat` 加载
 - **3 种出站拨号器**：
@@ -27,6 +27,9 @@ make build
 # 查看版本
 ./bin/bypasscore --version
 ./bin/bypasscore -V
+
+# 生产环境可降低热路径日志量
+./bin/bypasscore -run -config config.json -log-level warning
 
 # daemon 模式（启动 tproxy 监听 + 路由 + 出站）
 make run
@@ -56,7 +59,7 @@ iptables/nftables TPROXY/REDIRECT
   ↓
 inbound listener (TCP: SO_ORIGINAL_DST / UDP: IP_RECVORIGDSTADDR)
   ↓ 恢复原始目标 IP:port
-sniffer (TLS SNI / HTTP Host → 恢复域名)
+sniffer (TLS SNI / HTTP Host / QUIC Initial → routeOnly 域名)
   ↓
 router.PickRoute → outboundTag
   ↓
@@ -108,6 +111,13 @@ transport.Bridge (双向拷贝)
 | `tcp://1.2.3.4:53` | TCP 明文 (RFC 7766) | 53 |
 | `tls://1.2.3.4:853` | DoT (RFC 7858) | 853 |
 | `https://dns/dns-query` | DoH (RFC 8484) | 443 |
+| `h2c://dns/dns-query` | DoH over cleartext HTTP/2 | 80 |
+
+默认情况下，上游 DNS 连接和普通流量一样经过 Router/Outbound，因此可以走
+`freedom` 的指定 WAN 或 SOCKS5 proxy。需要明确绕过分流核心、直接查询的上游，
+可使用 `udp+local://`、`tcp+local://`、`tls+local://`、`https+local://` 等
+`+local` 形式；`localhost` 始终使用系统 resolver。DNS 路由上下文带有
+`protocol: dns` 和防递归标志，可以用 protocol/inboundTag 规则单独选择出口。
 
 ## config.json 结构
 
@@ -150,9 +160,20 @@ proxy/blackhole/   丢弃拨号器
 proxy/socks/       SOCKS5 client 拨号器
 common/protocol/tls/   TLS SNI 嗅探
 common/protocol/http/  HTTP Host 嗅探
+common/protocol/quic/  QUIC Initial 解密与 SNI 嗅探
 common/            底层类型 (net/geodata/errors/...)
 features/          特性接口 (Router/Dispatcher/Context/Manager/...)
 transport/         Link + Bridge (双向连接拷贝)
 infra/conf/        JSON 配置解析
 cmd/bypasscore/    CLI 入口 (run/test/resolve/observe)
+```
+
+## Linux 内核集成测试
+
+GitHub Actions 会在真实 network namespace 拓扑中验证 TCP REDIRECT、TCP/UDP
+TPROXY、IPv6、SOCKS5 UDP、透明回复源地址恢复，以及 UDP session/FD/RSS 上限。
+本地 Linux 主机可用 root 权限运行：
+
+```bash
+integration/netns/run.sh
 ```

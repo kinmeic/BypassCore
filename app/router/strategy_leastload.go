@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/eugene/bypasscore/app/observatory"
-	"github.com/eugene/bypasscore/common"
 	"github.com/eugene/bypasscore/common/dice"
 	"github.com/eugene/bypasscore/common/errors"
 	"github.com/eugene/bypasscore/core"
@@ -61,10 +60,10 @@ type node struct {
 
 func (s *LeastLoadStrategy) InjectContext(ctx context.Context) {
 	s.ctx = ctx
-	common.Must(core.RequireFeatures(s.ctx, func(observatory extension.Observatory) error {
+	_ = core.RequireFeatures(s.ctx, func(observatory extension.Observatory) error {
 		s.observer = observatory
 		return nil
-	}))
+	})
 }
 
 func (s *LeastLoadStrategy) PickOutbound(candidates []string) string {
@@ -150,7 +149,11 @@ func (s *LeastLoadStrategy) getNodes(candidates []string) []*node {
 		return make([]*node, 0)
 	}
 
-	results := observeResult.(*observatory.ObservationResult)
+	results, ok := observeResult.(*observatory.ObservationResult)
+	if !ok || results == nil {
+		errors.LogError(s.ctx, "least load: unsupported observation result")
+		return nil
+	}
 
 	var ret []*node
 
@@ -159,10 +162,10 @@ func (s *LeastLoadStrategy) getNodes(candidates []string) []*node {
 			record := &node{
 				Tag:              v.OutboundTag,
 				CountAll:         1,
-				CountFail:        1,
+				CountFail:        0,
 				RTTAverage:       time.Duration(v.Delay) * time.Millisecond,
-				RTTDeviation:     time.Duration(v.Delay) * time.Millisecond,
-				RTTDeviationCost: time.Duration(s.costs.Apply(v.OutboundTag, float64(time.Duration(v.Delay)*time.Millisecond))),
+				RTTDeviation:     time.Duration(v.Delay) * time.Millisecond / 2,
+				RTTDeviationCost: time.Duration(s.costs.Apply(v.OutboundTag, float64(time.Duration(v.Delay)*time.Millisecond/2))),
 			}
 
 			if v.HealthPing != nil {

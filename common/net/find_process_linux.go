@@ -10,9 +10,17 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/eugene/bypasscore/common/errors"
 )
+
+var processInodeCache struct {
+	sync.Mutex
+	expires time.Time
+	byInode map[string]string
+}
 
 func FindProcess(network, srcIP string, srcPort uint16, destIP string, destPort uint16) (PID int, Name string, AbsolutePath string, err error) {
 	isLocal, err := IsLocal(net.ParseIP(srcIP))
@@ -130,12 +138,18 @@ func findInodeInFile(filePath, targetHexAddr string) (string, error) {
 }
 
 func findPidByInode(inode string) (string, error) {
+	processInodeCache.Lock()
+	defer processInodeCache.Unlock()
+	if time.Now().Before(processInodeCache.expires) {
+		return processInodeCache.byInode[inode], nil
+	}
+
 	procDir, err := os.ReadDir("/proc")
 	if err != nil {
 		return "", err
 	}
 
-	targetLink := "socket:[" + inode + "]"
+	byInode := make(map[string]string)
 
 	for _, entry := range procDir {
 		if !entry.IsDir() {
@@ -158,12 +172,17 @@ func findPidByInode(inode string) (string, error) {
 			if err != nil {
 				continue
 			}
-			if linkTarget == targetLink {
-				return pid, nil
+			if strings.HasPrefix(linkTarget, "socket:[") && strings.HasSuffix(linkTarget, "]") {
+				socketInode := strings.TrimSuffix(strings.TrimPrefix(linkTarget, "socket:["), "]")
+				if _, exists := byInode[socketInode]; !exists {
+					byInode[socketInode] = pid
+				}
 			}
 		}
 	}
-	return "", nil
+	processInodeCache.byInode = byInode
+	processInodeCache.expires = time.Now().Add(250 * time.Millisecond)
+	return byInode[inode], nil
 }
 
 func getAbsPath(pid string) (string, error) {

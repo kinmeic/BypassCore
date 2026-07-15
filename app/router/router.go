@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"strings"
 	"sync"
 
 	"github.com/eugene/bypasscore/common"
@@ -9,6 +10,7 @@ import (
 	"github.com/eugene/bypasscore/common/serial"
 	"github.com/eugene/bypasscore/core"
 	"github.com/eugene/bypasscore/features/dns"
+	"github.com/eugene/bypasscore/features/extension"
 	"github.com/eugene/bypasscore/features/outbound"
 	"github.com/eugene/bypasscore/features/routing"
 	routing_dns "github.com/eugene/bypasscore/features/routing/dns"
@@ -25,6 +27,7 @@ type Router struct {
 	ohm        outbound.Manager
 	dispatcher routing.Dispatcher
 	mu         sync.RWMutex
+	reloadMu   sync.Mutex
 }
 
 // Route is an implementation of routing.Route.
@@ -37,6 +40,26 @@ type Route struct {
 
 // Init initializes the Router.
 func (r *Router) Init(ctx context.Context, config *Config, d dns.Client, ohm outbound.Manager, dispatcher routing.Dispatcher) error {
+	if config == nil {
+		return errors.New("nil router config")
+	}
+	if ohm == nil && len(config.BalancingRule) > 0 {
+		return errors.New("router with balancers requires outbound manager")
+	}
+	var observer extension.Observatory
+	_ = core.RequireFeatures(ctx, func(value extension.Observatory) error {
+		observer = value
+		return nil
+	})
+	for _, rule := range config.BalancingRule {
+		if rule == nil {
+			return errors.New("nil balancing rule")
+		}
+		strategy := strings.ToLower(rule.Strategy)
+		if (strategy == "leastping" || strategy == "leastload") && observer == nil {
+			return errors.New("balancer ", rule.Tag, " requires observatory")
+		}
+	}
 	r.domainStrategy = config.DomainStrategy
 	r.dns = d
 	r.ctx = ctx
@@ -45,6 +68,12 @@ func (r *Router) Init(ctx context.Context, config *Config, d dns.Client, ohm out
 
 	r.balancers = make(map[string]*Balancer, len(config.BalancingRule))
 	for _, rule := range config.BalancingRule {
+		if rule.Tag == "" {
+			return errors.New("empty balancer tag")
+		}
+		if _, exists := r.balancers[rule.Tag]; exists {
+			return errors.New("duplicate balancer tag ", rule.Tag)
+		}
 		balancer, err := rule.Build(ohm, dispatcher)
 		if err != nil {
 			return err
@@ -54,7 +83,19 @@ func (r *Router) Init(ctx context.Context, config *Config, d dns.Client, ohm out
 	}
 
 	r.rules = make([]*Rule, 0, len(config.Rule))
+	ruleTags := make(map[string]struct{}, len(config.Rule))
 	for _, rule := range config.Rule {
+		if rule == nil {
+			r.closeWebhooks()
+			return errors.New("nil routing rule")
+		}
+		if tag := rule.GetRuleTag(); tag != "" {
+			if _, exists := ruleTags[tag]; exists {
+				r.closeWebhooks()
+				return errors.New("duplicate ruleTag ", tag)
+			}
+			ruleTags[tag] = struct{}{}
+		}
 		cond, err := rule.BuildCondition()
 		if err != nil {
 			r.closeWebhooks()
@@ -126,79 +167,112 @@ func (r *Router) AddRule(config *serial.TypedMessage, shouldAppend bool) error {
 }
 
 func (r *Router) ReloadRules(config *Config, shouldAppend bool) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	if config == nil {
+		return errors.New("nil router config")
+	}
+	r.reloadMu.Lock()
+	defer r.reloadMu.Unlock()
 
+	r.mu.RLock()
+	ctx, ohm, dispatcher := r.ctx, r.ohm, r.dispatcher
+	baseRules := append([]*Rule(nil), r.rules...)
+	baseBalancers := make(map[string]*Balancer, len(r.balancers))
+	for tag, balancer := range r.balancers {
+		baseBalancers[tag] = balancer
+	}
+	r.mu.RUnlock()
 	if !shouldAppend {
-		for _, rule := range r.rules {
+		baseRules = nil
+		baseBalancers = make(map[string]*Balancer, len(config.BalancingRule))
+	}
+
+	newBalancers := baseBalancers
+	var observer extension.Observatory
+	_ = core.RequireFeatures(ctx, func(value extension.Observatory) error {
+		observer = value
+		return nil
+	})
+	for _, rule := range config.BalancingRule {
+		if rule == nil || rule.Tag == "" {
+			return errors.New("nil or empty balancing rule")
+		}
+		if _, found := newBalancers[rule.Tag]; found {
+			return errors.New("duplicate balancer tag ", rule.Tag)
+		}
+		strategy := strings.ToLower(rule.Strategy)
+		if (strategy == "leastping" || strategy == "leastload") && observer == nil {
+			return errors.New("balancer ", rule.Tag, " requires observatory")
+		}
+		balancer, err := rule.Build(ohm, dispatcher)
+		if err != nil {
+			return err
+		}
+		balancer.InjectContext(ctx)
+		newBalancers[rule.Tag] = balancer
+	}
+
+	newRules := append([]*Rule(nil), baseRules...)
+	ruleTags := make(map[string]struct{}, len(baseRules)+len(config.Rule))
+	for _, rule := range baseRules {
+		if rule.RuleTag != "" {
+			ruleTags[rule.RuleTag] = struct{}{}
+		}
+	}
+	var createdWebhooks []*WebhookNotifier
+	fail := func(err error) error {
+		for _, webhook := range createdWebhooks {
+			webhook.Close()
+		}
+		return err
+	}
+	for _, rule := range config.Rule {
+		if rule == nil {
+			return fail(errors.New("nil routing rule"))
+		}
+		if tag := rule.GetRuleTag(); tag != "" {
+			if _, exists := ruleTags[tag]; exists {
+				return fail(errors.New("duplicate ruleTag ", tag))
+			}
+			ruleTags[tag] = struct{}{}
+		}
+		cond, err := rule.BuildCondition()
+		if err != nil {
+			return fail(err)
+		}
+		rr := &Rule{Condition: cond, Tag: rule.GetTag(), RuleTag: rule.GetRuleTag()}
+		if wh := rule.GetWebhook(); wh != nil {
+			notifier, err := NewWebhookNotifier(wh)
+			if err != nil {
+				return fail(err)
+			}
+			rr.Webhook = notifier
+			createdWebhooks = append(createdWebhooks, notifier)
+		}
+		if tag := rule.GetBalancingTag(); tag != "" {
+			balancer, found := newBalancers[tag]
+			if !found {
+				return fail(errors.New("balancer ", tag, " not found"))
+			}
+			rr.Balancer = balancer
+		}
+		newRules = append(newRules, rr)
+	}
+
+	r.mu.Lock()
+	oldRules := r.rules
+	r.rules = newRules
+	r.balancers = newBalancers
+	if !shouldAppend {
+		r.domainStrategy = config.DomainStrategy
+	}
+	r.mu.Unlock()
+	if !shouldAppend {
+		for _, rule := range oldRules {
 			if rule.Webhook != nil {
 				rule.Webhook.Close()
 			}
 		}
-		r.balancers = make(map[string]*Balancer, len(config.BalancingRule))
-		r.rules = make([]*Rule, 0, len(config.Rule))
 	}
-	for _, rule := range config.BalancingRule {
-		_, found := r.balancers[rule.Tag]
-		if found {
-			return errors.New("duplicate balancer tag")
-		}
-		balancer, err := rule.Build(r.ohm, r.dispatcher)
-		if err != nil {
-			return err
-		}
-		balancer.InjectContext(r.ctx)
-		r.balancers[rule.Tag] = balancer
-	}
-
-	startIdx := len(r.rules)
-	closeNewWebhooks := func() {
-		for i := startIdx; i < len(r.rules); i++ {
-			if r.rules[i].Webhook != nil {
-				r.rules[i].Webhook.Close()
-			}
-		}
-		r.rules = r.rules[:startIdx]
-	}
-
-	for _, rule := range config.Rule {
-		if r.ruleExistsLocked(rule.GetRuleTag()) {
-			closeNewWebhooks()
-			return errors.New("duplicate ruleTag ", rule.GetRuleTag())
-		}
-		cond, err := rule.BuildCondition()
-		if err != nil {
-			closeNewWebhooks()
-			return err
-		}
-		rr := &Rule{
-			Condition: cond,
-			Tag:       rule.GetTag(),
-			RuleTag:   rule.GetRuleTag(),
-		}
-		if wh := rule.GetWebhook(); wh != nil {
-			notifier, err := NewWebhookNotifier(wh)
-			if err != nil {
-				closeNewWebhooks()
-				return err
-			}
-			rr.Webhook = notifier
-		}
-		btag := rule.GetBalancingTag()
-		if len(btag) > 0 {
-			brule, found := r.balancers[btag]
-			if !found {
-				if rr.Webhook != nil {
-					rr.Webhook.Close()
-				}
-				closeNewWebhooks()
-				return errors.New("balancer ", btag, " not found")
-			}
-			rr.Balancer = brule
-		}
-		r.rules = append(r.rules, rr)
-	}
-
 	return nil
 }
 
@@ -261,7 +335,7 @@ func (r *Router) pickRouteInternal(ctx routing.Context) (*Rule, routing.Context,
 	// evaluated without the lock, allowing rule.Apply to block on DNS without
 	// holding off rule mutations.
 	r.mu.RLock()
-	rules := r.rules
+	rules := append([]*Rule(nil), r.rules...)
 	strategy := r.domainStrategy
 	dnsClient := r.dns
 	r.mu.RUnlock()

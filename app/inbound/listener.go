@@ -53,6 +53,9 @@ func (l *Listener) Start() error {
 	if typeCfg != "redirect" && typeCfg != "tproxy" {
 		return errors.New("inbound: type must be redirect or tproxy")
 	}
+	// Normalize once so socket setup and accepted-connection handling cannot
+	// disagree about the inbound mode.
+	l.cfg.Type = typeCfg
 
 	if l.cfg.Port < 1 || l.cfg.Port > 65535 {
 		return errors.New("inbound: port must be between 1 and 65535")

@@ -160,6 +160,25 @@ type UserMatcher struct {
 }
 
 func NewUserMatcher(users []string) *UserMatcher {
+	valid := make([]string, 0, len(users))
+	for _, user := range users {
+		if pattern, ok := strings.CutPrefix(user, "regexp:"); ok {
+			if pattern == "" {
+				continue
+			}
+			if _, err := regexp.Compile(pattern); err != nil {
+				continue
+			}
+		}
+		valid = append(valid, user)
+	}
+	matcher, _ := NewUserMatcherChecked(valid)
+	return matcher
+}
+
+// NewUserMatcherChecked compiles user patterns and reports invalid regular
+// expressions instead of silently weakening a routing rule.
+func NewUserMatcherChecked(users []string) (*UserMatcher, error) {
 	usersCopy := make([]string, 0, len(users))
 	patternsCopy := make([]*regexp.Regexp, 0, len(users))
 	for _, user := range users {
@@ -170,12 +189,13 @@ func NewUserMatcher(users []string) *UserMatcher {
 		// A bare "regexp:" (empty pattern) is dropped as meaningless.
 		if pattern, ok := strings.CutPrefix(user, "regexp:"); ok {
 			if pattern == "" {
-				continue
+				return nil, errors.New("empty user regexp")
 			}
-			if re, err := regexp.Compile(pattern); err == nil {
-				patternsCopy = append(patternsCopy, re)
+			re, err := regexp.Compile(pattern)
+			if err != nil {
+				return nil, errors.New("invalid user regexp").Base(err)
 			}
-			// Entries with an invalid regexp pattern are ignored.
+			patternsCopy = append(patternsCopy, re)
 			continue
 		}
 		usersCopy = append(usersCopy, user)
@@ -183,7 +203,7 @@ func NewUserMatcher(users []string) *UserMatcher {
 	return &UserMatcher{
 		user:    usersCopy,
 		pattern: patternsCopy,
-	}
+	}, nil
 }
 
 // Apply implements Condition.

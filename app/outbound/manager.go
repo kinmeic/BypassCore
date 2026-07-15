@@ -2,6 +2,7 @@ package outbound
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -28,13 +29,22 @@ type Manager struct {
 	// default.
 	order         []string
 	duplicateTags map[string]struct{}
+	configErrors  []string
 }
 
 // NewManager creates a Manager from an outbound descriptor config.
 func NewManager(cfg *Config) *Manager {
 	m := &Manager{handlers: make(map[string]*handler), duplicateTags: make(map[string]struct{})}
 	if cfg != nil {
-		for _, ob := range cfg.Outbounds {
+		for index, ob := range cfg.Outbounds {
+			if ob == nil {
+				m.configErrors = append(m.configErrors, fmt.Sprintf("outbound[%d] is null", index))
+				continue
+			}
+			if strings.TrimSpace(ob.Tag) == "" {
+				m.configErrors = append(m.configErrors, fmt.Sprintf("outbound[%d] has empty tag", index))
+				continue
+			}
 			m.Add(ob)
 		}
 	}
@@ -61,6 +71,9 @@ func (m *Manager) GetHandler(tag string) featoutbound.Handler {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if h, ok := m.handlers[tag]; ok {
+		if h.external != nil {
+			return h.external
+		}
 		return h
 	}
 	return nil
@@ -74,7 +87,11 @@ func (m *Manager) GetDefaultHandler() featoutbound.Handler {
 	if len(m.order) == 0 {
 		return nil
 	}
-	return m.handlers[m.order[0]]
+	h := m.handlers[m.order[0]]
+	if h.external != nil {
+		return h.external
+	}
+	return h
 }
 
 // Select implements features/outbound.HandlerSelector.
@@ -147,7 +164,17 @@ func (m *Manager) Type() interface{} { return featoutbound.ManagerType() }
 func (m *Manager) Start() error { return nil }
 
 // Close implements common.Closable.
-func (m *Manager) Close() error { return nil }
+func (m *Manager) Close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var first error
+	for _, h := range m.handlers {
+		if err := h.Close(); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
+}
 
 // Validate checks the descriptor table for obvious misconfigurations.
 func (m *Manager) Validate() error {
@@ -155,6 +182,9 @@ func (m *Manager) Validate() error {
 	defer m.mu.RUnlock()
 	if len(m.handlers) == 0 {
 		return errors.New("no outbound configured")
+	}
+	if len(m.configErrors) > 0 {
+		return errors.New(strings.Join(m.configErrors, "; "))
 	}
 	for tag := range m.duplicateTags {
 		return errors.New("duplicate outbound tag: ", tag)
@@ -192,7 +222,11 @@ func (m *Manager) AddHandler(_ context.Context, h featoutbound.Handler) error {
 		m.order = append(m.order, tag)
 	}
 	// Wrap external handlers minimally: only Tag() is reachable via GetOutbound.
-	m.handlers[tag] = &handler{ob: &Outbound{Tag: tag, Mode: ModeFreedom}}
+	wrapped := &handler{ob: &Outbound{Tag: tag, Mode: ModeFreedom}, external: h}
+	if d, ok := h.(dialer.Dialer); ok {
+		wrapped.dialer = d
+	}
+	m.handlers[tag] = wrapped
 	return nil
 }
 
@@ -215,23 +249,30 @@ func (m *Manager) RemoveHandler(_ context.Context, tag string) error {
 
 // GetDialer returns the Dialer for the given outbound tag, or nil.
 func (m *Manager) GetDialer(tag string) dialer.Dialer {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	h, ok := m.handlers[tag]
 	if !ok {
 		return nil
 	}
-	return dialerFactory(h.ob)
+	if h.dialer == nil {
+		h.dialer = dialerFactory(h.ob)
+	}
+	return h.dialer
 }
 
 // GetDefaultDialer returns the dialer for the first registered outbound.
 func (m *Manager) GetDefaultDialer() dialer.Dialer {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if len(m.order) == 0 {
 		return nil
 	}
-	return dialerFactory(m.handlers[m.order[0]].ob)
+	h := m.handlers[m.order[0]]
+	if h.dialer == nil {
+		h.dialer = dialerFactory(h.ob)
+	}
+	return h.dialer
 }
 
 // dialerFactory converts an outbound descriptor to a Dialer.

@@ -24,9 +24,10 @@ type Handler struct {
 }
 
 // New creates a freedom handler.
-//   tag: outbound tag (e.g. "direct", "wan1")
-//   bindIP: source IP to dial from (empty = any)
-//   bindIface: interface name to bind to (empty = any; Linux SO_BINDTODEVICE)
+//
+//	tag: outbound tag (e.g. "direct", "wan1")
+//	bindIP: source IP to dial from (empty = any)
+//	bindIface: interface name to bind to (empty = any; Linux SO_BINDTODEVICE)
 func New(tag, bindIP, bindIface string) *Handler {
 	h := &Handler{tag: tag, bindIface: bindIface}
 	if bindIP != "" {
@@ -46,7 +47,7 @@ func (h *Handler) Dial(ctx context.Context, dest bcnet.Destination) (net.Conn, e
 	network := dest.Network.SystemString()
 	address := dest.NetAddr()
 
-	errors.LogInfo(ctx, "freedom[", h.tag, "] dialing ", network, "://", address)
+	errors.LogDebug(ctx, "freedom[", h.tag, "] dialing ", network, "://", address)
 
 	dialer := &net.Dialer{
 		Timeout: 10 * time.Second, // default so unreachable hosts don't hang forever

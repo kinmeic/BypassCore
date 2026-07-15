@@ -10,10 +10,10 @@ package observatory
 import (
 	"context"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
-	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -35,10 +35,61 @@ type Observer struct {
 
 	statusLock sync.Mutex
 	status     []*OutboundStatus
+	history    map[string]*probeHistory
 	startOnce  sync.Once
 	wg         sync.WaitGroup
 
 	ohm *appoutbound.Manager
+}
+
+const observerHistorySize = 10
+
+type probeHistory struct {
+	values []time.Duration // negative values represent failed probes
+	next   int
+}
+
+func (h *probeHistory) add(value time.Duration) {
+	if len(h.values) < observerHistorySize {
+		h.values = append(h.values, value)
+		return
+	}
+	h.values[h.next] = value
+	h.next = (h.next + 1) % observerHistorySize
+}
+
+func (h *probeHistory) stats() *HealthPingMeasurementResult {
+	result := &HealthPingMeasurementResult{All: int64(len(h.values))}
+	var successful []time.Duration
+	for _, value := range h.values {
+		if value < 0 {
+			result.Fail++
+			continue
+		}
+		successful = append(successful, value)
+		if result.Max == 0 || int64(value) > result.Max {
+			result.Max = int64(value)
+		}
+		if result.Min == 0 || int64(value) < result.Min {
+			result.Min = int64(value)
+		}
+		result.Average += int64(value)
+	}
+	if len(successful) == 0 {
+		return result
+	}
+	result.Average /= int64(len(successful))
+	if len(successful) == 1 {
+		result.Deviation = result.Average / 2
+		return result
+	}
+	var variance float64
+	for _, value := range successful {
+		delta := float64(int64(value) - result.Average)
+		variance += delta * delta
+	}
+	result.Deviation = int64(math.Sqrt(variance / float64(len(successful))))
+	return result
 }
 
 // GetObservation implements extension.Observatory.
@@ -139,13 +190,22 @@ func (o *Observer) clearRemovedOutbounds(outbounds []string) {
 	if len(o.status) == 0 {
 		return
 	}
+	active := make(map[string]struct{}, len(outbounds))
+	for _, tag := range outbounds {
+		active[tag] = struct{}{}
+	}
 	var pruned []*OutboundStatus
 	for _, status := range o.status {
-		if slices.Contains(outbounds, status.OutboundTag) {
+		if _, ok := active[status.OutboundTag]; ok {
 			pruned = append(pruned, status)
 		}
 	}
 	o.status = pruned
+	for tag := range o.history {
+		if _, ok := active[tag]; !ok {
+			delete(o.history, tag)
+		}
+	}
 }
 
 // probe fetches the probe URL and returns the result. If the outbound binds to
@@ -177,7 +237,7 @@ func (o *Observer) probe(outboundTag string) ProbeResult {
 	}
 
 	start := time.Now()
-	req, err := http.NewRequest(http.MethodGet, probeURL, nil)
+	req, err := http.NewRequestWithContext(o.ctx, http.MethodGet, probeURL, nil)
 	if err != nil {
 		return ProbeResult{Alive: false, LastErrorReason: "bad probe url: " + err.Error()}
 	}
@@ -253,6 +313,17 @@ func (o *Observer) updateStatusForResult(outboundTag string, result *ProbeResult
 		status.LastErrorReason = result.LastErrorReason
 		status.Delay = 99999999
 	}
+	history := o.history[outboundTag]
+	if history == nil {
+		history = new(probeHistory)
+		o.history[outboundTag] = history
+	}
+	value := -time.Nanosecond
+	if result.Alive {
+		value = time.Duration(result.Delay) * time.Millisecond
+	}
+	history.add(value)
+	status.HealthPing = history.stats()
 }
 
 func (o *Observer) findStatusLocationLockHolderOnly(outboundTag string) int {
@@ -271,10 +342,11 @@ func New(ctx context.Context, config *Config, ohm *appoutbound.Manager) (*Observ
 	}
 	subCtx, cancel := context.WithCancel(ctx)
 	return &Observer{
-		config: config,
-		ctx:    subCtx,
-		cancel: cancel,
-		ohm:    ohm,
+		config:  config,
+		ctx:     subCtx,
+		cancel:  cancel,
+		ohm:     ohm,
+		history: make(map[string]*probeHistory),
 	}, nil
 }
 

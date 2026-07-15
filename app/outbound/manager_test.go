@@ -129,6 +129,17 @@ func TestAdd_IgnoresNilAndEmptyTag(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsInvalidConfiguredEntries(t *testing.T) {
+	m := NewManager(&Config{Outbounds: []*Outbound{
+		nil,
+		{Tag: "", Mode: ModeFreedom},
+		{Tag: "direct", Mode: ModeFreedom},
+	}})
+	if err := m.Validate(); err == nil {
+		t.Fatal("invalid configured outbound entries were silently ignored")
+	}
+}
+
 // TestAdd_OverwritesSameTag locks the documented behavior: re-adding a tag
 // replaces the descriptor but keeps its position in order (first registration).
 func TestAdd_OverwritesSameTag(t *testing.T) {

@@ -103,7 +103,7 @@ func (v *NetworkList) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &strarray); err == nil {
 		nl := NetworkList(strarray)
 		*v = nl
-		return nil
+		return v.validate()
 	}
 	var rawstr Network
 	if err := json.Unmarshal(data, &rawstr); err == nil {
@@ -113,9 +113,18 @@ func (v *NetworkList) UnmarshalJSON(data []byte) error {
 			nl[idx] = Network(network)
 		}
 		*v = nl
-		return nil
+		return v.validate()
 	}
 	return errors.New("unknown format of a string list: " + string(data))
+}
+
+func (v NetworkList) validate() error {
+	for _, network := range v {
+		if network.Build() == net.Network_Unknown {
+			return errors.New("unknown network: " + string(network))
+		}
+	}
+	return nil
 }
 
 // Build converts the list to []net.Network. Defaults to TCP when nil.
@@ -237,6 +246,17 @@ func (list *PortList) Build() *net.PortList {
 // UnmarshalJSON accepts a string ("80,443" or "80-90" or "443"), a single
 // number, or a JSON array of such entries.
 func (list *PortList) UnmarshalJSON(data []byte) error {
+	var entries []json.RawMessage
+	if err := json.Unmarshal(data, &entries); err == nil {
+		for _, entry := range entries {
+			var part PortList
+			if err := part.UnmarshalJSON(entry); err != nil {
+				return err
+			}
+			list.Range = append(list.Range, part.Range...)
+		}
+		return nil
+	}
 	var listStr string
 	var number uint32
 	if err := json.Unmarshal(data, &listStr); err != nil {
