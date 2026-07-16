@@ -30,7 +30,7 @@
       "upstream": {
         "protocol": "socks",
         "server": "127.0.0.1:1080",
-        "settings": {}
+        "settings": {"udpMaxPacketBytes": 8192}
       }
     }
   ],
@@ -43,7 +43,18 @@
       "network": "tcp,udp",
       "maxConcurrentQueries": 256,
       "maxTCPConnections": 128,
-      "maxQueryBytes": 4096
+      "maxQueryBytes": 4096,
+      "dnsAllowedClients": ["127.0.0.0/8", "::1/128"],
+      "dnsQueriesPerSecond": 200,
+      "dnsQueryBurst": 400,
+      "dnsGlobalQueriesPerSecond": 1000,
+      "dnsGlobalQueryBurst": 2000,
+      "dnsRawCacheEntries": 4096,
+      "dnsRawCacheMaxTTLSeconds": 3600,
+      "dnsRawCacheMaxBytes": 16777216,
+      "dnsRules": [
+        {"qType": ["TXT", "MX", "SRV", "PTR", "CAA"], "action": "direct"}
+      ]
     },
     {
       "tag": "tcp_redir",
@@ -51,7 +62,9 @@
       "listen": "0.0.0.0",
       "port": 12345,
       "network": "tcp",
-      "sniffing": true
+      "sniffing": true,
+      "sniffingTimeoutMs": 500,
+      "sniffingMaxBytes": 32768
     },
     {
       "tag": "udp_tproxy",
@@ -59,7 +72,12 @@
       "listen": "0.0.0.0",
       "port": 12345,
       "network": "udp",
-      "sniffing": false
+      "sniffing": false,
+      "udpMaxSessions": 1024,
+      "udpMaxSessionsPerSource": 256,
+      "udpSessionQueueBytes": 65536,
+      "udpSessionQueuePackets": 64,
+      "udpSessionIdleTimeoutSeconds": 120
     }
   ],
   "dns": {
@@ -116,5 +134,10 @@
     "probe_url": "https://www.gstatic.com/generate_204",
     "probe_interval": 10000000000,
     "enable_concurrency": true
+  },
+  "metrics": {
+    "listen": "127.0.0.1:9090",
+    "allowedClients": ["127.0.0.0/8", "::1/128"],
+    "enablePprof": false
   }
 }

@@ -198,6 +198,23 @@ func TestHandler_Dial_UDPAssociate(t *testing.T) {
 	}
 }
 
+func TestUDPAssociateReadReportsShortBuffer(t *testing.T) {
+	client, peer := net.Pipe()
+	defer client.Close()
+	defer peer.Close()
+	target := bcnet.UDPDestination(bcnet.ParseAddress("1.2.3.4"), bcnet.Port(53))
+	conn := &udpAssociateConn{Conn: client, target: target}
+	go func() {
+		packet := []byte{0, 0, 0, 1, 1, 2, 3, 4, 0, 53}
+		packet = append(packet, []byte("payload")...)
+		_, _ = peer.Write(packet)
+	}()
+	buffer := make([]byte, 2)
+	if n, err := conn.Read(buffer); err != io.ErrShortBuffer || n != 0 {
+		t.Fatalf("Read n=%d err=%v, want io.ErrShortBuffer", n, err)
+	}
+}
+
 // TestNewFromSettings verifies settings map extraction.
 func TestNewFromSettings(t *testing.T) {
 	settings := map[string]any{
@@ -218,5 +235,19 @@ func TestNewFromSettings_NilSettings(t *testing.T) {
 	h := NewFromSettings("test", "127.0.0.1:1080", nil)
 	if h.username != "" || h.password != "" {
 		t.Errorf("user/pass should be empty, got %q/%q", h.username, h.password)
+	}
+}
+
+func TestNewFromSettingsUDPMaxPacketBytes(t *testing.T) {
+	h := NewFromSettings("test", "127.0.0.1:1080", map[string]any{"udpMaxPacketBytes": float64(1200)})
+	if h.maxUDPPayload != 1200 {
+		t.Fatalf("max UDP payload=%d, want 1200", h.maxUDPPayload)
+	}
+	client, peer := net.Pipe()
+	defer client.Close()
+	defer peer.Close()
+	conn := &udpAssociateConn{Conn: client, target: bcnet.UDPDestination(bcnet.ParseAddress("1.2.3.4"), 53), maxPayload: 512}
+	if _, err := conn.Write(make([]byte, 513)); err == nil {
+		t.Fatal("oversized configured UDP payload accepted")
 	}
 }

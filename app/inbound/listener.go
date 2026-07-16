@@ -17,8 +17,9 @@ import (
 // Listener is a transparent proxy listener supporting both TCP (redirect/tproxy)
 // and UDP (tproxy). The network config field determines which protocols to listen on.
 type Listener struct {
-	cfg        *Config
-	dispatcher *dispatcher.Dispatcher
+	cfg         *Config
+	dispatcher  *dispatcher.Dispatcher
+	inboundType string
 
 	tcpListener net.Listener
 	udpListener *udpTproxyListener
@@ -30,9 +31,20 @@ type Listener struct {
 	connMu      sync.Mutex
 	activeConns map[net.Conn]struct{}
 
-	ctx    context.Context
-	cancel context.CancelFunc
+	ctx     context.Context
+	cancel  context.CancelFunc
+	stateMu sync.Mutex
+	state   listenerState
 }
+
+type listenerState uint8
+
+const (
+	listenerNew listenerState = iota
+	listenerStarting
+	listenerRunning
+	listenerClosed
+)
 
 // New creates a Listener.
 func New(cfg *Config, d *dispatcher.Dispatcher) *Listener {
@@ -45,7 +57,35 @@ func New(cfg *Config, d *dispatcher.Dispatcher) *Listener {
 
 // Start begins listening on TCP and/or UDP based on the network config.
 func (l *Listener) Start() error {
+	l.stateMu.Lock()
+	defer l.stateMu.Unlock()
+	switch l.state {
+	case listenerStarting, listenerRunning:
+		return errors.New("inbound: listener is already started")
+	case listenerClosed:
+		return errors.New("inbound: listener is closed")
+	}
+	l.state = listenerStarting
+	if err := l.startLocked(); err != nil {
+		l.closeResourcesLocked()
+		l.state = listenerNew
+		return err
+	}
+	l.state = listenerRunning
+	return nil
+}
+
+func (l *Listener) startLocked() error {
+	if l.cfg == nil {
+		return errors.New("inbound: nil configuration")
+	}
+	if l.dispatcher == nil {
+		return errors.New("inbound: dispatcher is unavailable")
+	}
 	l.ctx, l.cancel = context.WithCancel(context.Background())
+	l.connMu.Lock()
+	l.activeConns = make(map[net.Conn]struct{})
+	l.connMu.Unlock()
 	typeCfg := strings.ToLower(strings.TrimSpace(l.cfg.Type))
 	if typeCfg == "" {
 		typeCfg = "redirect"
@@ -53,9 +93,9 @@ func (l *Listener) Start() error {
 	if typeCfg != "redirect" && typeCfg != "tproxy" {
 		return errors.New("inbound: type must be redirect or tproxy")
 	}
-	// Normalize once so socket setup and accepted-connection handling cannot
-	// disagree about the inbound mode.
-	l.cfg.Type = typeCfg
+	// Keep normalized runtime state separate from the source configuration.
+	// The latter is compared during SIGHUP reload and must remain immutable.
+	l.inboundType = typeCfg
 
 	if l.cfg.Port < 1 || l.cfg.Port > 65535 {
 		return errors.New("inbound: port must be between 1 and 65535")
@@ -83,9 +123,6 @@ func (l *Listener) Start() error {
 	if wantUDP {
 		udpLn, err := startUDP(l.cfg, l.dispatcher)
 		if err != nil {
-			// A partially started TCP accept loop must be cancelled and joined;
-			// merely closing its socket leaves it retrying Accept forever.
-			_ = l.Close()
 			return errors.New("inbound UDP listen failed").Base(err)
 		}
 		l.udpListener = udpLn
@@ -119,6 +156,17 @@ func parseInboundNetworks(value string) (bool, bool, error) {
 // Close stops all listeners and force-closes active connections so that
 // blocked handleConn goroutines unblock and wg.Wait() returns promptly.
 func (l *Listener) Close() error {
+	l.stateMu.Lock()
+	defer l.stateMu.Unlock()
+	if l.state == listenerClosed {
+		return nil
+	}
+	l.state = listenerClosed
+	l.closeResourcesLocked()
+	return nil
+}
+
+func (l *Listener) closeResourcesLocked() {
 	if l.cancel != nil {
 		l.cancel()
 	}
@@ -137,7 +185,10 @@ func (l *Listener) Close() error {
 	l.activeConns = nil // prevent further tracking
 	l.connMu.Unlock()
 	l.wg.Wait()
-	return nil
+	l.tcpListener = nil
+	l.udpListener = nil
+	l.ctx = nil
+	l.cancel = nil
 }
 
 // acceptLoop accepts TCP connections and dispatches them.
@@ -181,7 +232,7 @@ func (l *Listener) handleConn(conn net.Conn) {
 
 	var dest bcnet.Destination
 	var err error
-	if strings.EqualFold(l.cfg.Type, "tproxy") {
+	if l.inboundType == "tproxy" {
 		// As in Xray, a transparent TCP socket exposes the intercepted target as
 		// the accepted connection's local address.
 		dest = bcnet.DestinationFromAddr(conn.LocalAddr())

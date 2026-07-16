@@ -1,0 +1,60 @@
+name: Quality and security
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static-analysis:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.5'
+          cache: true
+      - name: Vet
+        run: go vet ./...
+      - name: Staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.6.1 ./...
+      - name: Vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.5'
+          cache: true
+      - name: Fuzz DNS wire handling
+        run: |
+          go test ./app/inbound -run '^$' -fuzz '^FuzzDNSListenerHandleQuery$' -fuzztime 30s
+          go test ./features/dns -run '^$' -fuzz '^FuzzValidateRawResponse$' -fuzztime 30s
+
+  benchmark-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.5'
+          cache: true
+      - name: Run hot-path benchmarks
+        run: |
+          go test ./common/geodata/strmatcher -run '^$' -bench . -benchtime 100ms
+          go test ./app/inbound -run '^$' -bench '^BenchmarkDNSRawCacheHit$' -benchtime 100ms

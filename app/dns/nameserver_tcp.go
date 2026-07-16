@@ -1,12 +1,12 @@
 package dns
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"io"
 	"net"
 	"net/url"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -22,8 +22,13 @@ type TCPNameServer struct {
 	reqID           uint32
 	dial            func(ctx context.Context) (net.Conn, error)
 	rawDial         Dialer
+	rawDialMu       sync.RWMutex
 	clientIP        bcnet.IP
+	idleConns       chan net.Conn
+	closed          atomic.Bool
 }
+
+const defaultDNSMaxIdleTCPConnections = 4
 
 // NewTCPNameServer creates a DNS-over-TCP server using a plain TCP dialer.
 func NewTCPNameServer(u *url.URL, disableCache bool, serveStale bool, serveExpiredTTL uint32, clientIP bcnet.IP) (*TCPNameServer, error) {
@@ -31,7 +36,7 @@ func NewTCPNameServer(u *url.URL, disableCache bool, serveStale bool, serveExpir
 	if err != nil {
 		return nil, err
 	}
-	s.dial = func(ctx context.Context) (net.Conn, error) { return s.rawDial(ctx, s.destination) }
+	s.dial = func(ctx context.Context) (net.Conn, error) { return s.dialRaw(ctx, s.destination) }
 	errors.LogInfo(context.Background(), "DNS: created TCP client for ", u.String())
 	return s, nil
 }
@@ -49,6 +54,7 @@ func baseTCPNameServer(u *url.URL, prefix string, disableCache bool, serveStale 
 		cacheController: NewCacheController(prefix+"//"+dest.NetAddr(), disableCache, serveStale, serveExpiredTTL),
 		destination:     dest,
 		clientIP:        clientIP,
+		idleConns:       make(chan net.Conn, defaultDNSMaxIdleTCPConnections),
 		rawDial: func(ctx context.Context, dest bcnet.Destination) (net.Conn, error) {
 			d := net.Dialer{}
 			return d.DialContext(ctx, "tcp", dest.NetAddr())
@@ -57,7 +63,22 @@ func baseTCPNameServer(u *url.URL, prefix string, disableCache bool, serveStale 
 	return s, nil
 }
 
-func (s *TCPNameServer) SetDialer(dial Dialer) { s.rawDial = dial }
+func (s *TCPNameServer) SetDialer(dial Dialer) {
+	if dial == nil {
+		return
+	}
+	s.rawDialMu.Lock()
+	s.rawDial = dial
+	s.rawDialMu.Unlock()
+	s.closeIdleConnections()
+}
+
+func (s *TCPNameServer) dialRaw(ctx context.Context, destination bcnet.Destination) (net.Conn, error) {
+	s.rawDialMu.RLock()
+	dial := s.rawDial
+	s.rawDialMu.RUnlock()
+	return dial(ctx, destination)
+}
 
 // Name implements Server.
 func (s *TCPNameServer) Name() string { return s.cacheController.name }
@@ -117,45 +138,12 @@ func (s *TCPNameServer) sendOneTCPQuery(ctx context.Context, noResponseErrCh cha
 		return
 	}
 
-	conn, err := s.dial(dialCtx)
+	respBuf, err := s.exchangeTCP(dialCtx, b, func(response []byte) error {
+		_, err := parseResponseForRequest(response, req)
+		return err
+	})
 	if err != nil {
-		errors.LogErrorInner(ctx, err, "failed to dial nameserver")
-		if noResponseErrCh != nil {
-			noResponseErrCh <- err
-		}
-		return
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(deadline)
-
-	// 2-byte length prefix + message.
-	if err := binary.Write(conn, binary.BigEndian, uint16(len(b))); err != nil {
-		errors.LogErrorInner(ctx, err, "failed to write length")
-		if noResponseErrCh != nil {
-			noResponseErrCh <- err
-		}
-		return
-	}
-	if _, err := io.Copy(conn, bytes.NewReader(b)); err != nil {
-		errors.LogErrorInner(ctx, err, "failed to send query")
-		if noResponseErrCh != nil {
-			noResponseErrCh <- err
-		}
-		return
-	}
-
-	// Read 2-byte length prefix.
-	var length uint16
-	if err := binary.Read(conn, binary.BigEndian, &length); err != nil {
-		errors.LogErrorInner(ctx, err, "failed to read response length")
-		if noResponseErrCh != nil {
-			noResponseErrCh <- err
-		}
-		return
-	}
-	respBuf := make([]byte, length)
-	if _, err := io.ReadFull(conn, respBuf); err != nil {
-		errors.LogErrorInner(ctx, err, "failed to read response body")
+		errors.LogErrorInner(ctx, err, "DNS over TCP exchange failed")
 		if noResponseErrCh != nil {
 			noResponseErrCh <- err
 		}
@@ -188,9 +176,16 @@ func (s *TCPNameServer) QueryIP(ctx context.Context, domain string, option dns_f
 // QueryRaw forwards an arbitrary DNS message over TCP or, for an embedded
 // DOTNameServer, over the TLS-wrapped dial function.
 func (s *TCPNameServer) QueryRaw(ctx context.Context, query []byte) ([]byte, error) {
-	return exchangeRawTCP(ctx, query, s.dial)
+	if len(query) == 0 || len(query) > 65535 {
+		return nil, errors.New("invalid raw DNS query length")
+	}
+	return s.exchangeTCP(ctx, query, func(response []byte) error {
+		return dns_feature.ValidateRawResponse(query, response)
+	})
 }
 
+// exchangeRawTCP remains available for the UDP truncation fallback, which has
+// no owning TCPNameServer pool.
 func exchangeRawTCP(ctx context.Context, query []byte, dial func(context.Context) (net.Conn, error)) ([]byte, error) {
 	if len(query) == 0 || len(query) > 65535 {
 		return nil, errors.New("invalid raw DNS query length")
@@ -225,6 +220,96 @@ func exchangeRawTCP(ctx context.Context, query []byte, dial func(context.Context
 	return response, nil
 }
 
+func (s *TCPNameServer) exchangeTCP(ctx context.Context, query []byte, validate func([]byte) error) ([]byte, error) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(5 * time.Second)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		conn, reused, err := s.acquireTCP(ctx)
+		if err != nil {
+			return nil, err
+		}
+		_ = conn.SetDeadline(deadline)
+		response, err := exchangeDNSMessage(conn, query)
+		if err == nil && validate != nil {
+			err = validate(response)
+		}
+		if err == nil {
+			s.releaseTCP(conn, true)
+			return response, nil
+		}
+		s.releaseTCP(conn, false)
+		if !reused || ctx.Err() != nil {
+			return nil, err
+		}
+		// An idle peer may close a pooled connection without notification. Retry
+		// once on a fresh connection; never loop on a newly-created connection.
+	}
+	return nil, errors.New("DNS over TCP exchange failed")
+}
+
+func exchangeDNSMessage(conn net.Conn, query []byte) ([]byte, error) {
+	if err := binary.Write(conn, binary.BigEndian, uint16(len(query))); err != nil {
+		return nil, err
+	}
+	if err := writeDNSPayload(conn, query); err != nil {
+		return nil, err
+	}
+	var length uint16
+	if err := binary.Read(conn, binary.BigEndian, &length); err != nil {
+		return nil, err
+	}
+	if length == 0 {
+		return nil, errors.New("empty DNS over TCP response")
+	}
+	response := make([]byte, int(length))
+	if _, err := io.ReadFull(conn, response); err != nil {
+		return nil, err
+	}
+	return response, nil
+}
+
+func (s *TCPNameServer) acquireTCP(ctx context.Context) (net.Conn, bool, error) {
+	if s.closed.Load() {
+		return nil, false, net.ErrClosed
+	}
+	select {
+	case conn := <-s.idleConns:
+		return conn, true, nil
+	default:
+	}
+	conn, err := s.dial(ctx)
+	return conn, false, err
+}
+
+func (s *TCPNameServer) releaseTCP(conn net.Conn, healthy bool) {
+	if conn == nil {
+		return
+	}
+	if !healthy || s.closed.Load() {
+		_ = conn.Close()
+		return
+	}
+	_ = conn.SetDeadline(time.Time{})
+	select {
+	case s.idleConns <- conn:
+	default:
+		_ = conn.Close()
+	}
+}
+
+func (s *TCPNameServer) closeIdleConnections() {
+	for {
+		select {
+		case conn := <-s.idleConns:
+			_ = conn.Close()
+		default:
+			return
+		}
+	}
+}
+
 func writeDNSPayload(writer io.Writer, payload []byte) error {
 	for len(payload) > 0 {
 		n, err := writer.Write(payload)
@@ -239,4 +324,10 @@ func writeDNSPayload(writer io.Writer, payload []byte) error {
 	return nil
 }
 
-func (s *TCPNameServer) Close() error { return s.cacheController.Close() }
+func (s *TCPNameServer) Close() error {
+	if !s.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	s.closeIdleConnections()
+	return s.cacheController.Close()
+}

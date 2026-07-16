@@ -8,11 +8,13 @@ import (
 	"github.com/eugene/bypasscore/common/geodata"
 	bcnet "github.com/eugene/bypasscore/common/net"
 	dns_feature "github.com/eugene/bypasscore/features/dns"
+	"golang.org/x/net/dns/dnsmessage"
 )
 
 type rawSelectionServer struct {
-	name  string
-	calls int
+	name    string
+	calls   int
+	invalid bool
 }
 
 func (s *rawSelectionServer) Name() string       { return s.name }
@@ -22,7 +24,28 @@ func (*rawSelectionServer) QueryIP(context.Context, string, dns_feature.IPOption
 }
 func (s *rawSelectionServer) QueryRaw(_ context.Context, query []byte) ([]byte, error) {
 	s.calls++
-	return append([]byte(nil), query...), nil
+	response := append([]byte(nil), query...)
+	if !s.invalid && len(response) >= 3 {
+		response[2] |= 0x80
+	}
+	return response, nil
+}
+
+func rawQuery(t *testing.T, id uint16, domain string, qtype dnsmessage.Type) []byte {
+	t.Helper()
+	name, err := dnsmessage.NewName(Fqdn(domain))
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := dnsmessage.Message{
+		Header:    dnsmessage.Header{ID: id, RecursionDesired: true},
+		Questions: []dnsmessage.Question{{Name: name, Type: qtype, Class: dnsmessage.ClassINET}},
+	}
+	query, err := message.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return query
 }
 
 func TestLookupIPContextHonorsCancellation(t *testing.T) {
@@ -63,17 +86,37 @@ func TestLookupRawHonorsDomainSpecificFinalAndDefaultFallback(t *testing.T) {
 		matcherInfos:  []*DomainMatcherInfo{{clientIdx: 0, domainRule: "domain:cn"}},
 	}
 
-	if _, err := server.LookupRawContext(context.Background(), "www.example.com", []byte{1}); err != nil {
+	if _, err := server.LookupRawContext(context.Background(), "www.example.com", rawQuery(t, 1, "www.example.com", dnsmessage.TypeTXT)); err != nil {
 		t.Fatal(err)
 	}
 	if direct.calls != 0 || remote.calls != 1 {
 		t.Fatalf("unmatched raw query used direct=%d remote=%d", direct.calls, remote.calls)
 	}
-	if _, err := server.LookupRawContext(context.Background(), "www.example.cn", []byte{2}); err != nil {
+	if _, err := server.LookupRawContext(context.Background(), "www.example.cn", rawQuery(t, 2, "www.example.cn", dnsmessage.TypeMX)); err != nil {
 		t.Fatal(err)
 	}
 	if direct.calls != 1 || remote.calls != 1 {
 		t.Fatalf("matched raw query used direct=%d remote=%d", direct.calls, remote.calls)
+	}
+}
+
+func TestLookupRawFallsBackAfterInvalidAssociatedResponse(t *testing.T) {
+	poisoned := &rawSelectionServer{name: "poisoned", invalid: true}
+	healthy := &rawSelectionServer{name: "healthy"}
+	server := &DNS{
+		ctx:     context.Background(),
+		clients: []*Client{{server: poisoned}, {server: healthy}},
+	}
+	query := rawQuery(t, 42, "fallback.example", dnsmessage.TypeSRV)
+	response, err := server.LookupRawContext(context.Background(), "fallback.example", query)
+	if err != nil {
+		t.Fatalf("LookupRawContext: %v", err)
+	}
+	if poisoned.calls != 1 || healthy.calls != 1 {
+		t.Fatalf("raw fallback calls poisoned=%d healthy=%d, want 1/1", poisoned.calls, healthy.calls)
+	}
+	if err := dns_feature.ValidateRawResponse(query, response); err != nil {
+		t.Fatalf("fallback response is invalid: %v", err)
 	}
 }
 

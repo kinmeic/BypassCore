@@ -8,14 +8,17 @@
     }
   ],
   "inbounds": [
-    {"tag": "dns4", "type": "dns", "listen": "10.10.0.1", "port": 1053, "network": "tcp,udp"},
-    {"tag": "dns6", "type": "dns", "listen": "fd00:10::1", "port": 1053, "network": "tcp,udp"},
+    {"tag": "dns4", "type": "dns", "listen": "10.10.0.1", "port": 1053, "network": "tcp,udp", "dnsAllowedClients": ["10.10.0.0/24"], "dnsQueriesPerSecond": 100, "dnsQueryBurst": 100},
+    {"tag": "dns6", "type": "dns", "listen": "fd00:10::1", "port": 1053, "network": "tcp,udp", "dnsAllowedClients": ["fd00:10::/64"], "dnsQueriesPerSecond": 100, "dnsQueryBurst": 100},
     {"tag": "redirect", "type": "redirect", "listen": "0.0.0.0", "port": 12345, "network": "tcp", "sniffing": true},
-    {"tag": "tproxy", "type": "tproxy", "listen": "0.0.0.0", "port": 12346, "network": "tcp,udp", "sniffing": true},
+    {"tag": "tproxy", "type": "tproxy", "listen": "0.0.0.0", "port": 12346, "network": "tcp,udp", "sniffing": true, "udpMaxSessions": 128, "udpMaxSessionsPerSource": 64, "udpSessionQueueBytes": 32768, "udpSessionQueuePackets": 32, "udpSessionIdleTimeoutSeconds": 60},
     {"tag": "tproxy6", "type": "tproxy", "listen": "::", "port": 12348, "network": "tcp,udp", "sniffing": true},
     {"tag": "udp_socks", "type": "tproxy", "listen": "0.0.0.0", "port": 12347, "network": "udp", "sniffing": true}
   ],
   "dns": {
+	"servers": [
+	  {"address": "10.20.0.2", "port": 15353, "tag": "netns-upstream"}
+	],
     "hosts": {
       "listener.test": "192.0.2.53",
       "listener6.test": "2001:db8::53"

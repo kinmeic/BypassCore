@@ -21,3 +21,22 @@ func TestParseInboundNetworks(t *testing.T) {
 		}
 	}
 }
+
+func TestListenerLifecycleState(t *testing.T) {
+	listener := New(nil, nil)
+	if err := listener.Start(); err == nil {
+		t.Fatal("nil listener configuration was accepted")
+	}
+	if listener.state != listenerNew {
+		t.Fatalf("failed start state=%d, want new", listener.state)
+	}
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := listener.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if err := listener.Start(); err == nil {
+		t.Fatal("closed listener restarted")
+	}
+}

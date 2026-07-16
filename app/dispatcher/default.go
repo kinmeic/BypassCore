@@ -12,10 +12,12 @@ import (
 	"context"
 	stderrors "errors"
 	"net"
+	"time"
 
 	"github.com/eugene/bypasscore/app/dialer"
 	"github.com/eugene/bypasscore/common"
 	"github.com/eugene/bypasscore/common/errors"
+	commonmetrics "github.com/eugene/bypasscore/common/metrics"
 	bcnet "github.com/eugene/bypasscore/common/net"
 	httpproto "github.com/eugene/bypasscore/common/protocol/http"
 	bcsession "github.com/eugene/bypasscore/common/session"
@@ -94,6 +96,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, conn net.Conn, dest bcnet.Des
 			conn.Close()
 			return errors.New("no default outbound available")
 		}
+		commonmetrics.Inc("bypasscore_route_decisions_total", "outbound", dialer.Tag(), "result", "default")
 		return d.bridge(ctx, conn, dialer, originalDest)
 	}
 	outTag = route.GetOutboundTag()
@@ -106,12 +109,13 @@ func (d *Dispatcher) Dispatch(ctx context.Context, conn net.Conn, dest bcnet.Des
 		return errors.New("routed outbound ", outTag, " not found")
 	}
 
+	commonmetrics.Inc("bypasscore_route_decisions_total", "outbound", outTag, "result", "matched")
 	return d.bridge(ctx, conn, dialer, originalDest)
 }
 
 // bridge dials the outbound and copies data bidirectionally.
 func (d *Dispatcher) bridge(ctx context.Context, inbound net.Conn, dialer dialer.Dialer, dest bcnet.Destination) error {
-	outbound, err := dialer.Dial(ctx, dest)
+	outbound, err := dialWithMetrics(ctx, dialer, dest)
 	if err != nil {
 		inbound.Close()
 		return errors.New("outbound dial failed for ", dest.String()).Base(err)
@@ -206,5 +210,18 @@ func (d *Dispatcher) dialOutboundPackets(ctx context.Context, dest bcnet.Destina
 		return nil, errors.New("no outbound available")
 	}
 
-	return dialer.Dial(ctx, dest)
+	return dialWithMetrics(ctx, dialer, dest)
+}
+
+func dialWithMetrics(ctx context.Context, outboundDialer dialer.Dialer, dest bcnet.Destination) (net.Conn, error) {
+	start := time.Now()
+	conn, err := outboundDialer.Dial(ctx, dest)
+	commonmetrics.Add("bypasscore_outbound_dial_duration_nanoseconds_total", time.Since(start).Nanoseconds(),
+		"outbound", outboundDialer.Tag(), "network", dest.Network.String())
+	result := "success"
+	if err != nil {
+		result = "error"
+	}
+	commonmetrics.Inc("bypasscore_outbound_dials_total", "outbound", outboundDialer.Tag(), "network", dest.Network.String(), "result", result)
+	return conn, err
 }

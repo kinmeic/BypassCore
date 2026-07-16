@@ -297,7 +297,10 @@ func (s *DNS) LookupRawContext(ctx context.Context, domain string, query []byte)
 	for _, client := range s.sortClients(domain) {
 		response, err := client.QueryRaw(ctx, query)
 		if err == nil && len(response) > 0 {
-			return response, nil
+			if err = dns.ValidateRawResponse(query, response); err == nil {
+				return response, nil
+			}
+			errors.LogWarningInner(ctx, err, "DNS: rejected invalid raw response from ", client.Name())
 		}
 		if err != nil {
 			lastErr = err

@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/eugene/bypasscore/app/dispatcher"
 	appdns "github.com/eugene/bypasscore/app/dns"
 	appinbound "github.com/eugene/bypasscore/app/inbound"
+	appmetrics "github.com/eugene/bypasscore/app/metrics"
 	"github.com/eugene/bypasscore/app/observatory"
 	appoutbound "github.com/eugene/bypasscore/app/outbound"
 	"github.com/eugene/bypasscore/app/router"
@@ -41,10 +43,13 @@ type Config struct {
 	DNS         *conf.DNSConfig         `json:"dns"`
 	Inbounds    []*appinbound.Config    `json:"inbounds"`
 	Observatory *observatory.Config     `json:"observatory"`
+	Metrics     *appmetrics.Config      `json:"metrics,omitempty"`
 }
 
 // version is overridden by release builds with -ldflags=-X main.version=... .
 var version = "dev"
+var commit = "unknown"
+var buildDate = "unknown"
 
 func main() {
 	if err := run(); err != nil {
@@ -59,6 +64,7 @@ func run() error {
 	resolve := flag.String("resolve", "", `resolve a domain via DNS, e.g. "example.com"`)
 	observe := flag.Bool("observe", false, "run a single observatory probe round")
 	runMode := flag.Bool("run", false, "run as a daemon (listen + dispatch)")
+	checkConfig := flag.Bool("check-config", false, "validate configuration and exit")
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warning, error")
 	showVersion := false
 	flag.BoolVar(&showVersion, "version", false, "print version and exit")
@@ -68,7 +74,7 @@ func run() error {
 		return err
 	}
 	if showVersion {
-		fmt.Println("BypassCore", version)
+		fmt.Printf("BypassCore %s (commit=%s, built=%s, go=%s)\n", version, commit, buildDate, runtime.Version())
 		return nil
 	}
 
@@ -83,6 +89,7 @@ func run() error {
 	if err := ohm.Validate(); err != nil {
 		return errors.New("outbound config: ").Base(err)
 	}
+	defer ohm.Close()
 
 	// Build the routing config.
 	routerCfg, err := cfg.Routing.Build()
@@ -91,6 +98,13 @@ func run() error {
 	}
 	if err := validateRoutingTargets(routerCfg, ohm); err != nil {
 		return errors.New("routing config: ").Base(err)
+	}
+	if err := validateRuntimeConfig(cfg); err != nil {
+		return err
+	}
+	if *checkConfig {
+		fmt.Println("configuration OK")
+		return nil
 	}
 
 	// Build the DNS client. If a dns config is provided, use the full DNS
@@ -143,7 +157,19 @@ func run() error {
 	// Choose the requested operating mode.
 	switch {
 	case *runMode:
-		if err := runDaemon(r, ohm, dnsClient, cfg.Inbounds, baseCtx); err != nil {
+		var metricsServer *appmetrics.Server
+		if cfg.Metrics != nil {
+			metricsServer, err = appmetrics.New(cfg.Metrics)
+			if err != nil {
+				return errors.New("metrics config: ").Base(err)
+			}
+			if err := metricsServer.Start(); err != nil {
+				return errors.New("start metrics: ").Base(err)
+			}
+			defer metricsServer.Close()
+		}
+		reload := func() error { return reloadRoutingConfig(*configPath, cfg, r, ohm) }
+		if err := runDaemonWithReload(r, ohm, dnsClient, cfg.Inbounds, baseCtx, reload); err != nil {
 			return errors.New("run: ").Base(err)
 		}
 	case *resolve != "":
@@ -250,6 +276,82 @@ func validateRoutingTargets(cfg *router.Config, ohm *appoutbound.Manager) error 
 	return nil
 }
 
+func validateRuntimeConfig(cfg *Config) error {
+	seen := make(map[string]struct{}, len(cfg.Inbounds))
+	for index, inbound := range cfg.Inbounds {
+		if err := appinbound.ValidateConfig(inbound); err != nil {
+			return errors.New("inbound[", index, "]: ").Base(err)
+		}
+		if _, exists := seen[inbound.Tag]; exists {
+			return errors.New("duplicate inbound tag: ", inbound.Tag)
+		}
+		seen[inbound.Tag] = struct{}{}
+		if _, err := dispatcher.NewSnifferWithOptions(inbound.Sniffing, inbound.SniffingTimeoutMs, inbound.SniffingMaxBytes); err != nil {
+			return errors.New("invalid sniffing settings for inbound ", inbound.Tag).Base(err)
+		}
+	}
+	if cfg.DNS != nil {
+		if _, err := cfg.DNS.Build(); err != nil {
+			return errors.New("build dns config: ").Base(err)
+		}
+	}
+	if cfg.Metrics != nil {
+		server, err := appmetrics.New(cfg.Metrics)
+		if err != nil {
+			return errors.New("metrics config: ").Base(err)
+		}
+		if err := server.Validate(); err != nil {
+			return errors.New("metrics config: ").Base(err)
+		}
+	}
+	return nil
+}
+
+func reloadRoutingConfig(path string, running *Config, r *router.Router, ohm *appoutbound.Manager) error {
+	next, err := loadConfig(path)
+	if err != nil {
+		return errors.New("reload config: ").Base(err)
+	}
+	if err := validateRuntimeConfig(next); err != nil {
+		return err
+	}
+	if !sameImmutableConfig(running, next) {
+		return errors.New("reload rejected: outbounds, DNS, inbounds, observatory, and metrics require restart")
+	}
+	nextRouter, err := next.Routing.Build()
+	if err != nil {
+		return errors.New("build reloaded routing config: ").Base(err)
+	}
+	if err := validateRoutingTargets(nextRouter, ohm); err != nil {
+		return errors.New("reloaded routing config: ").Base(err)
+	}
+	if err := r.ReloadRules(nextRouter, false); err != nil {
+		return errors.New("apply reloaded routing config: ").Base(err)
+	}
+	running.Routing = next.Routing
+	return nil
+}
+
+func sameImmutableConfig(left, right *Config) bool {
+	leftValue := struct {
+		Outbounds   []*appoutbound.Outbound
+		DNS         *conf.DNSConfig
+		Inbounds    []*appinbound.Config
+		Observatory *observatory.Config
+		Metrics     *appmetrics.Config
+	}{left.Outbounds, left.DNS, left.Inbounds, left.Observatory, left.Metrics}
+	rightValue := struct {
+		Outbounds   []*appoutbound.Outbound
+		DNS         *conf.DNSConfig
+		Inbounds    []*appinbound.Config
+		Observatory *observatory.Config
+		Metrics     *appmetrics.Config
+	}{right.Outbounds, right.DNS, right.Inbounds, right.Observatory, right.Metrics}
+	leftJSON, leftErr := json.Marshal(leftValue)
+	rightJSON, rightErr := json.Marshal(rightValue)
+	return leftErr == nil && rightErr == nil && string(leftJSON) == string(rightJSON)
+}
+
 func runTest(r *router.Router, ohm *appoutbound.Manager, dest string) error {
 	target, err := bcnet.ParseDestination(dest)
 	if err != nil {
@@ -349,6 +451,10 @@ func repeat(s string, n int) string {
 // runDaemon starts all transparent-proxy and DNS inbound listeners and blocks
 // until a signal is received.
 func runDaemon(r *router.Router, ohm *appoutbound.Manager, dnsClient featdns.Client, inbounds []*appinbound.Config, baseCtx context.Context) error {
+	return runDaemonWithReload(r, ohm, dnsClient, inbounds, baseCtx, nil)
+}
+
+func runDaemonWithReload(r *router.Router, ohm *appoutbound.Manager, dnsClient featdns.Client, inbounds []*appinbound.Config, baseCtx context.Context, reload func() error) error {
 	// Start all inbound listeners.
 	type listener interface {
 		Start() error
@@ -366,12 +472,18 @@ func runDaemon(r *router.Router, ohm *appoutbound.Manager, dnsClient featdns.Cli
 			return errors.New("nil inbound configuration")
 		}
 		var ln listener
-		if strings.EqualFold(strings.TrimSpace(ibCfg.Type), "dns") {
+		inboundType := strings.ToLower(strings.TrimSpace(ibCfg.Type))
+		if inboundType == "dns" || inboundType == "dot" || inboundType == "doh" {
 			ln = appinbound.NewDNS(ibCfg, dnsClient)
 		} else {
 			// Sniffing is an inbound property. Give each transparent listener its
 			// own dispatcher so one inbound cannot affect another.
-			d := dispatcher.New(r, ohm, dispatcher.NewSniffer(ibCfg.Sniffing))
+			sniffer, err := dispatcher.NewSnifferWithOptions(ibCfg.Sniffing, ibCfg.SniffingTimeoutMs, ibCfg.SniffingMaxBytes)
+			if err != nil {
+				closeListeners()
+				return errors.New("invalid sniffing settings for inbound ", ibCfg.Tag).Base(err)
+			}
+			d := dispatcher.New(r, ohm, sniffer)
 			ln = appinbound.New(ibCfg, d)
 		}
 		if err := ln.Start(); err != nil {
@@ -387,13 +499,29 @@ func runDaemon(r *router.Router, ohm *appoutbound.Manager, dnsClient featdns.Cli
 
 	fmt.Printf("BypassCore running with %d inbound(s). Ctrl+C to stop.\n", len(listeners))
 
-	// Block until SIGINT or SIGTERM.
+	// SIGHUP atomically replaces routing rules after full validation. Listener,
+	// DNS and outbound mutations are rejected because they require rebinding or
+	// draining live resources and therefore need an explicit restart.
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(sigCh)
-	select {
-	case <-sigCh:
-	case <-baseCtx.Done():
+	for {
+		select {
+		case received := <-sigCh:
+			if received == syscall.SIGHUP {
+				if reload == nil {
+					continue
+				}
+				if err := reload(); err != nil {
+					errors.LogErrorInner(context.Background(), err, "configuration reload failed; keeping previous routing rules")
+				} else {
+					errors.LogInfo(context.Background(), "routing rules reloaded")
+				}
+				continue
+			}
+		case <-baseCtx.Done():
+		}
+		break
 	}
 
 	fmt.Println("\nShutting down...")

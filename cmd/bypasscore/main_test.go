@@ -78,3 +78,46 @@ func TestLoadConfigRejectsUnknownTopLevelField(t *testing.T) {
 		t.Fatal("unknown top-level field must be rejected")
 	}
 }
+
+func TestReloadRoutingConfigIsTransactional(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	initial := `{"outbounds":[{"tag":"direct","mode":"freedom"}],"routing":{"domainStrategy":"AsIs","rules":[]}}`
+	if err := os.WriteFile(path, []byte(initial), 0600); err != nil {
+		t.Fatal(err)
+	}
+	running, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ohm := appoutbound.NewManager(&appoutbound.Config{Outbounds: running.Outbounds})
+	routerConfig, err := running.Routing.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := new(router.Router)
+	if err := r.Init(context.Background(), routerConfig, appdns.NewLocal(), ohm, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	updated := `{"outbounds":[{"tag":"direct","mode":"freedom"}],"routing":{"domainStrategy":"AsIs","rules":[{"ruleTag":"http","port":"80","outboundTag":"direct"}]}}`
+	if err := os.WriteFile(path, []byte(updated), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := reloadRoutingConfig(path, running, r, ohm); err != nil {
+		t.Fatalf("routing reload: %v", err)
+	}
+	if rules := r.ListRule(); len(rules) != 1 || rules[0].GetRuleTag() != "http" {
+		t.Fatalf("reloaded rules=%v", rules)
+	}
+
+	immutableChange := `{"outbounds":[{"tag":"direct","mode":"freedom"},{"tag":"block","mode":"blackhole"}],"routing":{"domainStrategy":"AsIs","rules":[]}}`
+	if err := os.WriteFile(path, []byte(immutableChange), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := reloadRoutingConfig(path, running, r, ohm); err == nil {
+		t.Fatal("immutable runtime change was accepted")
+	}
+	if rules := r.ListRule(); len(rules) != 1 || rules[0].GetRuleTag() != "http" {
+		t.Fatal("failed reload replaced the active rules")
+	}
+}

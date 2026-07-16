@@ -6,6 +6,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/eugene/bypasscore/app/dialer"
 	"github.com/eugene/bypasscore/common/errors"
@@ -30,6 +31,9 @@ type Manager struct {
 	order         []string
 	duplicateTags map[string]struct{}
 	configErrors  []string
+	closed        bool
+	closeOnce     sync.Once
+	closeErr      error
 }
 
 // NewManager creates a Manager from an outbound descriptor config.
@@ -58,6 +62,9 @@ func (m *Manager) Add(ob *Outbound) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed {
+		return
+	}
 	if _, exists := m.handlers[ob.Tag]; !exists {
 		m.order = append(m.order, ob.Tag)
 	} else {
@@ -70,6 +77,9 @@ func (m *Manager) Add(ob *Outbound) {
 func (m *Manager) GetHandler(tag string) featoutbound.Handler {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if m.closed {
+		return nil
+	}
 	if h, ok := m.handlers[tag]; ok {
 		if h.external != nil {
 			return h.external
@@ -84,7 +94,7 @@ func (m *Manager) GetHandler(tag string) featoutbound.Handler {
 func (m *Manager) GetDefaultHandler() featoutbound.Handler {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if len(m.order) == 0 {
+	if m.closed || len(m.order) == 0 {
 		return nil
 	}
 	h := m.handlers[m.order[0]]
@@ -165,15 +175,24 @@ func (m *Manager) Start() error { return nil }
 
 // Close implements common.Closable.
 func (m *Manager) Close() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	var first error
-	for _, h := range m.handlers {
-		if err := h.Close(); err != nil && first == nil {
-			first = err
+	m.closeOnce.Do(func() {
+		m.mu.Lock()
+		m.closed = true
+		handlers := make([]*handler, 0, len(m.handlers))
+		for _, h := range m.handlers {
+			handlers = append(handlers, h)
 		}
-	}
-	return first
+		m.mu.Unlock()
+
+		// Handler shutdown may perform network I/O. Do it outside the manager
+		// lock so status queries remain observable while a slow handler drains.
+		for _, h := range handlers {
+			if err := h.Close(); err != nil && m.closeErr == nil {
+				m.closeErr = err
+			}
+		}
+	})
+	return m.closeErr
 }
 
 // Validate checks the descriptor table for obvious misconfigurations.
@@ -201,12 +220,32 @@ func (m *Manager) Validate() error {
 			if _, _, err := net.SplitHostPort(h.ob.Upstream.Server); err != nil {
 				return errors.New("proxy outbound ", tag, " has invalid upstream.server").Base(err)
 			}
+			if raw, exists := h.ob.Upstream.Settings["udpMaxPacketBytes"]; exists {
+				value, ok := integerSetting(raw)
+				if !ok || value < 512 || value > 65507 {
+					return errors.New("proxy outbound ", tag, " udpMaxPacketBytes must be an integer between 512 and 65507")
+				}
+			}
 		}
 		if h.ob.Bind != nil && h.ob.Bind.LocalIP != "" && net.ParseIP(h.ob.Bind.LocalIP) == nil {
 			return errors.New("outbound ", tag, " has invalid bind.localIP")
 		}
 	}
 	return nil
+}
+
+func integerSetting(raw any) (int64, bool) {
+	switch value := raw.(type) {
+	case int:
+		return int64(value), true
+	case int64:
+		return value, true
+	case float64:
+		converted := int64(value)
+		return converted, float64(converted) == value
+	default:
+		return 0, false
+	}
 }
 
 // AddHandler registers a runtime handler (for callers building a Manager
@@ -216,9 +255,16 @@ func (m *Manager) AddHandler(_ context.Context, h featoutbound.Handler) error {
 		return errors.New("nil handler")
 	}
 	tag := h.Tag()
+	if strings.TrimSpace(tag) == "" {
+		return errors.New("handler has empty tag")
+	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if _, exists := m.handlers[tag]; !exists {
+	if m.closed {
+		m.mu.Unlock()
+		return errors.New("outbound manager is closed")
+	}
+	old, exists := m.handlers[tag]
+	if !exists {
 		m.order = append(m.order, tag)
 	}
 	// Wrap external handlers minimally: only Tag() is reachable via GetOutbound.
@@ -227,16 +273,25 @@ func (m *Manager) AddHandler(_ context.Context, h featoutbound.Handler) error {
 		wrapped.dialer = d
 	}
 	m.handlers[tag] = wrapped
+	m.mu.Unlock()
+	if old != nil {
+		return old.Close()
+	}
 	return nil
 }
 
 // RemoveHandler removes a handler by tag.
 func (m *Manager) RemoveHandler(_ context.Context, tag string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	if m.closed {
+		m.mu.Unlock()
+		return errors.New("outbound manager is closed")
+	}
 	if _, ok := m.handlers[tag]; !ok {
+		m.mu.Unlock()
 		return errors.New("outbound ", tag, " not found")
 	}
+	removed := m.handlers[tag]
 	delete(m.handlers, tag)
 	for i, t := range m.order {
 		if t == tag {
@@ -244,41 +299,57 @@ func (m *Manager) RemoveHandler(_ context.Context, tag string) error {
 			break
 		}
 	}
-	return nil
+	m.mu.Unlock()
+	// Removal is a lifecycle operation; close the detached handler outside the
+	// manager lock so a network-backed Close cannot block unrelated readers.
+	return removed.Close()
 }
 
 // GetDialer returns the Dialer for the given outbound tag, or nil.
 func (m *Manager) GetDialer(tag string) dialer.Dialer {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	if m.closed {
+		m.mu.RUnlock()
+		return nil
+	}
 	h, ok := m.handlers[tag]
+	m.mu.RUnlock()
 	if !ok {
 		return nil
 	}
-	if h.dialer == nil {
-		h.dialer = dialerFactory(h.ob)
-	}
-	return h.dialer
+	return h.getDialer()
 }
 
 // GetDefaultDialer returns the dialer for the first registered outbound.
 func (m *Manager) GetDefaultDialer() dialer.Dialer {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	if m.closed {
+		m.mu.RUnlock()
+		return nil
+	}
 	if len(m.order) == 0 {
+		m.mu.RUnlock()
 		return nil
 	}
 	h := m.handlers[m.order[0]]
-	if h.dialer == nil {
-		h.dialer = dialerFactory(h.ob)
-	}
-	return h.dialer
+	m.mu.RUnlock()
+	return h.getDialer()
 }
 
 // dialerFactory converts an outbound descriptor to a Dialer.
-var dialerFactory = func(ob *Outbound) dialer.Dialer { return nil }
+var dialerFactory atomic.Value
+
+func init() {
+	dialerFactory.Store(func(*Outbound) dialer.Dialer { return nil })
+}
 
 // SetDialerFactory registers the dialer factory. Called once at CLI startup.
 func SetDialerFactory(f func(ob *Outbound) dialer.Dialer) {
-	dialerFactory = f
+	if f != nil {
+		dialerFactory.Store(f)
+	}
+}
+
+func currentDialerFactory() func(*Outbound) dialer.Dialer {
+	return dialerFactory.Load().(func(*Outbound) dialer.Dialer)
 }

@@ -82,6 +82,7 @@ sudo ip6tables -t mangle -A PREROUTING -i bc-client -d fd00:20::2 -p udp --dport
 sudo ip netns exec bc-server "$TMP/netns-helper" -mode serve -listen 0.0.0.0 -tcp-ports 18080,18081 -udp-ports 18082,18085 >"$TMP/server4.log" 2>&1 & PIDS+=("$!")
 sudo ip netns exec bc-server "$TMP/netns-helper" -mode serve -listen :: -tcp-ports 18083 -udp-ports 18084 >"$TMP/server6.log" 2>&1 & PIDS+=("$!")
 sudo ip netns exec bc-server "$TMP/netns-helper" -mode socks -listen 10.20.0.2:1080 >"$TMP/socks.log" 2>&1 & PIDS+=("$!")
+sudo ip netns exec bc-server "$TMP/netns-helper" -mode dns-serve -listen 10.20.0.2:15353 >"$TMP/dns.log" 2>&1 & PIDS+=("$!")
 sudo sh -c 'echo $$ >"$1"; exec "$2" -run -config "$3" -log-level warning' sh \
   "$TMP/bypass.pid" "$TMP/bypasscore" "$ROOT/integration/netns/config.json" >"$TMP/bypass.log" 2>&1 &
 PIDS+=("$!")
@@ -107,6 +108,10 @@ sudo ip netns exec bc-client "$TMP/netns-helper" -mode dns-client -network udp -
 sudo ip netns exec bc-client "$TMP/netns-helper" -mode dns-client -network tcp -target 10.10.0.1:1053 -domain listener.test -want-ip 192.0.2.53
 sudo ip netns exec bc-client "$TMP/netns-helper" -mode dns-client -network udp6 -target '[fd00:10::1]:1053' -domain listener6.test -want-ip 2001:db8::53
 sudo ip netns exec bc-client "$TMP/netns-helper" -mode dns-client -network tcp6 -target '[fd00:10::1]:1053' -domain listener6.test -want-ip 2001:db8::53
+sudo ip netns exec bc-client "$TMP/netns-helper" -mode dns-client -network udp -target 10.10.0.1:1053 -domain raw.test -want-text raw-ok
+sudo ip netns exec bc-client "$TMP/netns-helper" -mode dns-client -network tcp -target 10.10.0.1:1053 -domain raw.test -want-text raw-ok
+# The upstream deliberately sets TC=1 over UDP; success verifies TCP fallback.
+sudo ip netns exec bc-client "$TMP/netns-helper" -mode dns-client -network udp -target 10.10.0.1:1053 -domain fallback.test -want-text raw-ok
 
 sudo ip netns exec bc-client "$TMP/netns-helper" -mode flood -target 10.20.0.2 -start-port 20000 -count 1200
 sleep 2

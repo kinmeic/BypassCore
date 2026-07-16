@@ -93,7 +93,7 @@ func dnsQuery(t testing.TB, id uint16, qtype dnsmessage.Type) []byte {
 	return raw
 }
 
-func unpackDNS(t *testing.T, raw []byte) dnsmessage.Message {
+func unpackDNS(t testing.TB, raw []byte) dnsmessage.Message {
 	t.Helper()
 	var msg dnsmessage.Message
 	if err := msg.Unpack(raw); err != nil {
@@ -196,7 +196,11 @@ func TestValidateRawResponseAcceptsQuestionNameCaseChanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := validateRawResponse(&request, raw); err != nil {
+	query, err := request.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dnsfeature.ValidateRawResponse(query, raw); err != nil {
 		t.Fatalf("case-only question-name change rejected: %v", err)
 	}
 }

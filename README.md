@@ -24,7 +24,8 @@ domain through sniffing, match routing rules, and forward through an outbound.
   plus Observatory health checks
 - Process matching on Linux, macOS, and Windows
 - `domainStrategy`: `AsIs`, `IpIfNonMatch`, and `IpOnDemand`
-- Daemon mode with graceful SIGINT/SIGTERM shutdown
+- Daemon mode with graceful SIGINT/SIGTERM shutdown and transactional SIGHUP
+  routing-rule reloads
 
 ## Quick start
 
@@ -38,6 +39,9 @@ make build
 
 # Reduce hot-path log volume in production
 ./bin/bypasscore -run -config config.json -log-level warning
+
+# Validate the complete configuration without opening listeners
+./bin/bypasscore -check-config -config config.json
 
 # Start the daemon (TPROXY listeners, routing, and outbounds)
 make run
@@ -90,7 +94,7 @@ Each outbound is a descriptor with optional binding metadata:
 
 ```json
 {"tag":"wan1","mode":"freedom","bind":{"interface":"en0","localIP":"192.168.1.2"}}
-{"tag":"proxy","mode":"proxy","upstream":{"protocol":"socks","server":"127.0.0.1:1080"}}
+{"tag":"proxy","mode":"proxy","upstream":{"protocol":"socks","server":"127.0.0.1:1080","settings":{"udpMaxPacketBytes":8192}}}
 ```
 
 ## DNS subsystem
@@ -137,7 +141,20 @@ To expose the internal resolver to dnsmasq or LAN clients, add a DNS inbound:
   "network": "tcp,udp",
   "maxConcurrentQueries": 256,
   "maxTCPConnections": 128,
-  "maxQueryBytes": 4096
+  "maxQueryBytes": 4096,
+  "dnsAllowedClients": ["127.0.0.0/8", "192.168.0.0/16", "fd00::/8"],
+  "dnsQueriesPerSecond": 200,
+  "dnsQueryBurst": 400,
+  "dnsGlobalQueriesPerSecond": 1000,
+  "dnsGlobalQueryBurst": 2000,
+  "dnsRawCacheEntries": 4096,
+  "dnsRawCacheMaxTTLSeconds": 3600,
+  "dnsRawCacheMaxBytes": 16777216,
+  "dnsRules": [
+    {"domain":["geosite:category-ads-all"],"action":"drop"},
+    {"domain":["full:blocked.example"],"action":"return","rcode":3},
+    {"qType":["TXT","MX"],"action":"direct"}
+  ]
 }
 ```
 
@@ -150,6 +167,66 @@ domain policy. UDP replies honor the client's advertised EDNS size (capped at
 port 53 normally requires root privileges or `CAP_NET_BIND_SERVICE`.
 `maxQueryBytes` limits memory used to parse one request and defaults to 4096.
 If `listen` is omitted, a DNS inbound binds to `127.0.0.1` for safety.
+For non-loopback listeners, use `dnsAllowedClients` to restrict IPv4/IPv6
+CIDRs and configure the per-source `dnsQueriesPerSecond`/`dnsQueryBurst` token
+bucket. Unauthorized or rate-limited UDP requests are dropped silently to
+avoid creating a DNS reflection endpoint, and rate-limiter client state has a
+hard memory bound. The global token bucket also limits spoofed-source floods.
+DNS rules are ordered and support `direct`, `drop`, `return` and `hijack`;
+`domain:`, `full:`, `regexp:` and `geosite:` matchers use the same parser as
+routing rules. Validated non-A/AAAA wire responses are held in a bounded LRU
+cache with TTL aging and query-ID restoration. A separate total-byte budget
+(16 MiB by default) prevents large TCP/DoH answers from defeating the entry
+count limit.
+
+The same resolver can be exposed as encrypted DoT or HTTP/2 DoH. Both require
+a PEM certificate and key; DoH defaults to `/dns-query`:
+
+```json
+{"tag":"dot-in","type":"dot","listen":"0.0.0.0","port":853,"network":"tcp","dnsCertificateFile":"server.crt","dnsKeyFile":"server.key","dnsAllowedClients":["192.168.0.0/16"]}
+{"tag":"doh-in","type":"doh","listen":"0.0.0.0","port":8443,"network":"tcp","dnsCertificateFile":"server.crt","dnsKeyFile":"server.key","dnsDoHPath":"/dns-query","dnsAllowedClients":["192.168.0.0/16"]}
+```
+
+UDP TPROXY resource budgets can be tuned for the device:
+
+```json
+{
+  "tag": "udp_tproxy",
+  "type": "tproxy",
+  "listen": "0.0.0.0",
+  "port": 12345,
+  "network": "udp",
+  "udpMaxSessions": 1024,
+  "udpMaxSessionsPerSource": 256,
+  "udpSessionQueueBytes": 65536,
+  "udpSessionQueuePackets": 64,
+  "udpSessionIdleTimeoutSeconds": 120
+}
+```
+
+The global and per-source limits work together so one client cannot consume
+all sockets, goroutines, and queue memory. These are the defaults; memory-limited
+OpenWrt devices can use smaller values.
+
+TCP sniffing is bounded by `sniffingTimeoutMs` (default 500) and
+`sniffingMaxBytes` (default 32768). QUIC/UDP sniffing is bounded by
+`udpSniffWaitMs` (default 25) and `udpSniffMaxPackets` (default 4).
+
+## Operations and observability
+
+Set `metrics` to expose Prometheus metrics and health status. Loopback is the
+safe default; a non-loopback address requires `allowedClients`. Pprof is
+disabled unless explicitly enabled.
+
+```json
+{"metrics":{"listen":"127.0.0.1:9090","allowedClients":["127.0.0.0/8"],"enablePprof":false}}
+```
+
+Endpoints are `/healthz`, `/metrics`, and, when enabled,
+`/debug/pprof/`. Send `SIGHUP` to validate and atomically replace routing
+rules. Outbound, DNS, inbound, Observatory, and metrics changes are rejected
+during reload and require a restart, so the old live configuration remains
+intact on every failure.
 
 ## Configuration
 
@@ -177,8 +254,9 @@ JSON configuration under `infra/conf`. The CLI entry point is
 
 GitHub Actions validates a real network-namespace topology covering TCP
 REDIRECT, TCP/UDP TPROXY, IPv6, SOCKS5 UDP, transparent reply source-address
-restoration, the UDP/TCP DNS listener over IPv4/IPv6, and UDP session/FD/RSS
-resource limits. On a Linux host, run:
+restoration, the UDP/TCP DNS listener over IPv4/IPv6, raw TXT forwarding,
+UDP-to-TCP DNS truncation fallback, and UDP session/FD/RSS resource limits. On
+a Linux host, run:
 
 ```bash
 sudo integration/netns/run.sh

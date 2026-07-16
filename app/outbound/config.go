@@ -11,6 +11,7 @@ package outbound
 
 import (
 	"strings"
+	"sync"
 
 	"github.com/eugene/bypasscore/app/dialer"
 	"github.com/eugene/bypasscore/common/errors"
@@ -110,6 +111,18 @@ type handler struct {
 	ob       *Outbound
 	external outbound.Handler
 	dialer   dialer.Dialer
+	// dialerOnce confines lazy construction to this outbound. A slow factory
+	// no longer serializes unrelated outbound lookups behind Manager.mu.
+	dialerOnce sync.Once
+}
+
+func (h *handler) getDialer() dialer.Dialer {
+	h.dialerOnce.Do(func() {
+		if h.dialer == nil {
+			h.dialer = currentDialerFactory()(h.ob)
+		}
+	})
+	return h.dialer
 }
 
 func (h *handler) Tag() string { return h.ob.Tag }

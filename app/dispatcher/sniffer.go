@@ -2,6 +2,7 @@ package dispatcher
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net"
 	"time"
@@ -15,7 +16,9 @@ import (
 // (TLS SNI or HTTP Host) so that domain-based routing rules work for
 // tproxy/redirect flows that arrive as IP:port.
 type Sniffer struct {
-	enabled bool
+	enabled  bool
+	timeout  time.Duration
+	maxBytes int
 }
 
 // SniffPacketMetadata inspects one or more consecutive UDP datagrams. QUIC
@@ -26,8 +29,8 @@ func (s *Sniffer) SniffPacketMetadata(packets [][]byte) (domain, protocol string
 		return "", "", false
 	}
 	data := bytes.Join(packets, nil)
-	if len(data) > maxSniffBytes {
-		data = data[:maxSniffBytes]
+	if len(data) > s.maxBytes {
+		data = data[:s.maxBytes]
 	}
 	domain, needMore = quic.SniffSNI(data)
 	if domain != "" {
@@ -38,15 +41,32 @@ func (s *Sniffer) SniffPacketMetadata(packets [][]byte) (domain, protocol string
 
 // NewSniffer creates a Sniffer. If enabled is false, Sniff returns "".
 func NewSniffer(enabled bool) *Sniffer {
-	return &Sniffer{enabled: enabled}
+	return &Sniffer{enabled: enabled, timeout: defaultSniffTimeout, maxBytes: defaultMaxSniffBytes}
+}
+
+// NewSnifferWithOptions creates a validated configurable sniffer.
+func NewSnifferWithOptions(enabled bool, timeoutMs, maxBytes int) (*Sniffer, error) {
+	if timeoutMs == 0 {
+		timeoutMs = int(defaultSniffTimeout / time.Millisecond)
+	}
+	if timeoutMs < 10 || timeoutMs > 10_000 {
+		return nil, fmt.Errorf("sniffingTimeoutMs must be between 10 and 10000")
+	}
+	if maxBytes == 0 {
+		maxBytes = defaultMaxSniffBytes
+	}
+	if maxBytes < 512 || maxBytes > 1024*1024 {
+		return nil, fmt.Errorf("sniffingMaxBytes must be between 512 and 1048576")
+	}
+	return &Sniffer{enabled: enabled, timeout: time.Duration(timeoutMs) * time.Millisecond, maxBytes: maxBytes}, nil
 }
 
 // sniffTimeout is the maximum total time to wait for enough bytes of a
 // connection. If the client sends nothing within this window (port scan,
 // or a server-speaks-first protocol), we give up and route by IP:port.
-const sniffTimeout = 500 * time.Millisecond
+const defaultSniffTimeout = 500 * time.Millisecond
 
-const maxSniffBytes = 32 * 1024
+const defaultMaxSniffBytes = 32 * 1024
 
 // Sniff reads the first bytes of conn, recovers the sniffed domain, and
 // returns a NEW net.Conn that replays the consumed bytes before reading
@@ -68,12 +88,16 @@ func (s *Sniffer) SniffMetadata(conn net.Conn) (net.Conn, string, string) {
 		return conn, "", ""
 	}
 
-	_ = conn.SetReadDeadline(time.Now().Add(sniffTimeout))
+	_ = conn.SetReadDeadline(time.Now().Add(s.timeout))
 	defer conn.SetReadDeadline(time.Time{})
 
 	data := make([]byte, 0, 4096)
 	tmp := make([]byte, 4096)
-	for len(data) < maxSniffBytes {
+	for len(data) < s.maxBytes {
+		remaining := s.maxBytes - len(data)
+		if remaining < len(tmp) {
+			tmp = tmp[:remaining]
+		}
 		n, err := conn.Read(tmp)
 		if n > 0 {
 			data = append(data, tmp[:n]...)
@@ -83,7 +107,7 @@ func (s *Sniffer) SniffMetadata(conn net.Conn) (net.Conn, string, string) {
 			if domain := http.SniffHost(data); domain != "" {
 				return &prependConn{Conn: conn, buf: data}, domain, "http"
 			}
-			if !sniffNeedsMore(data) {
+			if !sniffNeedsMore(data, s.maxBytes) {
 				break
 			}
 		}
@@ -97,7 +121,7 @@ func (s *Sniffer) SniffMetadata(conn net.Conn) (net.Conn, string, string) {
 	return &prependConn{Conn: conn, buf: data}, "", ""
 }
 
-func sniffNeedsMore(data []byte) bool {
+func sniffNeedsMore(data []byte, maxBytes int) bool {
 	if len(data) == 0 {
 		return true
 	}
@@ -112,7 +136,7 @@ func sniffNeedsMore(data []byte) bool {
 			prefixLen = len(method)
 		}
 		if bytes.EqualFold(data[:prefixLen], []byte(method[:prefixLen])) {
-			return len(data) < maxSniffBytes && !containsHeaderEnd(data)
+			return len(data) < maxBytes && !containsHeaderEnd(data)
 		}
 	}
 	return false

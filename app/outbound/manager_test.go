@@ -2,8 +2,46 @@ package outbound
 
 import (
 	"context"
+	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/eugene/bypasscore/app/dialer"
+	bcnet "github.com/eugene/bypasscore/common/net"
+	featoutbound "github.com/eugene/bypasscore/features/outbound"
 )
+
+type testDialer struct{ tag string }
+
+func (*testDialer) Dial(context.Context, bcnet.Destination) (net.Conn, error) { return nil, nil }
+func (d *testDialer) Tag() string                                             { return d.tag }
+
+type blockingCloseHandler struct {
+	tag     string
+	started chan struct{}
+	release chan struct{}
+}
+
+type countingCloseHandler struct {
+	tag    string
+	closed atomic.Int32
+}
+
+func (*countingCloseHandler) Type() interface{} { return featoutbound.ManagerType() }
+func (*countingCloseHandler) Start() error      { return nil }
+func (h *countingCloseHandler) Close() error    { h.closed.Add(1); return nil }
+func (h *countingCloseHandler) Tag() string     { return h.tag }
+
+func (h *blockingCloseHandler) Type() interface{} { return featoutbound.ManagerType() }
+func (*blockingCloseHandler) Start() error        { return nil }
+func (h *blockingCloseHandler) Close() error {
+	close(h.started)
+	<-h.release
+	return nil
+}
+func (h *blockingCloseHandler) Tag() string { return h.tag }
 
 func TestNewManager(t *testing.T) {
 	cfg := &Config{Outbounds: []*Outbound{
@@ -85,6 +123,13 @@ func TestValidateProxyRequiresUpstream(t *testing.T) {
 	}})
 	if err := m3.Validate(); err != nil {
 		t.Fatalf("Validate should accept SOCKS: %v", err)
+	}
+	m4 := NewManager(&Config{Outbounds: []*Outbound{{
+		Tag: "bad-limit", Mode: ModeProxy,
+		Upstream: &UpstreamConfig{Protocol: "socks", Server: "127.0.0.1:1080", Settings: map[string]any{"udpMaxPacketBytes": 1.5}},
+	}}})
+	if err := m4.Validate(); err == nil {
+		t.Fatal("Validate should reject a non-integer UDP packet limit")
 	}
 }
 
@@ -319,6 +364,76 @@ func TestManager_ConcurrentReadWrite(t *testing.T) {
 		}
 	}
 	<-done
+}
+
+func TestManagerDialerFactoryIsPerHandlerAndConcurrent(t *testing.T) {
+	var calls atomic.Int64
+	SetDialerFactory(func(ob *Outbound) dialer.Dialer {
+		calls.Add(1)
+		return &testDialer{tag: ob.Tag}
+	})
+	m := NewManager(&Config{Outbounds: []*Outbound{{Tag: "direct", Mode: ModeFreedom}}})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 64; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if d := m.GetDialer("direct"); d == nil || d.Tag() != "direct" {
+				t.Errorf("GetDialer returned %v", d)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("dialer factory calls=%d, want 1", got)
+	}
+}
+
+func TestManagerCloseDoesNotBlockReaders(t *testing.T) {
+	h := &blockingCloseHandler{tag: "slow", started: make(chan struct{}), release: make(chan struct{})}
+	m := NewManager(nil)
+	if err := m.AddHandler(context.Background(), h); err != nil {
+		t.Fatal(err)
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- m.Close() }()
+	<-h.started
+
+	read := make(chan struct{})
+	go func() {
+		_ = m.GetHandler("slow")
+		close(read)
+	}()
+	select {
+	case <-read:
+	case <-time.After(time.Second):
+		t.Fatal("manager reader blocked behind slow handler Close")
+	}
+	close(h.release)
+	if err := <-closed; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if m.GetHandler("slow") != nil {
+		t.Fatal("closed manager exposed a handler")
+	}
+}
+
+func TestAddHandlerReplacementClosesOldHandler(t *testing.T) {
+	m := NewManager(nil)
+	old := &countingCloseHandler{tag: "same"}
+	if err := m.AddHandler(context.Background(), old); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.AddHandler(context.Background(), &countingCloseHandler{tag: "same"}); err != nil {
+		t.Fatal(err)
+	}
+	if old.closed.Load() != 1 {
+		t.Fatalf("replaced handler close count=%d, want 1", old.closed.Load())
+	}
 }
 
 // itoa avoids importing strconv just for the loop above.

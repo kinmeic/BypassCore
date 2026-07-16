@@ -38,11 +38,16 @@ type CacheController struct {
 	cacheCleanup  *task.Periodic
 	highWatermark int
 	requestGroup  singleflight.Group
+	closeOnce     sync.Once
+	closeErr      error
 }
 
 func (c *CacheController) Close() error {
-	_ = c.cacheCleanup.Close()
-	return c.pub.Close()
+	c.closeOnce.Do(func() {
+		_ = c.cacheCleanup.Close()
+		c.closeErr = c.pub.Close()
+	})
+	return c.closeErr
 }
 
 func NewCacheController(name string, disableCache bool, serveStale bool, serveExpiredTTL uint32) *CacheController {

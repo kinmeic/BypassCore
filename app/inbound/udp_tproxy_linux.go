@@ -25,6 +25,7 @@ import (
 
 	"github.com/eugene/bypasscore/app/dispatcher"
 	"github.com/eugene/bypasscore/common/errors"
+	commonmetrics "github.com/eugene/bypasscore/common/metrics"
 	bcnet "github.com/eugene/bypasscore/common/net"
 	"github.com/eugene/bypasscore/common/session"
 	"golang.org/x/sys/unix"
@@ -39,6 +40,10 @@ type udpTproxyListener struct {
 	sessions sync.Map // key: "srcAddr|originalDst" → *udpSession
 	createMu sync.Mutex
 	count    atomic.Int64
+	// sourceCounts is guarded by createMu and contains entries only for source
+	// IPs with at least one active session.
+	sourceCounts map[string]int
+	limits       udpResourceLimits
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -49,6 +54,7 @@ type udpTproxyListener struct {
 // a goroutine copying return packets back to the client.
 type udpSession struct {
 	key         string
+	sourceKey   string
 	clientAddr  *net.UDPAddr      // client source address
 	originalDst bcnet.Destination // original target (from TPROXY)
 	outbound    net.Conn          // outbound connection (to proxy/freedom)
@@ -64,20 +70,12 @@ type udpSession struct {
 	closed    chan struct{}
 }
 
-const (
-	udpSessionIdleTimeout = 2 * time.Minute
-	// Bound both per-flow memory and the number of sockets/goroutines an
-	// untrusted UDP source can create. A single maximum-size datagram still
-	// fits, while bursts overflow instead of growing memory without bound.
-	udpSessionQueueBytes = 64 * 1024
-	udpSessionQueueSlots = 64
-	udpMaxSessions       = 1024
-	udpSniffWait         = 25 * time.Millisecond
-	udpSniffMaxPackets   = 4
-)
-
 // startUDP creates a UDP TPROXY listener.
 func startUDP(cfg *Config, d *dispatcher.Dispatcher) (*udpTproxyListener, error) {
+	limits, err := udpResourceLimitsFromConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
 	addr := net.JoinHostPort(cfg.Listen, strconv.Itoa(cfg.Port))
 
 	// Create a raw UDP socket with IP_TRANSPARENT + IP_RECVORIGDSTADDR.
@@ -137,9 +135,11 @@ func startUDP(cfg *Config, d *dispatcher.Dispatcher) (*udpTproxyListener, error)
 	}
 
 	l := &udpTproxyListener{
-		cfg:        cfg,
-		dispatcher: d,
-		conn:       udpConn,
+		cfg:          cfg,
+		dispatcher:   d,
+		conn:         udpConn,
+		sourceCounts: make(map[string]int),
+		limits:       limits,
 	}
 	l.ctx, l.cancel = context.WithCancel(context.Background())
 
@@ -187,6 +187,7 @@ func (l *udpTproxyListener) recvLoop() {
 		key := srcAddr.String() + "|" + origDst.String()
 		s := l.getOrCreateSession(key, srcAddr, origDst)
 		if s == nil {
+			commonmetrics.Inc("bypasscore_udp_dropped_total", "inbound", l.cfg.Tag, "reason", "session_limit")
 			errors.LogWarning(context.Background(), "UDP relay session limit reached, dropping packet")
 			continue
 		}
@@ -204,22 +205,28 @@ func (l *udpTproxyListener) getOrCreateSession(key string, src *net.UDPAddr, dst
 	if value, ok := l.sessions.Load(key); ok {
 		return value.(*udpSession)
 	}
-	if l.ctx.Err() != nil || l.count.Load() >= udpMaxSessions {
+	sourceKey := src.IP.String()
+	if l.ctx.Err() != nil || l.count.Load() >= l.limits.maxSessions ||
+		l.sourceCounts[sourceKey] >= l.limits.maxSessionsPerSource {
 		return nil
 	}
 	ctx, cancel := context.WithCancel(l.ctx)
 	s := &udpSession{
 		key:         key,
+		sourceKey:   sourceKey,
 		clientAddr:  src,
 		originalDst: dst,
 		listener:    l,
 		ctx:         ctx,
 		cancel:      cancel,
-		packets:     make(chan []byte, udpSessionQueueSlots),
+		packets:     make(chan []byte, l.limits.queuePackets),
 		closed:      make(chan struct{}),
 	}
 	l.sessions.Store(key, s)
 	l.count.Add(1)
+	l.sourceCounts[sourceKey]++
+	commonmetrics.Add("bypasscore_udp_sessions_active", 1, "inbound", l.cfg.Tag)
+	commonmetrics.Inc("bypasscore_udp_sessions_created_total", "inbound", l.cfg.Tag)
 	l.wg.Add(1)
 	go s.run()
 	return s
@@ -255,7 +262,8 @@ func (s *udpSession) enqueue(data []byte) {
 	size := int64(len(data))
 	for {
 		queued := s.queuedBytes.Load()
-		if queued+size > udpSessionQueueBytes {
+		if queued+size > s.listener.limits.queueBytes {
+			commonmetrics.Inc("bypasscore_udp_dropped_total", "inbound", s.listener.cfg.Tag, "reason", "queue_bytes")
 			errors.LogWarning(context.Background(), "UDP relay byte queue full for ", s.key, ", dropping packet")
 			return
 		}
@@ -270,6 +278,7 @@ func (s *udpSession) enqueue(data []byte) {
 	case s.packets <- packet:
 	default:
 		s.queuedBytes.Add(-size)
+		commonmetrics.Inc("bypasscore_udp_dropped_total", "inbound", s.listener.cfg.Tag, "reason", "queue_packets")
 		errors.LogWarning(context.Background(), "UDP relay queue full for ", s.key, ", dropping packet")
 	}
 }
@@ -297,12 +306,12 @@ func (s *udpSession) run() {
 		pending = append(pending, packet)
 	}
 collectLoop:
-	for len(pending) < udpSniffMaxPackets {
+	for len(pending) < s.listener.limits.sniffMaxPackets {
 		_, _, needMore := s.listener.dispatcher.SniffPacketMetadata(pending)
 		if !needMore {
 			break
 		}
-		timer := time.NewTimer(udpSniffWait)
+		timer := time.NewTimer(s.listener.limits.sniffWait)
 		select {
 		case packet := <-s.packets:
 			if !timer.Stop() {
@@ -319,7 +328,7 @@ collectLoop:
 			timer.Stop()
 			return
 		}
-		if len(pending) == 0 || len(pending) >= udpSniffMaxPackets {
+		if len(pending) == 0 || len(pending) >= s.listener.limits.sniffMaxPackets {
 			break
 		}
 	}
@@ -349,7 +358,7 @@ collectLoop:
 
 	reads := make(chan udpReadResult, 1)
 	go s.readUDPResponses(conn, reads)
-	timer := time.NewTimer(udpSessionIdleTimeout)
+	timer := time.NewTimer(s.listener.limits.idleTimeout)
 	defer timer.Stop()
 	resetTimer := func() {
 		if !timer.Stop() {
@@ -358,7 +367,7 @@ collectLoop:
 			default:
 			}
 		}
-		timer.Reset(udpSessionIdleTimeout)
+		timer.Reset(s.listener.limits.idleTimeout)
 	}
 
 	for {
@@ -465,9 +474,7 @@ func (s *udpSession) close() {
 	s.closeOnce.Do(func() {
 		close(s.closed)
 		s.cancel()
-		if s.listener.sessions.CompareAndDelete(s.key, s) {
-			s.listener.count.Add(-1)
-		}
+		s.listener.removeSession(s)
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		if s.outbound != nil {
@@ -477,6 +484,21 @@ func (s *udpSession) close() {
 			s.replyConn.Close()
 		}
 	})
+}
+
+func (l *udpTproxyListener) removeSession(s *udpSession) {
+	l.createMu.Lock()
+	defer l.createMu.Unlock()
+	if !l.sessions.CompareAndDelete(s.key, s) {
+		return
+	}
+	l.count.Add(-1)
+	commonmetrics.Add("bypasscore_udp_sessions_active", -1, "inbound", l.cfg.Tag)
+	if remaining := l.sourceCounts[s.sourceKey] - 1; remaining > 0 {
+		l.sourceCounts[s.sourceKey] = remaining
+	} else {
+		delete(l.sourceCounts, s.sourceKey)
+	}
 }
 
 // Close stops the UDP listener.

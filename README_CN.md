@@ -17,7 +17,7 @@
 - **负载均衡**：random / roundrobin / leastping / leastload + Observatory 健康探测
 - **进程匹配**：按源进程名/路径分流（Linux/macOS/Windows）
 - **domainStrategy**：AsIs / IpIfNonMatch / IpOnDemand
-- **daemon 模式**：`bypasscore run -c config.json` 常驻，SIGINT/SIGTERM 优雅退出
+- **daemon 模式**：`bypasscore -run -config config.json` 常驻，SIGINT/SIGTERM 优雅退出，SIGHUP 事务式重载路由规则
 
 ## 快速开始
 
@@ -31,6 +31,9 @@ make build
 
 # 生产环境可降低热路径日志量
 ./bin/bypasscore -run -config config.json -log-level warning
+
+# 不打开端口，完整检查配置
+./bin/bypasscore -check-config -config config.json
 
 # daemon 模式（启动 tproxy 监听 + 路由 + 出站）
 make run
@@ -85,7 +88,7 @@ transport.Bridge (双向拷贝)
 
 ```json
 {"tag": "wan1", "mode": "freedom", "bind": {"interface": "en0", "localIP": "192.168.1.2"}}
-{"tag": "proxy", "mode": "proxy", "upstream": {"protocol": "socks", "server": "127.0.0.1:1080"}}
+{"tag": "proxy", "mode": "proxy", "upstream": {"protocol": "socks", "server": "127.0.0.1:1080", "settings": {"udpMaxPacketBytes": 8192}}}
 ```
 
 ## DNS 子系统
@@ -131,7 +134,20 @@ transport.Bridge (双向拷贝)
   "network": "tcp,udp",
   "maxConcurrentQueries": 256,
   "maxTCPConnections": 128,
-  "maxQueryBytes": 4096
+  "maxQueryBytes": 4096,
+  "dnsAllowedClients": ["127.0.0.0/8", "192.168.0.0/16", "fd00::/8"],
+  "dnsQueriesPerSecond": 200,
+  "dnsQueryBurst": 400,
+  "dnsGlobalQueriesPerSecond": 1000,
+  "dnsGlobalQueryBurst": 2000,
+  "dnsRawCacheEntries": 4096,
+  "dnsRawCacheMaxTTLSeconds": 3600,
+  "dnsRawCacheMaxBytes": 16777216,
+  "dnsRules": [
+    {"domain": ["geosite:category-ads-all"], "action": "drop"},
+    {"domain": ["full:blocked.example"], "action": "return", "rcode": 3},
+    {"qType": ["TXT", "MX"], "action": "direct"}
+  ]
 }
 ```
 
@@ -142,6 +158,58 @@ wire message，经所选 UDP、TCP、DoT 或 DoH 服务器及相同 tagged outbo
 重试时设置截断标志。监听 53 端口通常需要 root 权限或 `CAP_NET_BIND_SERVICE`。
 `maxQueryBytes` 用于限制单个请求解析时的内存占用，默认为 4096。
 DNS inbound 未设置 `listen` 时会安全地默认监听 `127.0.0.1`。
+监听非 loopback 地址时，建议用 `dnsAllowedClients` 限制可访问的 IPv4/IPv6
+CIDR，并配置按源 IP 的 `dnsQueriesPerSecond`/`dnsQueryBurst`。未授权或限流的
+UDP 请求会被静默丢弃，避免形成 DNS 反射入口；限流器的客户端状态数量也有硬上限。
+全局 token bucket 还能限制伪造源地址的洪泛。DNS 规则按顺序执行，支持
+`direct`、`drop`、`return`、`hijack`，域名语法与路由规则相同。非 A/AAAA 的
+已校验 wire 响应进入有容量上限的 LRU 缓存，命中时会递减 TTL 并恢复请求 ID；
+独立的总字节预算（默认 16 MiB）可防止大体积 TCP/DoH 响应绕过条目数限制。
+
+同一个解析器也可以通过加密 DoT 或 HTTP/2 DoH 对外提供服务。两者都要求 PEM
+证书和私钥，DoH 路径默认是 `/dns-query`：
+
+```json
+{"tag":"dot-in","type":"dot","listen":"0.0.0.0","port":853,"network":"tcp","dnsCertificateFile":"server.crt","dnsKeyFile":"server.key","dnsAllowedClients":["192.168.0.0/16"]}
+{"tag":"doh-in","type":"doh","listen":"0.0.0.0","port":8443,"network":"tcp","dnsCertificateFile":"server.crt","dnsKeyFile":"server.key","dnsDoHPath":"/dns-query","dnsAllowedClients":["192.168.0.0/16"]}
+```
+
+UDP TPROXY 的资源预算可按设备内存和并发量配置：
+
+```json
+{
+  "tag": "udp_tproxy",
+  "type": "tproxy",
+  "listen": "0.0.0.0",
+  "port": 12345,
+  "network": "udp",
+  "udpMaxSessions": 1024,
+  "udpMaxSessionsPerSource": 256,
+  "udpSessionQueueBytes": 65536,
+  "udpSessionQueuePackets": 64,
+  "udpSessionIdleTimeoutSeconds": 120
+}
+```
+
+全局上限和按源 IP 上限共同生效，防止单个客户端耗尽全部 socket、goroutine 和
+队列内存。以上均为默认值；低内存 OpenWrt 设备可以适当调低。
+
+TCP 嗅探可用 `sniffingTimeoutMs`（默认 500）和 `sniffingMaxBytes`（默认
+32768）限制；QUIC/UDP 嗅探可用 `udpSniffWaitMs`（默认 25）和
+`udpSniffMaxPackets`（默认 4）限制。
+
+## 运维与可观测性
+
+配置 `metrics` 后可提供 Prometheus 指标和健康状态。默认只监听 loopback；监听
+非 loopback 地址时必须配置 `allowedClients`。pprof 默认关闭。
+
+```json
+{"metrics":{"listen":"127.0.0.1:9090","allowedClients":["127.0.0.0/8"],"enablePprof":false}}
+```
+
+端点为 `/healthz`、`/metrics`，启用后还有 `/debug/pprof/`。向进程发送
+`SIGHUP` 会先完整校验，再原子替换路由规则。出站、DNS、入站、Observatory 和
+metrics 的变更在热重载时会被拒绝并要求重启；任何失败都会保留旧的运行配置。
 
 ## config.json 结构
 
@@ -196,8 +264,8 @@ cmd/bypasscore/    CLI 入口 (run/test/resolve/observe)
 ## Linux 内核集成测试
 
 GitHub Actions 会在真实 network namespace 拓扑中验证 TCP REDIRECT、TCP/UDP
-TPROXY、IPv6、SOCKS5 UDP、透明回复源地址恢复、IPv4/IPv6 UDP/TCP DNS 监听，
-以及 UDP session/FD/RSS 上限。
+TPROXY、IPv6、SOCKS5 UDP、透明回复源地址恢复、IPv4/IPv6 UDP/TCP DNS 监听、
+原始 TXT 转发、DNS UDP 截断后的 TCP 回退，以及 UDP session/FD/RSS 上限。
 本地 Linux 主机可用 root 权限运行：
 
 ```bash

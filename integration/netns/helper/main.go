@@ -16,7 +16,7 @@ import (
 )
 
 func main() {
-	mode := flag.String("mode", "", "serve, socks, tcp-client, udp-client, dns-client, flood")
+	mode := flag.String("mode", "", "serve, dns-serve, socks, tcp-client, udp-client, dns-client, flood")
 	listen := flag.String("listen", "", "listen address")
 	tcpPorts := flag.String("tcp-ports", "", "comma-separated TCP ports")
 	udpPorts := flag.String("udp-ports", "", "comma-separated UDP ports")
@@ -27,6 +27,7 @@ func main() {
 	network := flag.String("network", "udp", "client network")
 	domain := flag.String("domain", "", "DNS query domain")
 	wantIP := flag.String("want-ip", "", "expected DNS response IP")
+	wantText := flag.String("want-text", "", "expected DNS TXT response")
 	flag.Parse()
 
 	var err error
@@ -35,12 +36,14 @@ func main() {
 		err = serve(*listen, *tcpPorts, *udpPorts)
 	case "socks":
 		err = serveSOCKS(*listen)
+	case "dns-serve":
+		err = serveDNS(*listen)
 	case "tcp-client":
 		err = tcpClient(*target, []byte(*payload))
 	case "udp-client":
 		err = udpClient(*target, []byte(*payload))
 	case "dns-client":
-		err = dnsClient(*target, *network, *domain, *wantIP)
+		err = dnsClient(*target, *network, *domain, *wantIP, *wantText)
 	case "flood":
 		err = flood(*target, *startPort, *count)
 	default:
@@ -52,14 +55,18 @@ func main() {
 	}
 }
 
-func dnsClient(target, network, domain, wantIP string) error {
-	want := net.ParseIP(wantIP)
-	if want == nil {
-		return fmt.Errorf("invalid expected IP %q", wantIP)
-	}
-	qType := dnsmessage.TypeAAAA
-	if want.To4() != nil {
-		qType = dnsmessage.TypeA
+func dnsClient(target, network, domain, wantIP, wantText string) error {
+	var want net.IP
+	qType := dnsmessage.TypeTXT
+	if wantText == "" {
+		want = net.ParseIP(wantIP)
+		if want == nil {
+			return fmt.Errorf("invalid expected IP %q", wantIP)
+		}
+		qType = dnsmessage.TypeAAAA
+		if want.To4() != nil {
+			qType = dnsmessage.TypeA
+		}
 	}
 	name, err := dnsmessage.NewName(strings.TrimSuffix(domain, ".") + ".")
 	if err != nil {
@@ -127,13 +134,107 @@ func dnsClient(target, network, domain, wantIP string) error {
 			got = net.IP(body.A[:])
 		case *dnsmessage.AAAAResource:
 			got = net.IP(body.AAAA[:])
+		case *dnsmessage.TXTResource:
+			for _, text := range body.TXT {
+				if text == wantText {
+					fmt.Printf("dns network=%s domain=%s txt=%s\n", network, domain, text)
+					return nil
+				}
+			}
 		}
 		if got != nil && got.Equal(want) {
 			fmt.Printf("dns network=%s domain=%s ip=%s\n", network, domain, got)
 			return nil
 		}
 	}
+	if wantText != "" {
+		return fmt.Errorf("DNS response did not contain TXT %q", wantText)
+	}
 	return fmt.Errorf("DNS response did not contain %s", want)
+}
+
+func serveDNS(address string) error {
+	udpAddress, err := net.ResolveUDPAddr("udp", address)
+	if err != nil {
+		return err
+	}
+	udp, err := net.ListenUDP("udp", udpAddress)
+	if err != nil {
+		return err
+	}
+	tcp, err := net.Listen("tcp", address)
+	if err != nil {
+		_ = udp.Close()
+		return err
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		buffer := make([]byte, 65535)
+		for {
+			n, peer, readErr := udp.ReadFromUDP(buffer)
+			if readErr != nil {
+				return
+			}
+			response, responseErr := dnsTestResponse(buffer[:n], true)
+			if responseErr == nil {
+				_, _ = udp.WriteToUDP(response, peer)
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for {
+			conn, acceptErr := tcp.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				var length [2]byte
+				for {
+					if _, readErr := io.ReadFull(conn, length[:]); readErr != nil {
+						return
+					}
+					query := make([]byte, binary.BigEndian.Uint16(length[:]))
+					if _, readErr := io.ReadFull(conn, query); readErr != nil {
+						return
+					}
+					response, responseErr := dnsTestResponse(query, false)
+					if responseErr != nil {
+						return
+					}
+					binary.BigEndian.PutUint16(length[:], uint16(len(response)))
+					if writeAll(conn, length[:]) != nil || writeAll(conn, response) != nil {
+						return
+					}
+				}
+			}()
+		}
+	}()
+	wg.Wait()
+	return nil
+}
+
+func dnsTestResponse(raw []byte, udp bool) ([]byte, error) {
+	var query dnsmessage.Message
+	if err := query.Unpack(raw); err != nil || len(query.Questions) != 1 {
+		return nil, fmt.Errorf("invalid DNS test query")
+	}
+	question := query.Questions[0]
+	truncated := udp && strings.EqualFold(question.Name.String(), "fallback.test.")
+	response := dnsmessage.Message{
+		Header:    dnsmessage.Header{ID: query.ID, Response: true, Truncated: truncated, RecursionDesired: query.RecursionDesired, RecursionAvailable: true},
+		Questions: query.Questions,
+	}
+	if !truncated && question.Type == dnsmessage.TypeTXT {
+		response.Answers = []dnsmessage.Resource{{
+			Header: dnsmessage.ResourceHeader{Name: question.Name, Type: dnsmessage.TypeTXT, Class: dnsmessage.ClassINET, TTL: 60},
+			Body:   &dnsmessage.TXTResource{TXT: []string{"raw-ok"}},
+		}}
+	}
+	return response.AppendPack(nil)
 }
 
 func writeAll(writer io.Writer, payload []byte) error {

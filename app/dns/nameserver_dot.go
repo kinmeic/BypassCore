@@ -40,7 +40,7 @@ func NewDOTNameServer(u *url.URL, disableCache bool, serveStale bool, serveExpir
 		base.destination.Port = parsed
 	}
 	base.dial = func(ctx context.Context) (net.Conn, error) {
-		rawConn, err := base.rawDial(ctx, base.destination)
+		rawConn, err := base.dialRaw(ctx, base.destination)
 		if err != nil {
 			return nil, err
 		}
