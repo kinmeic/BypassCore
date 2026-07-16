@@ -15,28 +15,76 @@ import (
 type value struct {
 	name   string
 	labels string
+	values map[string]string
 	number atomic.Int64
 }
 
 var registry sync.Map // canonical key -> *value
+var restrictions atomic.Pointer[labelRestrictions]
+
+type labelRestrictions struct {
+	allowed map[string]map[string]struct{}
+}
 
 func metric(name string, labelPairs ...string) *value {
+	values := labelValues(labelPairs)
+	current := restrictions.Load()
+	if current != nil && !labelsAllowed(values, current.allowed) {
+		return nil
+	}
 	labels := canonicalLabels(labelPairs)
 	key := name + "\x00" + labels
 	if existing, ok := registry.Load(key); ok {
 		return existing.(*value)
 	}
-	created := &value{name: name, labels: labels}
+	created := &value{name: name, labels: labels, values: values}
 	actual, _ := registry.LoadOrStore(key, created)
+	// A reload may replace restrictions between the first check and insertion.
+	// Recheck after LoadOrStore so a retired snapshot cannot recreate a pruned
+	// low-cardinality series after RetainLabelValues has already scanned it.
+	if latest := restrictions.Load(); latest != current && latest != nil && !labelsAllowed(values, latest.allowed) {
+		registry.Delete(key)
+		return nil
+	}
 	return actual.(*value)
 }
 
-func Inc(name string, labelPairs ...string) { metric(name, labelPairs...).number.Add(1) }
+func labelsAllowed(values map[string]string, allowed map[string]map[string]struct{}) bool {
+	for label, choices := range allowed {
+		if current, exists := values[label]; exists {
+			if _, ok := choices[current]; !ok {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func labelValues(pairs []string) map[string]string {
+	if len(pairs) == 0 {
+		return nil
+	}
+	values := make(map[string]string, len(pairs)/2)
+	for index := 0; index+1 < len(pairs); index += 2 {
+		values[pairs[index]] = pairs[index+1]
+	}
+	return values
+}
+
+func Inc(name string, labelPairs ...string) {
+	if item := metric(name, labelPairs...); item != nil {
+		item.number.Add(1)
+	}
+}
 func Add(name string, delta int64, labelPairs ...string) {
-	metric(name, labelPairs...).number.Add(delta)
+	if item := metric(name, labelPairs...); item != nil {
+		item.number.Add(delta)
+	}
 }
 func Set(name string, current int64, labelPairs ...string) {
-	metric(name, labelPairs...).number.Store(current)
+	if item := metric(name, labelPairs...); item != nil {
+		item.number.Store(current)
+	}
 }
 
 type Sample struct {
@@ -97,6 +145,33 @@ func canonicalLabels(pairs []string) string {
 func ResetForTest() {
 	registry.Range(func(key, _ any) bool {
 		registry.Delete(key)
+		return true
+	})
+	restrictions.Store(nil)
+}
+
+// RetainLabelValues removes series whose controlled labels no longer exist in
+// the active configuration. This bounds cardinality across repeated reloads.
+func RetainLabelValues(allowed map[string]map[string]struct{}) {
+	copyAllowed := make(map[string]map[string]struct{}, len(allowed))
+	for label, values := range allowed {
+		copyValues := make(map[string]struct{}, len(values))
+		for value := range values {
+			copyValues[value] = struct{}{}
+		}
+		copyAllowed[label] = copyValues
+	}
+	restrictions.Store(&labelRestrictions{allowed: copyAllowed})
+	registry.Range(func(key, raw any) bool {
+		item := raw.(*value)
+		for label, values := range copyAllowed {
+			if current, exists := item.values[label]; exists {
+				if _, keep := values[current]; !keep {
+					registry.Delete(key)
+					break
+				}
+			}
+		}
 		return true
 	})
 }

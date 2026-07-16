@@ -18,10 +18,11 @@ import (
 
 // Router is an implementation of routing.Router.
 type Router struct {
-	domainStrategy Config_DomainStrategy
-	rules          []*Rule
-	balancers      map[string]*Balancer
-	dns            dns.Client
+	domainStrategy   Config_DomainStrategy
+	rules            []*Rule
+	balancers        map[string]*Balancer
+	finalOutboundTag string
+	dns              dns.Client
 
 	ctx        context.Context
 	ohm        outbound.Manager
@@ -61,6 +62,7 @@ func (r *Router) Init(ctx context.Context, config *Config, d dns.Client, ohm out
 		}
 	}
 	r.domainStrategy = config.DomainStrategy
+	r.finalOutboundTag = config.FinalOutboundTag
 	r.dns = d
 	r.ctx = ctx
 	r.ohm = ohm
@@ -142,6 +144,14 @@ func (r *Router) PickRoute(ctx routing.Context) (routing.Route, error) {
 	originalCtx := ctx
 	rule, ctx, err := r.pickRouteInternal(ctx)
 	if err != nil {
+		if err == common.ErrNoClue {
+			r.mu.RLock()
+			finalTag := r.finalOutboundTag
+			r.mu.RUnlock()
+			if finalTag != "" {
+				return &Route{Context: ctx, outboundTag: finalTag}, nil
+			}
+		}
 		return nil, err
 	}
 	tag, err := rule.GetTag()
@@ -264,6 +274,7 @@ func (r *Router) ReloadRules(config *Config, shouldAppend bool) error {
 	r.balancers = newBalancers
 	if !shouldAppend {
 		r.domainStrategy = config.DomainStrategy
+		r.finalOutboundTag = config.FinalOutboundTag
 	}
 	r.mu.Unlock()
 	if !shouldAppend {

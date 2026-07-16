@@ -40,11 +40,11 @@ func (h *Handler) Dial(_ context.Context, dest bcnet.Destination) (net.Conn, err
 // side is cleanly closed.
 type discardConn struct{}
 
-func (*discardConn) Read([]byte) (int, error)          { return 0, io.EOF }
-func (*discardConn) Write(p []byte) (int, error)       { return len(p), nil }
-func (*discardConn) Close() error                      { return nil }
-func (*discardConn) LocalAddr() net.Addr               { return &net.IPAddr{} }
-func (*discardConn) RemoteAddr() net.Addr              { return &net.IPAddr{} }
-func (*discardConn) SetDeadline(t time.Time) error     { return nil }
+func (*discardConn) Read([]byte) (int, error)           { return 0, io.EOF }
+func (*discardConn) Write(p []byte) (int, error)        { return len(p), nil }
+func (*discardConn) Close() error                       { return nil }
+func (*discardConn) LocalAddr() net.Addr                { return &net.IPAddr{} }
+func (*discardConn) RemoteAddr() net.Addr               { return &net.IPAddr{} }
+func (*discardConn) SetDeadline(t time.Time) error      { return nil }
 func (*discardConn) SetReadDeadline(t time.Time) error  { return nil }
 func (*discardConn) SetWriteDeadline(t time.Time) error { return nil }

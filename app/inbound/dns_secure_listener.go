@@ -14,7 +14,6 @@ import (
 	"github.com/eugene/bypasscore/common/errors"
 	commonmetrics "github.com/eugene/bypasscore/common/metrics"
 	"golang.org/x/net/http2"
-	"golang.org/x/net/netutil"
 )
 
 func loadDNSServerTLSConfig(cfg *Config) (*tls.Config, error) {
@@ -36,13 +35,17 @@ func loadDNSServerTLSConfig(cfg *Config) (*tls.Config, error) {
 	}, nil
 }
 
-func (l *DNSListener) startDoH(address string, maxConnections, maxQueries int, tlsConfig *tls.Config) error {
+type dohConnLease struct {
+	slots chan struct{}
+	tag   string
+}
+
+func (l *DNSListener) startDoH(address string, tlsConfig *tls.Config) error {
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		return errors.New("DNS inbound DoH listen failed: ", address).Base(err)
 	}
-	limited := netutil.LimitListener(listener, maxConnections)
-	l.tcp = tls.NewListener(limited, tlsConfig)
+	l.tcp = tls.NewListener(listener, tlsConfig)
 	path := strings.TrimSpace(l.cfg.DNSDoHPath)
 	if path == "" {
 		path = "/dns-query"
@@ -61,8 +64,9 @@ func (l *DNSListener) startDoH(address string, maxConnections, maxQueries int, t
 		IdleTimeout:       30 * time.Second,
 		MaxHeaderBytes:    16 * 1024,
 		TLSConfig:         tlsConfig,
+		ConnState:         l.handleDoHConnState,
 	}
-	if err := http2.ConfigureServer(server, &http2.Server{MaxConcurrentStreams: uint32(maxQueries)}); err != nil {
+	if err := http2.ConfigureServer(server, &http2.Server{MaxConcurrentStreams: uint32(maxDoHConcurrentStreams)}); err != nil {
 		_ = l.tcp.Close()
 		return errors.New("DNS inbound: configure HTTP/2").Base(err)
 	}
@@ -74,20 +78,55 @@ func (l *DNSListener) startDoH(address string, maxConnections, maxQueries int, t
 			errors.LogErrorInner(context.Background(), err, "DNS inbound DoH serve failed")
 		}
 	}()
-	errors.LogInfo(context.Background(), "inbound[", l.cfg.Tag, "] listening on doh://", address, path)
+	errors.LogInfo(context.Background(), "inbound[", l.inboundTag(), "] listening on doh://", address, path)
 	return nil
 }
 
+func (l *DNSListener) handleDoHConnState(conn net.Conn, state http.ConnState) {
+	switch state {
+	case http.StateNew:
+		policy := l.currentPolicy()
+		select {
+		case policy.tcpSlots <- struct{}{}:
+			lease := dohConnLease{slots: policy.tcpSlots, tag: l.inboundTag()}
+			l.connMu.Lock()
+			if l.dohConns == nil {
+				l.connMu.Unlock()
+				<-policy.tcpSlots
+				_ = conn.Close()
+				return
+			}
+			l.dohConns[conn] = lease
+			l.connMu.Unlock()
+			commonmetrics.Add("bypasscore_dns_tcp_connections_active", 1, "inbound", lease.tag)
+		default:
+			_ = conn.Close()
+		}
+	case http.StateClosed, http.StateHijacked:
+		l.connMu.Lock()
+		lease, exists := l.dohConns[conn]
+		if exists {
+			delete(l.dohConns, conn)
+		}
+		l.connMu.Unlock()
+		if exists {
+			<-lease.slots
+			commonmetrics.Add("bypasscore_dns_tcp_connections_active", -1, "inbound", lease.tag)
+		}
+	}
+}
+
 func (l *DNSListener) handleDoH(writer http.ResponseWriter, request *http.Request) {
+	policy := l.currentPolicy()
 	ip, ok := remoteRequestIP(request.RemoteAddr)
-	if !ok || !clientAllowed(ip, l.allowedClients) {
-		commonmetrics.Inc("bypasscore_dns_rejected_total", "inbound", l.cfg.Tag, "reason", "acl", "transport", "doh")
+	if !ok || !clientAllowed(ip, policy.allowedClients) {
+		commonmetrics.Inc("bypasscore_dns_rejected_total", "inbound", l.inboundTag(), "reason", "acl", "transport", "doh")
 		http.Error(writer, "forbidden", http.StatusForbidden)
 		return
 	}
 	now := time.Now()
-	if !l.globalLimiter.allow(now) || !l.rateLimiter.allow(ip, now) {
-		commonmetrics.Inc("bypasscore_dns_rejected_total", "inbound", l.cfg.Tag, "reason", "rate", "transport", "doh")
+	if !policy.globalLimiter.allow(now) || !policy.rateLimiter.allow(ip, now) {
+		commonmetrics.Inc("bypasscore_dns_rejected_total", "inbound", l.inboundTag(), "reason", "rate", "transport", "doh")
 		http.Error(writer, "rate limited", http.StatusTooManyRequests)
 		return
 	}
@@ -99,7 +138,7 @@ func (l *DNSListener) handleDoH(writer http.ResponseWriter, request *http.Reques
 			http.Error(writer, "unsupported content type", http.StatusUnsupportedMediaType)
 			return
 		}
-		query, err = io.ReadAll(io.LimitReader(request.Body, int64(l.queryLimit()+1)))
+		query, err = io.ReadAll(io.LimitReader(request.Body, int64(policy.queryBytes+1)))
 	case http.MethodGet:
 		query, err = base64.RawURLEncoding.DecodeString(request.URL.Query().Get("dns"))
 	default:
@@ -107,14 +146,14 @@ func (l *DNSListener) handleDoH(writer http.ResponseWriter, request *http.Reques
 		http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if err != nil || len(query) == 0 || len(query) > l.queryLimit() {
+	if err != nil || len(query) == 0 || len(query) > policy.queryBytes {
 		http.Error(writer, "invalid DNS query", http.StatusBadRequest)
 		return
 	}
-	commonmetrics.Inc("bypasscore_dns_queries_total", "inbound", l.cfg.Tag, "transport", "doh")
+	commonmetrics.Inc("bypasscore_dns_queries_total", "inbound", l.inboundTag(), "transport", "doh")
 	select {
-	case l.querySlots <- struct{}{}:
-		defer func() { <-l.querySlots }()
+	case policy.querySlots <- struct{}{}:
+		defer func() { <-policy.querySlots }()
 	case <-l.ctx.Done():
 		http.Error(writer, "shutting down", http.StatusServiceUnavailable)
 		return

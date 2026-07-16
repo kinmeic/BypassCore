@@ -23,13 +23,51 @@ type Config struct {
 }
 
 type Server struct {
-	config  *Config
-	allowed []netip.Prefix
-	server  *http.Server
-	listen  net.Listener
-	healthy atomic.Bool
-	mu      sync.Mutex
-	closed  bool
+	config    *Config
+	allowed   []netip.Prefix
+	server    *http.Server
+	listen    net.Listener
+	healthy   atomic.Bool
+	mu        sync.Mutex
+	closed    bool
+	readiness func() bool
+}
+
+// SetReadiness supplies the daemon readiness predicate used by /readyz.
+func (s *Server) SetReadiness(check func() bool) {
+	s.mu.Lock()
+	s.readiness = check
+	s.mu.Unlock()
+}
+
+// Reload updates exposure policy and pprof availability without rebinding.
+func (s *Server) Reload(config *Config) error {
+	candidate, err := New(config)
+	if err != nil {
+		return err
+	}
+	if err := candidate.Validate(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	currentListen := normalizedListen(s.config)
+	s.mu.Unlock()
+	if normalizedListen(config) != currentListen {
+		return errors.New("metrics: listen change requires restart")
+	}
+	copyConfig := *config
+	s.mu.Lock()
+	s.config = &copyConfig
+	s.allowed = candidate.allowed
+	s.mu.Unlock()
+	return nil
+}
+
+func normalizedListen(config *Config) string {
+	if config == nil || strings.TrimSpace(config.Listen) == "" {
+		return "127.0.0.1:9090"
+	}
+	return strings.TrimSpace(config.Listen)
 }
 
 func New(config *Config) (*Server, error) {
@@ -126,7 +164,11 @@ func (s *Server) Close() error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return server.Shutdown(ctx)
+	err := server.Shutdown(ctx)
+	if err != nil {
+		_ = server.Close()
+	}
+	return err
 }
 
 func (s *Server) handler() http.Handler {
@@ -140,17 +182,25 @@ func (s *Server) handler() http.Handler {
 		writer.WriteHeader(status)
 		_ = json.NewEncoder(writer).Encode(map[string]any{"ok": status == http.StatusOK})
 	})
+	mux.HandleFunc("/readyz", func(writer http.ResponseWriter, _ *http.Request) {
+		ready := s.isReady()
+		status := http.StatusOK
+		if !ready {
+			status = http.StatusServiceUnavailable
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(status)
+		_ = json.NewEncoder(writer).Encode(map[string]any{"ready": ready})
+	})
 	mux.HandleFunc("/metrics", func(writer http.ResponseWriter, _ *http.Request) {
 		writer.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		_ = commonmetrics.WritePrometheus(writer)
 	})
-	if s.config.EnablePprof {
-		mux.HandleFunc("/debug/pprof/", pprof.Index)
-		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
-	}
+	mux.HandleFunc("/debug/pprof/", s.pprofHandler(pprof.Index))
+	mux.HandleFunc("/debug/pprof/cmdline", s.pprofHandler(pprof.Cmdline))
+	mux.HandleFunc("/debug/pprof/profile", s.pprofHandler(pprof.Profile))
+	mux.HandleFunc("/debug/pprof/symbol", s.pprofHandler(pprof.Symbol))
+	mux.HandleFunc("/debug/pprof/trace", s.pprofHandler(pprof.Trace))
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if !s.clientAllowed(request.RemoteAddr) {
 			http.Error(writer, "forbidden", http.StatusForbidden)
@@ -161,6 +211,9 @@ func (s *Server) handler() http.Handler {
 }
 
 func (s *Server) clientAllowed(remote string) bool {
+	s.mu.Lock()
+	allowed := append([]netip.Prefix(nil), s.allowed...)
+	s.mu.Unlock()
 	host, _, err := net.SplitHostPort(remote)
 	if err != nil {
 		return false
@@ -170,13 +223,33 @@ func (s *Server) clientAllowed(remote string) bool {
 		return false
 	}
 	ip = ip.Unmap()
-	if len(s.allowed) == 0 {
+	if len(allowed) == 0 {
 		return ip.IsLoopback()
 	}
-	for _, prefix := range s.allowed {
+	for _, prefix := range allowed {
 		if prefix.Contains(ip) {
 			return true
 		}
 	}
 	return false
+}
+
+func (s *Server) isReady() bool {
+	s.mu.Lock()
+	check := s.readiness
+	s.mu.Unlock()
+	return s.healthy.Load() && check != nil && check()
+}
+
+func (s *Server) pprofHandler(next http.HandlerFunc) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		s.mu.Lock()
+		enabled := s.config != nil && s.config.EnablePprof
+		s.mu.Unlock()
+		if !enabled {
+			http.NotFound(writer, request)
+			return
+		}
+		next(writer, request)
+	}
 }

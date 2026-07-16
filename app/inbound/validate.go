@@ -17,6 +17,9 @@ func ValidateConfig(cfg *Config) error {
 	if strings.TrimSpace(cfg.Tag) == "" {
 		return errors.New("inbound tag must not be empty")
 	}
+	if cfg.Tag != strings.TrimSpace(cfg.Tag) {
+		return errors.New("inbound tag must not contain leading or trailing whitespace")
+	}
 	if cfg.Port < 1 || cfg.Port > 65535 {
 		return errors.New("inbound port must be between 1 and 65535")
 	}
@@ -38,6 +41,9 @@ func ValidateConfig(cfg *Config) error {
 	case "dns", "dot", "doh":
 		if _, err := positiveLimit(cfg.MaxConcurrentQueries, defaultDNSMaxConcurrentQueries, "maxConcurrentQueries"); err != nil {
 			return err
+		}
+		if typ == "doh" && cfg.MaxConcurrentQueries > maxDoHConcurrentStreams {
+			return errors.New("DNS inbound: DoH maxConcurrentQueries must not exceed ", maxDoHConcurrentStreams)
 		}
 		if _, err := positiveLimit(cfg.MaxTCPConnections, defaultDNSMaxTCPConnections, "maxTCPConnections"); err != nil {
 			return err

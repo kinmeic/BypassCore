@@ -93,8 +93,10 @@ type NameServer struct {
 	UnexpectedIp    []*geodata.IPRule      `protobuf:"bytes,13,rep,name=unexpected_ip,json=unexpectedIp,proto3" json:"unexpected_ip,omitempty"`
 	ActUnprior      bool                   `protobuf:"varint,14,opt,name=actUnprior,proto3" json:"actUnprior,omitempty"`
 	PolicyID        uint32                 `protobuf:"varint,17,opt,name=policyID,proto3" json:"policyID,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Optional outbound used to reach this upstream. Empty means route normally.
+	OutboundTag   string `protobuf:"bytes,18,opt,name=outbound_tag,json=outboundTag,proto3" json:"outbound_tag,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *NameServer) Reset() {
@@ -237,6 +239,13 @@ func (x *NameServer) GetPolicyID() uint32 {
 		return x.PolicyID
 	}
 	return 0
+}
+
+func (x *NameServer) GetOutboundTag() string {
+	if x != nil {
+		return x.OutboundTag
+	}
+	return ""
 }
 
 type Config struct {
@@ -435,7 +444,7 @@ var File_app_dns_config_proto protoreflect.FileDescriptor
 
 const file_app_dns_config_proto_rawDesc = "" +
 	"\n" +
-	"\x14app/dns/config.proto\x12\x12bypasscore.app.dns\x1a\x1ccommon/net/destination.proto\x1a\x1bcommon/geodata/geodat.proto\"\xfc\x05\n" +
+	"\x14app/dns/config.proto\x12\x12bypasscore.app.dns\x1a\x1ccommon/net/destination.proto\x1a\x1bcommon/geodata/geodat.proto\"\x9f\x06\n" +
 	"\n" +
 	"NameServer\x129\n" +
 	"\aaddress\x18\x01 \x01(\v2\x1f.bypasscore.common.net.EndpointR\aaddress\x12\x1b\n" +
@@ -461,7 +470,8 @@ const file_app_dns_config_proto_rawDesc = "" +
 	"\n" +
 	"actUnprior\x18\x0e \x01(\bR\n" +
 	"actUnprior\x12\x1a\n" +
-	"\bpolicyID\x18\x11 \x01(\rR\bpolicyIDB\x0f\n" +
+	"\bpolicyID\x18\x11 \x01(\rR\bpolicyID\x12!\n" +
+	"\foutbound_tag\x18\x12 \x01(\tR\voutboundTagB\x0f\n" +
 	"\r_disableCacheB\r\n" +
 	"\v_serveStaleB\x12\n" +
 	"\x10_serveExpiredTTLJ\x04\b\x04\x10\x05\"\x9b\x05\n" +

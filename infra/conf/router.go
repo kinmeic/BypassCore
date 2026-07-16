@@ -29,6 +29,11 @@ type BalancingRule struct {
 
 // Build converts the JSON BalancingRule to a router.BalancingRule.
 func (r *BalancingRule) Build() (*router.BalancingRule, error) {
+	r.Tag = strings.TrimSpace(r.Tag)
+	r.FallbackTag = strings.TrimSpace(r.FallbackTag)
+	for index := range r.Selectors {
+		r.Selectors[index] = strings.TrimSpace(r.Selectors[index])
+	}
 	if r.Tag == "" {
 		return nil, errors.New("empty balancer tag")
 	}
@@ -151,9 +156,10 @@ func (d *Duration) UnmarshalJSON(data []byte) error {
 
 // RouterConfig is the JSON form of the routing section.
 type RouterConfig struct {
-	RuleList       []json.RawMessage `json:"rules"`
-	DomainStrategy *string           `json:"domainStrategy"`
-	Balancers      []*BalancingRule  `json:"balancers"`
+	RuleList         []json.RawMessage `json:"rules"`
+	DomainStrategy   *string           `json:"domainStrategy"`
+	Balancers        []*BalancingRule  `json:"balancers"`
+	FinalOutboundTag string            `json:"finalOutboundTag,omitempty"`
 }
 
 func (c *RouterConfig) getDomainStrategy() (router.Config_DomainStrategy, error) {
@@ -181,6 +187,7 @@ func (c *RouterConfig) Build() (*router.Config, error) {
 		return nil, err
 	}
 	config.DomainStrategy = strategy
+	config.FinalOutboundTag = strings.TrimSpace(c.FinalOutboundTag)
 
 	ruleTags := make(map[string]struct{}, len(c.RuleList))
 	for _, rawRule := range c.RuleList {
@@ -249,7 +256,9 @@ func parseFieldRule(msg json.RawMessage) (*router.RoutingRule, error) {
 	}
 
 	rule := new(router.RoutingRule)
-	rule.RuleTag = rawFieldRule.RuleTag
+	rule.RuleTag = strings.TrimSpace(rawFieldRule.RuleTag)
+	rawFieldRule.OutboundTag = strings.TrimSpace(rawFieldRule.OutboundTag)
+	rawFieldRule.BalancerTag = strings.TrimSpace(rawFieldRule.BalancerTag)
 	if rawFieldRule.OutboundTag != "" && rawFieldRule.BalancerTag != "" {
 		return nil, errors.New("routing rule cannot specify both outboundTag and balancerTag")
 	}

@@ -7,6 +7,7 @@ import (
 	"net"
 	"time"
 
+	commonmetrics "github.com/eugene/bypasscore/common/metrics"
 	"github.com/eugene/bypasscore/common/protocol/http"
 	"github.com/eugene/bypasscore/common/protocol/quic"
 	"github.com/eugene/bypasscore/common/protocol/tls"
@@ -34,8 +35,14 @@ func (s *Sniffer) SniffPacketMetadata(packets [][]byte) (domain, protocol string
 	}
 	domain, needMore = quic.SniffSNI(data)
 	if domain != "" {
+		commonmetrics.Inc("bypasscore_sniff_total", "network", "udp", "result", "success", "protocol", "quic")
 		return domain, "quic", false
 	}
+	result := "failure"
+	if needMore {
+		result = "need_more"
+	}
+	commonmetrics.Inc("bypasscore_sniff_total", "network", "udp", "result", result, "protocol", "quic")
 	return "", "", needMore
 }
 
@@ -93,6 +100,7 @@ func (s *Sniffer) SniffMetadata(conn net.Conn) (net.Conn, string, string) {
 
 	data := make([]byte, 0, 4096)
 	tmp := make([]byte, 4096)
+	failureResult := "failure"
 	for len(data) < s.maxBytes {
 		remaining := s.maxBytes - len(data)
 		if remaining < len(tmp) {
@@ -102,9 +110,11 @@ func (s *Sniffer) SniffMetadata(conn net.Conn) (net.Conn, string, string) {
 		if n > 0 {
 			data = append(data, tmp[:n]...)
 			if domain, _ := tls.SniffSNIWithStatus(data); domain != "" {
+				commonmetrics.Inc("bypasscore_sniff_total", "network", "tcp", "result", "success", "protocol", "tls")
 				return &prependConn{Conn: conn, buf: data}, domain, "tls"
 			}
 			if domain := http.SniffHost(data); domain != "" {
+				commonmetrics.Inc("bypasscore_sniff_total", "network", "tcp", "result", "success", "protocol", "http")
 				return &prependConn{Conn: conn, buf: data}, domain, "http"
 			}
 			if !sniffNeedsMore(data, s.maxBytes) {
@@ -112,9 +122,13 @@ func (s *Sniffer) SniffMetadata(conn net.Conn) (net.Conn, string, string) {
 			}
 		}
 		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				failureResult = "timeout"
+			}
 			break
 		}
 	}
+	commonmetrics.Inc("bypasscore_sniff_total", "network", "tcp", "result", failureResult, "protocol", "unknown")
 	if len(data) == 0 {
 		return conn, "", ""
 	}

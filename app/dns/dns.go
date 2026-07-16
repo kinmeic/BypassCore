@@ -5,6 +5,7 @@ import (
 	"context"
 	go_errors "errors"
 	"fmt"
+	stdnet "net"
 	"sort"
 	"strings"
 	"sync"
@@ -210,6 +211,14 @@ func (s *DNS) Start() error {
 // routing/outbound data plane. It is intended to be called during startup,
 // before queries are served.
 func (s *DNS) SetDialer(dial Dialer) {
+	s.SetTaggedDialer(func(ctx context.Context, dest net.Destination, _ string) (stdnet.Conn, error) {
+		return dial(ctx, dest)
+	})
+}
+
+// SetTaggedDialer attaches routing to every non-local upstream and supplies
+// the upstream's native outboundTag to the caller.
+func (s *DNS) SetTaggedDialer(dial TaggedDialer) {
 	if dial == nil {
 		return
 	}
@@ -218,9 +227,32 @@ func (s *DNS) SetDialer(dial Dialer) {
 			continue
 		}
 		if server, ok := client.server.(routedNameServer); ok {
-			server.SetDialer(dial)
+			outboundTag := client.outboundTag
+			server.SetDialer(func(ctx context.Context, dest net.Destination) (stdnet.Conn, error) {
+				return dial(ctx, dest, outboundTag)
+			})
 		}
 	}
+}
+
+// SetResultObserver installs a non-blocking caller-owned result sink hook.
+func (s *DNS) SetResultObserver(observer ResultObserver) {
+	var holder *resultObserver
+	if observer != nil {
+		holder = &resultObserver{call: observer}
+	}
+	for _, client := range s.clients {
+		client.observer.Store(holder)
+	}
+}
+
+// UpstreamStatus returns a bounded status record for configured upstreams.
+func (s *DNS) UpstreamStatus() []UpstreamStatus {
+	result := make([]UpstreamStatus, 0, len(s.clients))
+	for _, client := range s.clients {
+		result = append(result, client.upstreamStatus())
+	}
+	return result
 }
 
 // Close implements common.Closable.

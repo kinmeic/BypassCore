@@ -27,6 +27,8 @@ message NameServer {
   repeated bypasscore.common.geodata.IPRule unexpected_ip = 13;
   bool actUnprior = 14;
   uint32 policyID = 17;
+  // Optional outbound used to reach this upstream. Empty means route normally.
+  string outbound_tag = 18;
 }
 
 enum QueryStrategy {

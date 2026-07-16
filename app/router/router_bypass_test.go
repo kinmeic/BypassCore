@@ -83,6 +83,20 @@ func TestPickRoute_NoMatch(t *testing.T) {
 	}
 }
 
+func TestPickRouteFinalOutbound(t *testing.T) {
+	r := new(Router)
+	if err := r.Init(context.Background(), &Config{DomainStrategy: Config_AsIs, FinalOutboundTag: "final"}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	route, err := r.PickRoute(&testContext{targetDomain: "unmatched.example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if route.GetOutboundTag() != "final" || route.GetRuleTag() != "" {
+		t.Fatalf("unexpected final route: %#v", route)
+	}
+}
+
 func TestPickRoute_DomainSubdomainMatch(t *testing.T) {
 	// domain: rules match the domain itself and any subdomain.
 	r := buildTestRouter(t)

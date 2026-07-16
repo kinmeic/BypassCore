@@ -46,7 +46,7 @@ func (m Mode) String() string {
 }
 
 // UnmarshalJSON parses Mode from a JSON string ("freedom"/"blackhole"/"proxy").
-// Unknown values default to ModeFreedom to stay permissive.
+// Unknown values are rejected so a typo cannot silently become direct access.
 func (m *Mode) UnmarshalJSON(data []byte) error {
 	s := strings.Trim(strings.Trim(string(data), `"`), " ")
 	switch strings.ToLower(s) {

@@ -69,11 +69,11 @@ func TestUserMatcher_LiteralAndRegexMix(t *testing.T) {
 // become the bare name "curl" (no dedup is performed).
 func TestProcessNameMatcher_Classification(t *testing.T) {
 	m := NewProcessNameMatcher([]string{
-		"curl",          // bare name
-		"wget.exe",      // .exe stripped -> "wget"
-		"/usr/bin/ssh",  // abs path
-		"/usr/bin/",     // folder
-		"self/",         // match-self token
+		"curl",         // bare name
+		"wget.exe",     // .exe stripped -> "wget"
+		"/usr/bin/ssh", // abs path
+		"/usr/bin/",    // folder
+		"self/",        // match-self token
 	})
 	if !m.MatchSelf {
 		t.Error("self/ should set MatchSelf")
@@ -163,7 +163,7 @@ func TestDomainMatcher_SubstrAndSubdomain(t *testing.T) {
 		{"google.com", true},
 		{"www.google.com", true},
 		{"docs.www.google.com", true},
-		{"Google.COM", true},  // case-insensitive
+		{"Google.COM", true}, // case-insensitive
 		{"evilgoogle.com", false},
 		{"google.com.evil.com", false},
 		{"", false},

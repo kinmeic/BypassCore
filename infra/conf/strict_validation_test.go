@@ -2,6 +2,7 @@ package conf
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -9,6 +10,22 @@ func TestNetworkListRejectsUnknownValue(t *testing.T) {
 	var networks NetworkList
 	if err := json.Unmarshal([]byte(`"tpc"`), &networks); err == nil {
 		t.Fatal("unknown network was accepted")
+	}
+}
+
+func TestDNSNameServerOutboundTag(t *testing.T) {
+	var config DNSConfig
+	decoder := json.NewDecoder(strings.NewReader(`{"servers":[{"address":"1.1.1.1","outboundTag":"proxy"}]}`))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&config); err != nil {
+		t.Fatal(err)
+	}
+	built, err := config.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(built.NameServer) != 1 || built.NameServer[0].GetOutboundTag() != "proxy" {
+		t.Fatalf("outboundTag not preserved: %#v", built.NameServer)
 	}
 }
 

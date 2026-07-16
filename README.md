@@ -24,8 +24,10 @@ domain through sniffing, match routing rules, and forward through an outbound.
   plus Observatory health checks
 - Process matching on Linux, macOS, and Windows
 - `domainStrategy`: `AsIs`, `IpIfNonMatch`, and `IpOnDemand`
-- Daemon mode with graceful SIGINT/SIGTERM shutdown and transactional SIGHUP
-  routing-rule reloads
+- Unix-socket HTTP/JSON control plane for live status, readiness, validation,
+  reload, route explanation, DNS resolution, Observatory, and metrics
+- Transactional runtime snapshots: routing, outbounds, DNS, Observatory, and
+  non-binding inbound/metrics parameters reload without dropping old flows
 
 ## Quick start
 
@@ -36,6 +38,9 @@ make build
 # Show the version
 ./bin/bypasscore --version
 ./bin/bypasscore -V
+
+# Machine-readable feature negotiation (config schema included)
+./bin/bypasscore --capabilities --json
 
 # Reduce hot-path log volume in production
 ./bin/bypasscore -run -config config.json -log-level warning
@@ -106,7 +111,7 @@ Multiple upstreams, domain routing, and caching are configured as follows:
   "dns": {
     "servers": [
       {"address":"https://223.5.5.5/dns-query","domains":["domain:cn"],"tag":"cn"},
-      {"address":"tls://1.1.1.1:853","tag":"cloudflare"},
+      {"address":"tls://1.1.1.1:853","tag":"cloudflare","outboundTag":"proxy"},
       "localhost"
     ],
     "queryStrategy":"UseIP"
@@ -128,7 +133,17 @@ traffic, so they can use a selected WAN or SOCKS5 proxy. Use
 `udp+local://`, `tcp+local://`, `tls+local://`, or `https+local://` for direct
 queries outside the routing core. `localhost` always uses the system resolver.
 DNS routing carries `protocol: dns` and a recursion guard, allowing dedicated
-protocol or inboundTag rules.
+protocol or inboundTag rules. A server-level `outboundTag` bypasses synthetic
+DNS routing rules and forces that upstream through the named outbound; config
+validation rejects unknown tags.
+
+Successful A/AAAA results can be emitted to a local Unix datagram consumer for
+a lightweight nftables/NFTSet updater. Delivery is bounded and non-blocking;
+the event contains `domain`, `ips`, `ttl`, `serverTag`, and `timestamp`:
+
+```json
+{"dnsResultEvents":{"socket":"/run/bypasscore/dns-results.sock","queueSize":1024,"maxDatagramBytes":8192}}
+```
 
 To expose the internal resolver to dnsmasq or LAN clients, add a DNS inbound:
 
@@ -222,11 +237,51 @@ disabled unless explicitly enabled.
 {"metrics":{"listen":"127.0.0.1:9090","allowedClients":["127.0.0.0/8"],"enablePprof":false}}
 ```
 
-Endpoints are `/healthz`, `/metrics`, and, when enabled,
-`/debug/pprof/`. Send `SIGHUP` to validate and atomically replace routing
-rules. Outbound, DNS, inbound, Observatory, and metrics changes are rejected
-during reload and require a restart, so the old live configuration remains
-intact on every failure.
+Endpoints are `/healthz`, `/readyz`, `/metrics`, and, when enabled,
+`/debug/pprof/`. `/healthz` is liveness; `/readyz` becomes successful only
+after all configured inbounds have started.
+
+Enable the local control plane (it never opens a TCP port):
+
+```json
+{"control":{"enabled":true,"socket":"/run/bypasscore/control.sock","mode":"0660","maxRequestBytes":1048576,"maxConcurrentRequests":32}}
+```
+
+It speaks HTTP/JSON over the Unix socket:
+
+| Method and path | Purpose |
+|---|---|
+| `GET /v1/status` | Live revision/hash, listeners, DNS/outbound status, Observatory, last reload |
+| `GET /v1/capabilities` | Version, config schema, feature list |
+| `GET /v1/ready` | Structured readiness |
+| `POST /v1/config/validate` | Validate a JSON config without activating it |
+| `POST /v1/config/reload` | Transactionally activate a JSON config; empty body reloads `-config` |
+| `POST /v1/route/explain` | Explain a route for `{"destination":"tcp:example.com:443"}` |
+| `POST /v1/dns/resolve` | Resolve with the running DNS state |
+| `GET /v1/observatory` | Current probe results |
+| `GET /v1/metrics` | Metrics as JSON |
+
+Example: `curl --unix-socket /run/bypasscore/control.sock http://localhost/v1/status`.
+`SIGHUP` uses the same transactional reload path. A candidate runtime is fully
+built and validated before one atomic swap. Existing TCP/UDP flows retain the
+old snapshot and drain naturally; after 30 seconds the retired snapshot is
+force-closed. Routing, outbounds, DNS, Observatory, DNS result events, and
+inbound/metrics parameters can change live. Adding/removing listeners or
+changing an inbound address, port, type, network, TLS files, DoH path, metrics
+listen address, or control socket returns `restart_required` and leaves the
+running revision intact.
+
+Routing may declare an explicit default instead of a catch-all rule:
+
+```json
+{"routing":{"domainStrategy":"AsIs","finalOutboundTag":"proxy","rules":[]}}
+```
+
+Metrics include low-cardinality rule hits, active outbound connections,
+upload/download bytes, outbound dial status/latency, DNS upstream status and
+latency, sniff results, revision, and reload outcomes. On reload, series whose
+configured tags no longer exist are removed to bound memory over the process
+lifetime.
 
 ## Configuration
 

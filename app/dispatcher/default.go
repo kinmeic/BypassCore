@@ -12,6 +12,7 @@ import (
 	"context"
 	stderrors "errors"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/eugene/bypasscore/app/dialer"
@@ -30,17 +31,21 @@ import (
 type Dispatcher struct {
 	router  routing.Router
 	ohm     DialerManager
-	sniffer *Sniffer
+	sniffer atomic.Pointer[Sniffer]
 }
 
 // New creates a Dispatcher.
 func New(router routing.Router, ohm DialerManager, sniffer *Sniffer) *Dispatcher {
-	return &Dispatcher{
-		router:  router,
-		ohm:     ohm,
-		sniffer: sniffer,
+	d := &Dispatcher{
+		router: router,
+		ohm:    ohm,
 	}
+	d.sniffer.Store(sniffer)
+	return d
 }
+
+// SetSniffer atomically changes sniffing settings for new connections.
+func (d *Dispatcher) SetSniffer(sniffer *Sniffer) { d.sniffer.Store(sniffer) }
 
 // Dispatch handles a single accepted inbound connection. It blocks until the
 // connection is closed (both directions copied). The caller (inbound listener)
@@ -60,9 +65,9 @@ func (d *Dispatcher) Dispatch(ctx context.Context, conn net.Conn, dest bcnet.Des
 	// Sniff the first bytes to recover the domain (if enabled).
 	// Sniff returns a new conn that replays the consumed bytes, so the
 	// outbound stream is not truncated.
-	if d.sniffer != nil {
+	if sniffer := d.sniffer.Load(); sniffer != nil {
 		var sniffed, protocol string
-		conn, sniffed, protocol = d.sniffer.SniffMetadata(conn)
+		conn, sniffed, protocol = sniffer.SniffMetadata(conn)
 		content.Protocol = protocol
 		if protocol == "http" {
 			if replay, ok := conn.(*prependConn); ok {
@@ -80,6 +85,22 @@ func (d *Dispatcher) Dispatch(ctx context.Context, conn net.Conn, dest bcnet.Des
 		}
 	}
 	rctx := buildRoutingContext(ctx, outboundSession)
+	if plane, ok := d.router.(RoutedDialer); ok {
+		outbound, outTag, _, usedDefault, err := plane.DialRouted(ctx, rctx, originalDest)
+		if err != nil {
+			_ = conn.Close()
+			return errors.New("route or outbound dial failed for ", dest.String()).Base(err)
+		}
+		result := "matched"
+		if usedDefault {
+			result = "default"
+		}
+		commonmetrics.Inc("bypasscore_route_decisions_total", "outbound", outTag, "result", result)
+		err = transport.Bridge(conn, outbound)
+		_ = conn.Close()
+		_ = outbound.Close()
+		return err
+	}
 
 	// Route: ask the router which outbound tag to use.
 	route, err := d.router.PickRoute(rctx)
@@ -144,6 +165,13 @@ type DialerManager interface {
 	GetDefaultDialer() dialer.Dialer
 }
 
+// RoutedDialer lets a hot-reloadable data plane choose the route, resolve the
+// outbound and acquire the connection from one immutable runtime snapshot.
+// This avoids a reload race between PickRoute and GetDialer.
+type RoutedDialer interface {
+	DialRouted(context.Context, routing.Context, bcnet.Destination) (net.Conn, string, string, bool, error)
+}
+
 // DialOutbound routes the destination via the router and dials the chosen
 // outbound. It's used by the UDP tproxy listener which can't use Dispatch
 // (Dispatch is stream-oriented, not packet-oriented).
@@ -163,10 +191,11 @@ func (d *Dispatcher) DialOutboundPackets(ctx context.Context, dest bcnet.Destina
 // SniffPacketMetadata exposes the bounded packet sniffer to the UDP session so
 // it can collect another Initial packet only when the parser asks for it.
 func (d *Dispatcher) SniffPacketMetadata(packets [][]byte) (string, string, bool) {
-	if d.sniffer == nil {
+	sniffer := d.sniffer.Load()
+	if sniffer == nil {
 		return "", "", false
 	}
-	return d.sniffer.SniffPacketMetadata(packets)
+	return sniffer.SniffPacketMetadata(packets)
 }
 
 func (d *Dispatcher) dialOutboundPackets(ctx context.Context, dest bcnet.Destination, packets [][]byte) (net.Conn, error) {
@@ -185,6 +214,13 @@ func (d *Dispatcher) dialOutboundPackets(ctx context.Context, dest bcnet.Destina
 		errors.LogDebug(ctx, "sniffed UDP domain: ", domain, " for ", dest.String())
 	}
 	rctx := buildRoutingContext(ctx, outboundSession)
+	if plane, ok := d.router.(RoutedDialer); ok {
+		conn, _, _, _, err := plane.DialRouted(ctx, rctx, dest)
+		if err != nil {
+			return nil, errors.New("route or outbound dial failed for ", dest.String()).Base(err)
+		}
+		return conn, nil
+	}
 
 	// Route.
 	route, err := d.router.PickRoute(rctx)

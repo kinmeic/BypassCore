@@ -2,13 +2,17 @@ package dns
 
 import (
 	"context"
+	stderrors "errors"
 	"net"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/eugene/bypasscore/common/errors"
 	"github.com/eugene/bypasscore/common/geodata"
+	commonmetrics "github.com/eugene/bypasscore/common/metrics"
 	bcnet "github.com/eugene/bypasscore/common/net"
 	"github.com/eugene/bypasscore/common/session"
 	"github.com/eugene/bypasscore/common/utils"
@@ -27,6 +31,10 @@ type Server interface {
 
 // Dialer routes a DNS transport connection to its configured destination.
 type Dialer func(context.Context, bcnet.Destination) (net.Conn, error)
+
+// TaggedDialer optionally forces a DNS transport through a configured
+// outbound. An empty tag preserves normal routing semantics.
+type TaggedDialer func(context.Context, bcnet.Destination, string) (net.Conn, error)
 
 type routedNameServer interface {
 	SetDialer(Dialer)
@@ -52,6 +60,31 @@ type Client struct {
 	checkSystem   bool
 	policyID      uint32
 	localDirect   bool
+	outboundTag   string
+	metricTag     string
+	observer      atomic.Pointer[resultObserver]
+	statusMu      sync.RWMutex
+	status        UpstreamStatus
+}
+
+type Result struct {
+	Domain    string     `json:"domain"`
+	IPs       []bcnet.IP `json:"-"`
+	TTL       uint32     `json:"ttl"`
+	ServerTag string     `json:"serverTag"`
+	At        time.Time  `json:"at"`
+}
+
+type ResultObserver func(Result)
+type resultObserver struct{ call ResultObserver }
+
+type UpstreamStatus struct {
+	ServerTag     string    `json:"serverTag"`
+	Name          string    `json:"name"`
+	LastSuccess   time.Time `json:"lastSuccess,omitempty"`
+	LastFailure   time.Time `json:"lastFailure,omitempty"`
+	LastLatencyMs int64     `json:"lastLatencyMs,omitempty"`
+	LastError     string    `json:"lastError,omitempty"`
 }
 
 // NewServer creates a transport Server from a destination URL. It dispatches on
@@ -152,6 +185,12 @@ func NewClient(
 
 	client.server = server
 	client.localDirect = isLocalDNSAddress(ns.Address.AsDestination())
+	client.outboundTag = ns.OutboundTag
+	client.metricTag = ns.Tag
+	if client.metricTag == "" {
+		client.metricTag = "_default"
+	}
+	client.status = UpstreamStatus{ServerTag: client.metricTag, Name: server.Name()}
 	client.skipFallback = ns.SkipFallback
 	client.expectedIPs = expectedMatcher
 	client.unexpectedIPs = unexpectedMatcher
@@ -172,6 +211,7 @@ func (c *Client) Name() string { return c.server.Name() }
 // QueryIP sends a DNS query to the underlying server, applying query-strategy
 // and expected/unexpected IP filtering.
 func (c *Client) QueryIP(ctx context.Context, domain string, option dns_feature.IPOption) ([]bcnet.IP, uint32, error) {
+	started := time.Now()
 	if c.checkSystem {
 		supportIPv4, supportIPv6 := utils.CheckRoutes()
 		option.IPv4Enable = option.IPv4Enable && supportIPv4
@@ -190,6 +230,7 @@ func (c *Client) QueryIP(ctx context.Context, domain string, option dns_feature.
 	ctx = session.ContextWithContent(ctx, &session.Content{Protocol: "dns", SkipDNSResolve: true})
 	ips, ttl, err := c.server.QueryIP(ctx, domain, option)
 	cancel()
+	c.recordQuery(started, err)
 
 	if err != nil {
 		return nil, 0, err
@@ -226,6 +267,9 @@ func (c *Client) QueryIP(ctx context.Context, domain string, option dns_feature.
 			errors.LogDebug(context.Background(), "domain ", domain, " unpriorIPs ", ips, " matched at server ", c.Name())
 		}
 	}
+	if observer := c.observer.Load(); observer != nil {
+		observer.call(Result{Domain: domain, IPs: append([]bcnet.IP(nil), ips...), TTL: ttl, ServerTag: c.metricTag, At: time.Now()})
+	}
 	return ips, ttl, nil
 }
 
@@ -241,7 +285,40 @@ func (c *Client) QueryRaw(ctx context.Context, query []byte) ([]byte, error) {
 	defer cancel()
 	ctx = session.ContextWithInbound(ctx, &session.Inbound{Tag: c.tag})
 	ctx = session.ContextWithContent(ctx, &session.Content{Protocol: "dns", SkipDNSResolve: true})
-	return server.QueryRaw(ctx, query)
+	started := time.Now()
+	response, err := server.QueryRaw(ctx, query)
+	c.recordQuery(started, err)
+	return response, err
+}
+
+func (c *Client) recordQuery(started time.Time, err error) {
+	latency := time.Since(started)
+	result := "success"
+	if err != nil {
+		result = "error"
+		if netErr, ok := err.(net.Error); (ok && netErr.Timeout()) || stderrors.Is(err, context.DeadlineExceeded) {
+			result = "timeout"
+		}
+	}
+	commonmetrics.Inc("bypasscore_dns_upstream_queries_total", "server", c.metricTag, "result", result)
+	commonmetrics.Add("bypasscore_dns_upstream_latency_nanoseconds_total", latency.Nanoseconds(), "server", c.metricTag)
+	now := time.Now()
+	c.statusMu.Lock()
+	c.status.LastLatencyMs = latency.Milliseconds()
+	if err == nil {
+		c.status.LastSuccess = now
+		c.status.LastError = ""
+	} else {
+		c.status.LastFailure = now
+		c.status.LastError = err.Error()
+	}
+	c.statusMu.Unlock()
+}
+
+func (c *Client) upstreamStatus() UpstreamStatus {
+	c.statusMu.RLock()
+	defer c.statusMu.RUnlock()
+	return c.status
 }
 
 func isLocalDNSAddress(dest bcnet.Destination) bool {

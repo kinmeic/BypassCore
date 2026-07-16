@@ -21,3 +21,15 @@ func TestRegistryPrometheusOutput(t *testing.T) {
 		t.Fatalf("unexpected metrics:\n%s", text)
 	}
 }
+
+func TestRetainLabelValues(t *testing.T) {
+	ResetForTest()
+	Inc("connections_total", "outbound", "old", "result", "success")
+	Inc("connections_total", "outbound", "current", "result", "success")
+	RetainLabelValues(map[string]map[string]struct{}{"outbound": {"current": {}}})
+	Inc("connections_total", "outbound", "old", "result", "success")
+	samples := Snapshot()
+	if len(samples) != 1 || !strings.Contains(samples[0].Labels, `outbound="current"`) {
+		t.Fatalf("unexpected retained samples: %#v", samples)
+	}
+}

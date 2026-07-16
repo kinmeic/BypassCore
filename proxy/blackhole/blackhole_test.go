@@ -106,12 +106,12 @@ func (s *stringConn) Read(p []byte) (int, error) {
 	s.data = s.data[n:]
 	return n, nil
 }
-func (s *stringConn) Write(p []byte) (int, error) { return len(p), nil }
-func (s *stringConn) Close() error                { s.closed = true; return nil }
-func (s *stringConn) LocalAddr() net.Addr         { return &net.IPAddr{} }
-func (s *stringConn) RemoteAddr() net.Addr        { return &net.IPAddr{} }
-func (s *stringConn) SetDeadline(t time.Time) error { return nil }
-func (s *stringConn) SetReadDeadline(t time.Time) error { return nil }
+func (s *stringConn) Write(p []byte) (int, error)        { return len(p), nil }
+func (s *stringConn) Close() error                       { s.closed = true; return nil }
+func (s *stringConn) LocalAddr() net.Addr                { return &net.IPAddr{} }
+func (s *stringConn) RemoteAddr() net.Addr               { return &net.IPAddr{} }
+func (s *stringConn) SetDeadline(t time.Time) error      { return nil }
+func (s *stringConn) SetReadDeadline(t time.Time) error  { return nil }
 func (s *stringConn) SetWriteDeadline(t time.Time) error { return nil }
 
 // byteBufConn collects written bytes for assertions.
@@ -125,9 +125,9 @@ func (c *byteBufConn) Write(p []byte) (int, error) {
 	c.buf = append(c.buf, p...)
 	return len(p), nil
 }
-func (c *byteBufConn) Close() error                     { return nil }
-func (c *byteBufConn) LocalAddr() net.Addr              { return &net.IPAddr{} }
-func (c *byteBufConn) RemoteAddr() net.Addr             { return &net.IPAddr{} }
-func (c *byteBufConn) SetDeadline(t time.Time) error { return nil }
-func (c *byteBufConn) SetReadDeadline(t time.Time) error { return nil }
+func (c *byteBufConn) Close() error                       { return nil }
+func (c *byteBufConn) LocalAddr() net.Addr                { return &net.IPAddr{} }
+func (c *byteBufConn) RemoteAddr() net.Addr               { return &net.IPAddr{} }
+func (c *byteBufConn) SetDeadline(t time.Time) error      { return nil }
+func (c *byteBufConn) SetReadDeadline(t time.Time) error  { return nil }
 func (c *byteBufConn) SetWriteDeadline(t time.Time) error { return nil }

@@ -581,3 +581,16 @@ func FuzzDNSListenerHandleQuery(f *testing.F) {
 		}
 	})
 }
+
+func TestDNSListenerReloadAdoptsNewConfig(t *testing.T) {
+	initial := &Config{Tag: "old", Type: "dns", Listen: "127.0.0.1", Port: 53, Network: "udp"}
+	next := &Config{Tag: "new", Type: "dns", Listen: "127.0.0.1", Port: 53, Network: "udp", MaxConcurrentQueries: 7}
+	listener := NewDNS(initial, &stubDNSClient{})
+	listener.state = dnsListenerRunning
+	if err := listener.Reload(next); err != nil {
+		t.Fatal(err)
+	}
+	if listener.cfg != next || listener.inboundTag() != "new" || cap(listener.currentPolicy().querySlots) != 7 {
+		t.Fatal("DNS listener retained its initial configuration after reload")
+	}
+}

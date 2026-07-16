@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/eugene/bypasscore/app/dispatcher"
@@ -31,10 +32,11 @@ type Listener struct {
 	connMu      sync.Mutex
 	activeConns map[net.Conn]struct{}
 
-	ctx     context.Context
-	cancel  context.CancelFunc
-	stateMu sync.Mutex
-	state   listenerState
+	ctx        context.Context
+	cancel     context.CancelFunc
+	stateMu    sync.Mutex
+	state      listenerState
+	runtimeTag atomic.Pointer[string]
 }
 
 type listenerState uint8
@@ -48,11 +50,122 @@ const (
 
 // New creates a Listener.
 func New(cfg *Config, d *dispatcher.Dispatcher) *Listener {
-	return &Listener{
+	l := &Listener{
 		cfg:         cfg,
 		dispatcher:  d,
 		activeConns: make(map[net.Conn]struct{}),
 	}
+	if cfg != nil {
+		l.setTag(cfg.Tag)
+	}
+	return l
+}
+
+func (l *Listener) setTag(tag string) { value := tag; l.runtimeTag.Store(&value) }
+func (l *Listener) inboundTag() string {
+	if value := l.runtimeTag.Load(); value != nil {
+		return *value
+	}
+	return ""
+}
+
+// Reload applies parameters that do not require rebinding the transparent
+// sockets. Existing flows keep their current resources; new flows use the new
+// sniffing and UDP limits.
+func (l *Listener) Reload(cfg *Config) error {
+	if err := ValidateConfig(cfg); err != nil {
+		return err
+	}
+	l.stateMu.Lock()
+	defer l.stateMu.Unlock()
+	if l.state != listenerRunning {
+		return errors.New("inbound: listener is not running")
+	}
+	if !SameListenerBinding(l.cfg, cfg) {
+		return errors.New("inbound: listen identity changed")
+	}
+	sniffer, err := dispatcher.NewSnifferWithOptions(cfg.Sniffing, cfg.SniffingTimeoutMs, cfg.SniffingMaxBytes)
+	if err != nil {
+		return err
+	}
+	var limits udpResourceLimits
+	if l.udpListener != nil {
+		limits, err = udpResourceLimitsFromConfig(cfg)
+		if err != nil {
+			return err
+		}
+	}
+	l.dispatcher.SetSniffer(sniffer)
+	l.setTag(cfg.Tag)
+	if l.udpListener != nil {
+		l.udpListener.setTag(cfg.Tag)
+		l.udpListener.setLimits(limits)
+	}
+	l.cfg = cfg
+	return nil
+}
+
+// SameListenerBinding reports whether two configs use the same kernel sockets.
+func SameListenerBinding(left, right *Config) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return normalizedInboundType(left.Type) == normalizedInboundType(right.Type) &&
+		normalizedInboundListen(left) == normalizedInboundListen(right) && left.Port == right.Port &&
+		normalizedInboundNetwork(left) == normalizedInboundNetwork(right)
+}
+
+func normalizedInboundListen(cfg *Config) string {
+	value := strings.Trim(strings.TrimSpace(cfg.Listen), "[]")
+	if value == "" {
+		typ := normalizedInboundType(cfg.Type)
+		if typ == "dns" || typ == "dot" || typ == "doh" {
+			return "127.0.0.1"
+		}
+	}
+	return value
+}
+
+func normalizedInboundType(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return "redirect"
+	}
+	return value
+}
+
+func normalizedInboundNetwork(config *Config) string {
+	value := strings.TrimSpace(config.Network)
+	if value == "" {
+		typeName := normalizedInboundType(config.Type)
+		if typeName == "dns" {
+			return "tcp,udp"
+		}
+		return "tcp"
+	}
+	tcp, udp, err := parseInboundNetworks(value)
+	if err != nil {
+		return strings.ToLower(value)
+	}
+	if tcp && udp {
+		return "tcp,udp"
+	}
+	if udp {
+		return "udp"
+	}
+	return "tcp"
+}
+
+// EffectiveDNSDoHPath returns the listener path after applying its default.
+func EffectiveDNSDoHPath(config *Config) string {
+	if config == nil {
+		return ""
+	}
+	path := strings.TrimSpace(config.DNSDoHPath)
+	if path == "" {
+		return "/dns-query"
+	}
+	return path
 }
 
 // Start begins listening on TCP and/or UDP based on the network config.
@@ -109,13 +222,13 @@ func (l *Listener) startLocked() error {
 	}
 
 	if wantTCP {
-		addr := net.JoinHostPort(l.cfg.Listen, strconv.Itoa(l.cfg.Port))
+		addr := net.JoinHostPort(normalizedInboundListen(l.cfg), strconv.Itoa(l.cfg.Port))
 		ln, err := listenTCP(l.cfg, addr)
 		if err != nil {
 			return errors.New("inbound TCP listen failed: ", addr).Base(err)
 		}
 		l.tcpListener = ln
-		errors.LogInfo(context.Background(), "inbound[", l.cfg.Tag, "] listening on tcp://", addr)
+		errors.LogInfo(context.Background(), "inbound[", l.inboundTag(), "] listening on tcp://", addr)
 		l.wg.Add(1)
 		go l.acceptLoop()
 	}
@@ -248,7 +361,7 @@ func (l *Listener) handleConn(conn net.Conn) {
 	ctx := session.ContextWithInbound(l.ctx, &session.Inbound{
 		Source: bcnet.DestinationFromAddr(conn.RemoteAddr()),
 		Local:  bcnet.DestinationFromAddr(conn.LocalAddr()),
-		Tag:    l.cfg.Tag,
+		Tag:    l.inboundTag(),
 	})
 	ctx = session.ContextWithContent(ctx, new(session.Content))
 

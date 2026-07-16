@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/signal"
 	"runtime"
@@ -16,9 +17,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/eugene/bypasscore/app/control"
 	"github.com/eugene/bypasscore/app/dialer"
 	"github.com/eugene/bypasscore/app/dispatcher"
 	appdns "github.com/eugene/bypasscore/app/dns"
+	"github.com/eugene/bypasscore/app/dnsevent"
 	appinbound "github.com/eugene/bypasscore/app/inbound"
 	appmetrics "github.com/eugene/bypasscore/app/metrics"
 	"github.com/eugene/bypasscore/app/observatory"
@@ -29,6 +32,7 @@ import (
 	bcsession "github.com/eugene/bypasscore/common/session"
 	"github.com/eugene/bypasscore/core"
 	featdns "github.com/eugene/bypasscore/features/dns"
+	featrouting "github.com/eugene/bypasscore/features/routing"
 	routingsession "github.com/eugene/bypasscore/features/routing/session"
 	"github.com/eugene/bypasscore/infra/conf"
 	"github.com/eugene/bypasscore/proxy/blackhole"
@@ -38,16 +42,18 @@ import (
 
 // Config is the top-level BypassCore config (outbounds + routing + dns + inbounds).
 type Config struct {
-	Outbounds   []*appoutbound.Outbound `json:"outbounds"`
-	Routing     conf.RouterConfig       `json:"routing"`
-	DNS         *conf.DNSConfig         `json:"dns"`
-	Inbounds    []*appinbound.Config    `json:"inbounds"`
-	Observatory *observatory.Config     `json:"observatory"`
-	Metrics     *appmetrics.Config      `json:"metrics,omitempty"`
+	Outbounds       []*appoutbound.Outbound `json:"outbounds"`
+	Routing         conf.RouterConfig       `json:"routing"`
+	DNS             *conf.DNSConfig         `json:"dns"`
+	Inbounds        []*appinbound.Config    `json:"inbounds"`
+	Observatory     *observatory.Config     `json:"observatory"`
+	Metrics         *appmetrics.Config      `json:"metrics,omitempty"`
+	Control         *control.Config         `json:"control,omitempty"`
+	DNSResultEvents *dnsevent.Config        `json:"dnsResultEvents,omitempty"`
 }
 
 // version is overridden by release builds with -ldflags=-X main.version=... .
-var version = "1.0.9"
+var version = "1.0.10"
 var commit = "unknown"
 var buildDate = "unknown"
 
@@ -67,6 +73,8 @@ func run() error {
 	checkConfig := flag.Bool("check-config", false, "validate configuration and exit")
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warning, error")
 	showVersion := false
+	showCapabilities := flag.Bool("capabilities", false, "print supported capabilities and exit")
+	jsonOutput := flag.Bool("json", false, "use JSON output where supported")
 	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 	flag.BoolVar(&showVersion, "V", false, "print version and exit")
 	flag.Parse()
@@ -77,14 +85,28 @@ func run() error {
 		fmt.Printf("BypassCore %s (commit=%s, built=%s, go=%s)\n", version, commit, buildDate, runtime.Version())
 		return nil
 	}
+	if *showCapabilities {
+		value := capabilities()
+		if *jsonOutput {
+			return json.NewEncoder(os.Stdout).Encode(value)
+		}
+		fmt.Printf("BypassCore %s, config schema %d\n", value.Version, value.ConfigSchema)
+		for _, feature := range value.Features {
+			fmt.Println(feature)
+		}
+		return nil
+	}
 
-	cfg, err := loadConfig(*configPath)
+	cfg, configHash, err := loadConfigAndHash(*configPath)
 	if err != nil {
 		return errors.New("load config: ").Base(err)
 	}
 
 	// Build the outbound manager from the descriptor table.
 	registerDialerFactory()
+	if *runMode {
+		return runRuntimeDaemon(context.Background(), *configPath, cfg, configHash)
+	}
 	ohm := appoutbound.NewManager(&appoutbound.Config{Outbounds: cfg.Outbounds})
 	if err := ohm.Validate(); err != nil {
 		return errors.New("outbound config: ").Base(err)
@@ -151,27 +173,20 @@ func run() error {
 	}
 	if routedDNS != nil {
 		dnsDispatcher := dispatcher.New(r, ohm, nil)
-		routedDNS.SetDialer(dnsDispatcher.DialOutbound)
+		routedDNS.SetTaggedDialer(func(ctx context.Context, destination bcnet.Destination, outboundTag string) (net.Conn, error) {
+			if outboundTag == "" {
+				return dnsDispatcher.DialOutbound(ctx, destination)
+			}
+			selected := ohm.GetDialer(outboundTag)
+			if selected == nil {
+				return nil, errors.New("DNS outbound not found: ", outboundTag)
+			}
+			return selected.Dial(ctx, destination)
+		})
 	}
 
 	// Choose the requested operating mode.
 	switch {
-	case *runMode:
-		var metricsServer *appmetrics.Server
-		if cfg.Metrics != nil {
-			metricsServer, err = appmetrics.New(cfg.Metrics)
-			if err != nil {
-				return errors.New("metrics config: ").Base(err)
-			}
-			if err := metricsServer.Start(); err != nil {
-				return errors.New("start metrics: ").Base(err)
-			}
-			defer metricsServer.Close()
-		}
-		reload := func() error { return reloadRoutingConfig(*configPath, cfg, r, ohm) }
-		if err := runDaemonWithReload(r, ohm, dnsClient, cfg.Inbounds, baseCtx, reload); err != nil {
-			return errors.New("run: ").Base(err)
-		}
 	case *resolve != "":
 		if err := runResolve(dnsClient, *resolve); err != nil {
 			return errors.New("resolve: ").Base(err)
@@ -254,6 +269,9 @@ func validateRoutingTargets(cfg *router.Config, ohm *appoutbound.Manager) error 
 	if cfg == nil {
 		return errors.New("nil routing config")
 	}
+	if tag := cfg.GetFinalOutboundTag(); tag != "" && ohm.GetOutbound(tag) == nil {
+		return errors.New("routing finalOutboundTag references unknown outbound: ", tag)
+	}
 	for _, rule := range cfg.Rule {
 		if rule == nil {
 			return errors.New("nil routing rule")
@@ -277,6 +295,10 @@ func validateRoutingTargets(cfg *router.Config, ohm *appoutbound.Manager) error 
 }
 
 func validateRuntimeConfig(cfg *Config) error {
+	return validateRuntimeConfigWithOutbounds(cfg, nil)
+}
+
+func validateRuntimeConfigWithOutbounds(cfg *Config, ohm *appoutbound.Manager) error {
 	seen := make(map[string]struct{}, len(cfg.Inbounds))
 	for index, inbound := range cfg.Inbounds {
 		if err := appinbound.ValidateConfig(inbound); err != nil {
@@ -291,8 +313,19 @@ func validateRuntimeConfig(cfg *Config) error {
 		}
 	}
 	if cfg.DNS != nil {
-		if _, err := cfg.DNS.Build(); err != nil {
+		dnsConfig, err := cfg.DNS.Build()
+		if err != nil {
 			return errors.New("build dns config: ").Base(err)
+		}
+		if ohm != nil {
+			for _, server := range dnsConfig.NameServer {
+				if tag := server.GetOutboundTag(); tag != "" && ohm.GetOutbound(tag) == nil {
+					return errors.New("DNS server ", server.GetTag(), " references unknown outbound: ", tag)
+				}
+				if tag := server.GetOutboundTag(); tag != "" && dnsServerIsLocal(server.Address.AsDestination()) {
+					return errors.New("DNS server ", server.GetTag(), " cannot combine outboundTag with localhost or a +local transport")
+				}
+			}
 		}
 	}
 	if cfg.Metrics != nil {
@@ -304,52 +337,34 @@ func validateRuntimeConfig(cfg *Config) error {
 			return errors.New("metrics config: ").Base(err)
 		}
 	}
+	if cfg.Control != nil && cfg.Control.Enabled {
+		if err := control.Validate(cfg.Control); err != nil {
+			return errors.New("control config: ").Base(err)
+		}
+	}
+	if cfg.DNSResultEvents != nil {
+		if cfg.DNS == nil {
+			return errors.New("dnsResultEvents requires a DNS configuration")
+		}
+		sink, err := dnsevent.New(cfg.DNSResultEvents)
+		if err != nil {
+			return errors.New("dnsResultEvents config: ").Base(err)
+		}
+		_ = sink.Close()
+	}
 	return nil
 }
 
-func reloadRoutingConfig(path string, running *Config, r *router.Router, ohm *appoutbound.Manager) error {
-	next, err := loadConfig(path)
-	if err != nil {
-		return errors.New("reload config: ").Base(err)
+func dnsServerIsLocal(destination bcnet.Destination) bool {
+	if !destination.Address.Family().IsDomain() {
+		return false
 	}
-	if err := validateRuntimeConfig(next); err != nil {
-		return err
+	raw := strings.ToLower(destination.Address.Domain())
+	if raw == "localhost" {
+		return true
 	}
-	if !sameImmutableConfig(running, next) {
-		return errors.New("reload rejected: outbounds, DNS, inbounds, observatory, and metrics require restart")
-	}
-	nextRouter, err := next.Routing.Build()
-	if err != nil {
-		return errors.New("build reloaded routing config: ").Base(err)
-	}
-	if err := validateRoutingTargets(nextRouter, ohm); err != nil {
-		return errors.New("reloaded routing config: ").Base(err)
-	}
-	if err := r.ReloadRules(nextRouter, false); err != nil {
-		return errors.New("apply reloaded routing config: ").Base(err)
-	}
-	running.Routing = next.Routing
-	return nil
-}
-
-func sameImmutableConfig(left, right *Config) bool {
-	leftValue := struct {
-		Outbounds   []*appoutbound.Outbound
-		DNS         *conf.DNSConfig
-		Inbounds    []*appinbound.Config
-		Observatory *observatory.Config
-		Metrics     *appmetrics.Config
-	}{left.Outbounds, left.DNS, left.Inbounds, left.Observatory, left.Metrics}
-	rightValue := struct {
-		Outbounds   []*appoutbound.Outbound
-		DNS         *conf.DNSConfig
-		Inbounds    []*appinbound.Config
-		Observatory *observatory.Config
-		Metrics     *appmetrics.Config
-	}{right.Outbounds, right.DNS, right.Inbounds, right.Observatory, right.Metrics}
-	leftJSON, leftErr := json.Marshal(leftValue)
-	rightJSON, rightErr := json.Marshal(rightValue)
-	return leftErr == nil && rightErr == nil && string(leftJSON) == string(rightJSON)
+	separator := strings.Index(raw, "://")
+	return separator > 0 && strings.HasSuffix(raw[:separator], "+local")
 }
 
 func runTest(r *router.Router, ohm *appoutbound.Manager, dest string) error {
@@ -454,7 +469,7 @@ func runDaemon(r *router.Router, ohm *appoutbound.Manager, dnsClient featdns.Cli
 	return runDaemonWithReload(r, ohm, dnsClient, inbounds, baseCtx, nil)
 }
 
-func runDaemonWithReload(r *router.Router, ohm *appoutbound.Manager, dnsClient featdns.Client, inbounds []*appinbound.Config, baseCtx context.Context, reload func() error) error {
+func runDaemonWithReload(r featrouting.Router, ohm dispatcher.DialerManager, dnsClient featdns.Client, inbounds []*appinbound.Config, baseCtx context.Context, reload func() error) error {
 	// Start all inbound listeners.
 	type listener interface {
 		Start() error
@@ -490,18 +505,27 @@ func runDaemonWithReload(r *router.Router, ohm *appoutbound.Manager, dnsClient f
 			closeListeners()
 			return errors.New("failed to start inbound ", ibCfg.Tag).Base(err)
 		}
+		if live, ok := r.(*runtimeService); ok {
+			if reloadable, ok := ln.(reloadableInbound); ok {
+				live.registerInbound(reloadable)
+			}
+		}
 		listeners = append(listeners, ln)
 	}
 
 	if len(listeners) == 0 {
 		return errors.New("no inbounds configured; nothing to listen on")
 	}
+	if live, ok := r.(*runtimeService); ok {
+		live.listeners.Store(true)
+		defer live.listeners.Store(false)
+	}
 
 	fmt.Printf("BypassCore running with %d inbound(s). Ctrl+C to stop.\n", len(listeners))
 
-	// SIGHUP atomically replaces routing rules after full validation. Listener,
-	// DNS and outbound mutations are rejected because they require rebinding or
-	// draining live resources and therefore need an explicit restart.
+	// SIGHUP transactionally replaces the runtime snapshot after full validation.
+	// Existing flows drain on the old snapshot; listener binding changes are
+	// rejected with restart_required while mutable inbound policies are updated.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(sigCh)
@@ -513,9 +537,9 @@ func runDaemonWithReload(r *router.Router, ohm *appoutbound.Manager, dnsClient f
 					continue
 				}
 				if err := reload(); err != nil {
-					errors.LogErrorInner(context.Background(), err, "configuration reload failed; keeping previous routing rules")
+					errors.LogErrorInner(context.Background(), err, "configuration reload failed; keeping the previous runtime snapshot")
 				} else {
-					errors.LogInfo(context.Background(), "routing rules reloaded")
+					errors.LogInfo(context.Background(), "runtime configuration reloaded")
 				}
 				continue
 			}

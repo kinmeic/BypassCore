@@ -21,20 +21,20 @@ type testContext struct {
 	attributes   map[string]string
 }
 
-func (c *testContext) GetInboundTag() string             { return c.inboundTag }
-func (c *testContext) GetSourceIPs() []bcnet.IP          { return c.sourceIPs }
-func (c *testContext) GetSourcePort() bcnet.Port         { return c.sourcePort }
-func (c *testContext) GetTargetIPs() []bcnet.IP          { return c.targetIPs }
-func (c *testContext) GetTargetPort() bcnet.Port         { return c.targetPort }
-func (c *testContext) GetLocalIPs() []bcnet.IP           { return nil }
-func (c *testContext) GetLocalPort() bcnet.Port          { return 0 }
-func (c *testContext) GetTargetDomain() string           { return c.targetDomain }
-func (c *testContext) GetNetwork() bcnet.Network         { return c.network }
-func (c *testContext) GetProtocol() string               { return c.protocol }
-func (c *testContext) GetUser() string                   { return c.user }
-func (c *testContext) GetVlessRoute() bcnet.Port         { return 0 }
-func (c *testContext) GetAttributes() map[string]string  { return c.attributes }
-func (c *testContext) GetSkipDNSResolve() bool           { return false }
+func (c *testContext) GetInboundTag() string            { return c.inboundTag }
+func (c *testContext) GetSourceIPs() []bcnet.IP         { return c.sourceIPs }
+func (c *testContext) GetSourcePort() bcnet.Port        { return c.sourcePort }
+func (c *testContext) GetTargetIPs() []bcnet.IP         { return c.targetIPs }
+func (c *testContext) GetTargetPort() bcnet.Port        { return c.targetPort }
+func (c *testContext) GetLocalIPs() []bcnet.IP          { return nil }
+func (c *testContext) GetLocalPort() bcnet.Port         { return 0 }
+func (c *testContext) GetTargetDomain() string          { return c.targetDomain }
+func (c *testContext) GetNetwork() bcnet.Network        { return c.network }
+func (c *testContext) GetProtocol() string              { return c.protocol }
+func (c *testContext) GetUser() string                  { return c.user }
+func (c *testContext) GetVlessRoute() bcnet.Port        { return 0 }
+func (c *testContext) GetAttributes() map[string]string { return c.attributes }
+func (c *testContext) GetSkipDNSResolve() bool          { return false }
 
 func TestPortMatcher(t *testing.T) {
 	pl := &bcnet.PortList{Range: []*bcnet.PortRange{

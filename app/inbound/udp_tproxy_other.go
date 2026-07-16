@@ -16,4 +16,7 @@ func startUDP(cfg *Config, d *dispatcher.Dispatcher) (*udpTproxyListener, error)
 
 type udpTproxyListener struct{}
 
+func (*udpTproxyListener) setLimits(udpResourceLimits) {}
+func (*udpTproxyListener) setTag(string)               {}
+
 func (l *udpTproxyListener) Close() error { return nil }

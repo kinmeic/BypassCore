@@ -91,7 +91,8 @@
       },
       {
         "address": "tls://1.1.1.1:853",
-        "tag": "cloudflare-dot"
+        "tag": "cloudflare-dot",
+        "outboundTag": "proxy"
       },
       "localhost"
     ],
@@ -104,6 +105,7 @@
   },
   "routing": {
     "domainStrategy": "IpIfNonMatch",
+    "finalOutboundTag": "direct",
     "rules": [
       {
         "domain": [
@@ -139,5 +141,17 @@
     "listen": "127.0.0.1:9090",
     "allowedClients": ["127.0.0.0/8", "::1/128"],
     "enablePprof": false
+  },
+  "control": {
+    "enabled": true,
+    "socket": "/run/bypasscore/control.sock",
+    "mode": "0660",
+    "maxRequestBytes": 1048576,
+    "maxConcurrentRequests": 32
+  },
+  "dnsResultEvents": {
+    "socket": "/run/bypasscore/dns-results.sock",
+    "queueSize": 1024,
+    "maxDatagramBytes": 8192
   }
 }

@@ -35,6 +35,7 @@ type NameServerConfig struct {
 	ServeExpiredTTL *uint32    `json:"serveExpiredTTL"`
 	FinalQuery      bool       `json:"finalQuery"`
 	UnexpectedIPs   StringList `json:"unexpectedIPs"`
+	OutboundTag     string     `json:"outboundTag,omitempty"`
 }
 
 // UnmarshalJSON accepts a bare address string or a full object.
@@ -61,6 +62,7 @@ func (c *NameServerConfig) UnmarshalJSON(data []byte) error {
 		ServeExpiredTTL *uint32    `json:"serveExpiredTTL"`
 		FinalQuery      bool       `json:"finalQuery"`
 		UnexpectedIPs   StringList `json:"unexpectedIPs"`
+		OutboundTag     string     `json:"outboundTag,omitempty"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
@@ -80,6 +82,7 @@ func (c *NameServerConfig) UnmarshalJSON(data []byte) error {
 		c.ServeExpiredTTL = advanced.ServeExpiredTTL
 		c.FinalQuery = advanced.FinalQuery
 		c.UnexpectedIPs = advanced.UnexpectedIPs
+		c.OutboundTag = advanced.OutboundTag
 		return nil
 	}
 	return errors.New("failed to parse name server: ", string(data))
@@ -153,7 +156,7 @@ func (c *NameServerConfig) Build() (*dns.NameServer, error) {
 		ExpectedIp:      expectedIPRules,
 		QueryStrategy:   queryStrategy,
 		ActPrior:        actPrior,
-		Tag:             c.Tag,
+		Tag:             strings.TrimSpace(c.Tag),
 		TimeoutMs:       c.TimeoutMs,
 		DisableCache:    c.DisableCache,
 		ServeStale:      c.ServeStale,
@@ -161,6 +164,7 @@ func (c *NameServerConfig) Build() (*dns.NameServer, error) {
 		FinalQuery:      c.FinalQuery,
 		UnexpectedIp:    unexpectedIPRules,
 		ActUnprior:      actUnprior,
+		OutboundTag:     strings.TrimSpace(c.OutboundTag),
 	}, nil
 }
 

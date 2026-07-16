@@ -209,6 +209,9 @@ func (m *Manager) Validate() error {
 		return errors.New("duplicate outbound tag: ", tag)
 	}
 	for tag, h := range m.handlers {
+		if tag != strings.TrimSpace(tag) {
+			return errors.New("outbound tag must not contain leading or trailing whitespace: ", tag)
+		}
 		if h.ob.Mode == ModeProxy && (h.ob.Upstream == nil || h.ob.Upstream.Server == "") {
 			return errors.New("proxy outbound ", tag, " requires upstream.server")
 		}

@@ -17,7 +17,8 @@
 - **负载均衡**：random / roundrobin / leastping / leastload + Observatory 健康探测
 - **进程匹配**：按源进程名/路径分流（Linux/macOS/Windows）
 - **domainStrategy**：AsIs / IpIfNonMatch / IpOnDemand
-- **daemon 模式**：`bypasscore -run -config config.json` 常驻，SIGINT/SIGTERM 优雅退出，SIGHUP 事务式重载路由规则
+- **本地控制面**：只监听 Unix Socket 的 HTTP/JSON API，提供运行状态、readiness、配置校验/重载、路由解释、DNS 测试、Observatory 和指标
+- **事务式运行时快照**：路由、outbound、DNS、Observatory 及不改变绑定的 inbound/metrics 参数可热更新，旧连接自然排空
 
 ## 快速开始
 
@@ -28,6 +29,9 @@ make build
 # 查看版本
 ./bin/bypasscore --version
 ./bin/bypasscore -V
+
+# 能力协商与配置 Schema（机器可读）
+./bin/bypasscore --capabilities --json
 
 # 生产环境可降低热路径日志量
 ./bin/bypasscore -run -config config.json -log-level warning
@@ -100,7 +104,7 @@ transport.Bridge (双向拷贝)
   "dns": {
     "servers": [
       {"address": "https://223.5.5.5/dns-query", "domains": ["domain:cn"], "tag": "cn"},
-      {"address": "tls://1.1.1.1:853", "tag": "cloudflare"},
+      {"address": "tls://1.1.1.1:853", "tag": "cloudflare", "outboundTag": "proxy"},
       "localhost"
     ],
     "queryStrategy": "UseIP"
@@ -122,6 +126,16 @@ transport.Bridge (双向拷贝)
 可使用 `udp+local://`、`tcp+local://`、`tls+local://`、`https+local://` 等
 `+local` 形式；`localhost` 始终使用系统 resolver。DNS 路由上下文带有
 `protocol: dns` 和防递归标志，可以用 protocol/inboundTag 规则单独选择出口。
+每个 DNS server 还可直接配置 `outboundTag`，无需再生成隐藏 DNS 路由规则；
+引用不存在的 outbound 会在配置校验阶段直接报错。
+
+如需把解析结果交给轻量 NFTSet/nftables 消费者，可开启非阻塞 Unix datagram
+事件出口。事件包含 `domain`、`ips`、`ttl`、`serverTag`、`timestamp`，队列满、
+消费者离线或写入超时都不会阻塞 DNS：
+
+```json
+{"dnsResultEvents":{"socket":"/run/bypasscore/dns-results.sock","queueSize":1024,"maxDatagramBytes":8192}}
+```
 
 如需向 dnsmasq 或局域网客户端提供内部解析服务，可增加一个 DNS inbound：
 
@@ -207,9 +221,44 @@ TCP 嗅探可用 `sniffingTimeoutMs`（默认 500）和 `sniffingMaxBytes`（默
 {"metrics":{"listen":"127.0.0.1:9090","allowedClients":["127.0.0.0/8"],"enablePprof":false}}
 ```
 
-端点为 `/healthz`、`/metrics`，启用后还有 `/debug/pprof/`。向进程发送
-`SIGHUP` 会先完整校验，再原子替换路由规则。出站、DNS、入站、Observatory 和
-metrics 的变更在热重载时会被拒绝并要求重启；任何失败都会保留旧的运行配置。
+端点为 `/healthz`、`/readyz`、`/metrics`，启用后还有 `/debug/pprof/`。
+`/healthz` 只表示进程存活；所有 inbound 成功监听后 `/readyz` 才返回就绪。
+
+本地控制面只使用 Unix Socket，不会开放 TCP 端口：
+
+```json
+{"control":{"enabled":true,"socket":"/run/bypasscore/control.sock","mode":"0660","maxRequestBytes":1048576,"maxConcurrentRequests":32}}
+```
+
+| 方法与路径 | 用途 |
+|---|---|
+| `GET /v1/status` | 当前 revision/hash、监听器、DNS/outbound 状态、Observatory、最近 reload |
+| `GET /v1/capabilities` | 版本、配置 Schema、能力列表 |
+| `GET /v1/ready` | 结构化 readiness |
+| `POST /v1/config/validate` | 校验请求体中的 JSON 配置但不生效 |
+| `POST /v1/config/reload` | 事务式加载请求体；空请求体重新读取 `-config` |
+| `POST /v1/route/explain` | 解释 `{"destination":"tcp:example.com:443"}` 的真实路由 |
+| `POST /v1/dns/resolve` | 使用当前运行实例解析 DNS |
+| `GET /v1/observatory` | 当前探测结果 |
+| `GET /v1/metrics` | JSON 指标 |
+
+调用示例：`curl --unix-socket /run/bypasscore/control.sock http://localhost/v1/status`。
+`SIGHUP` 也走同一条事务式重载路径：候选 runtime 先完整构建和校验，再一次原子
+切换。已有 TCP/UDP 流量继续持有旧快照并自然排空，30 秒后仍未结束的旧快照会被
+强制回收。routing、outbound、DNS、Observatory、DNS 结果事件以及不改变 socket
+绑定的 inbound/metrics 参数均可热更新。增加/删除监听器，或修改 inbound 的
+地址、端口、类型、网络、TLS 文件、DoH path，以及 metrics 监听地址、control
+socket 时会返回 `restart_required`，当前 revision 保持不变。
+
+Routing 可用显式默认出口取代最后一条 catch-all 规则：
+
+```json
+{"routing":{"domainStrategy":"AsIs","finalOutboundTag":"proxy","rules":[]}}
+```
+
+指标包含低基数的 ruleTag 命中、outbound 当前连接数、上下行字节、拨号结果/延迟、
+DNS 上游结果/延迟、sniff 结果、配置 revision 和 reload 结果。热重载后，已不在
+当前配置中的 tag 对应 series 会被删除，避免长期运行时基数不断增长。
 
 ## config.json 结构
 

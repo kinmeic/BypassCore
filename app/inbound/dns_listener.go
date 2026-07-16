@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/eugene/bypasscore/common/errors"
@@ -28,6 +29,7 @@ const (
 	maxDNSUDPPayload               = 4096
 	maxDNSMessageSize              = 65535
 	maxDNSConfiguredLimit          = 65535
+	maxDoHConcurrentStreams        = 1024
 	rcodeBadVersion                = dnsmessage.RCode(16)
 )
 
@@ -61,17 +63,114 @@ type DNSListener struct {
 	globalLimiter  *dnsGlobalRateLimiter
 	dnsRules       []compiledDNSRule
 	rawCache       *dnsRawCache
+	policyMu       sync.RWMutex
 	wg             sync.WaitGroup
 
-	stateMu sync.Mutex
-	state   dnsListenerState
-	connMu  sync.Mutex
-	conns   map[net.Conn]struct{}
+	stateMu    sync.Mutex
+	state      dnsListenerState
+	connMu     sync.Mutex
+	conns      map[net.Conn]struct{}
+	dohConns   map[net.Conn]dohConnLease
+	runtimeTag atomic.Pointer[string]
 }
 
 // NewDNS creates a normal (non-transparent) DNS listener.
 func NewDNS(cfg *Config, client dnsfeature.Client) *DNSListener {
-	return &DNSListener{cfg: cfg, client: client, conns: make(map[net.Conn]struct{})}
+	l := &DNSListener{cfg: cfg, client: client, conns: make(map[net.Conn]struct{})}
+	if cfg != nil {
+		l.setTag(cfg.Tag)
+	}
+	return l
+}
+
+func (l *DNSListener) setTag(tag string) { value := tag; l.runtimeTag.Store(&value) }
+func (l *DNSListener) inboundTag() string {
+	if value := l.runtimeTag.Load(); value != nil {
+		return *value
+	}
+	return ""
+}
+
+type dnsRuntimePolicy struct {
+	querySlots     chan struct{}
+	tcpSlots       chan struct{}
+	queryBytes     int
+	allowedClients []netip.Prefix
+	rateLimiter    *dnsRateLimiter
+	globalLimiter  *dnsGlobalRateLimiter
+	dnsRules       []compiledDNSRule
+	rawCache       *dnsRawCache
+}
+
+func buildDNSRuntimePolicy(cfg *Config) (*dnsRuntimePolicy, error) {
+	maxQueries, err := positiveLimit(cfg.MaxConcurrentQueries, defaultDNSMaxConcurrentQueries, "maxConcurrentQueries")
+	if err != nil {
+		return nil, err
+	}
+	maxQueryBytes, err := queryByteLimit(cfg.MaxQueryBytes)
+	if err != nil {
+		return nil, err
+	}
+	maxTCP, err := positiveLimit(cfg.MaxTCPConnections, defaultDNSMaxTCPConnections, "maxTCPConnections")
+	if err != nil {
+		return nil, err
+	}
+	allowedClients, rateLimiter, globalLimiter, err := newDNSAccessPolicy(cfg)
+	if err != nil {
+		return nil, err
+	}
+	dnsRules, err := compileDNSRules(cfg.DNSRules)
+	if err != nil {
+		return nil, err
+	}
+	rawCache, err := newDNSRawCacheWithLimit(cfg.DNSRawCacheEntries, cfg.DNSRawCacheMaxTTLSeconds, cfg.DNSRawCacheMaxBytes)
+	if err != nil {
+		return nil, err
+	}
+	return &dnsRuntimePolicy{
+		querySlots: make(chan struct{}, maxQueries), tcpSlots: make(chan struct{}, maxTCP), queryBytes: maxQueryBytes,
+		allowedClients: allowedClients, rateLimiter: rateLimiter, globalLimiter: globalLimiter, dnsRules: dnsRules, rawCache: rawCache,
+	}, nil
+}
+
+func (l *DNSListener) currentPolicy() dnsRuntimePolicy {
+	l.policyMu.RLock()
+	defer l.policyMu.RUnlock()
+	return dnsRuntimePolicy{l.querySlots, l.tcpSlots, l.queryBytes, l.allowedClients, l.rateLimiter, l.globalLimiter, l.dnsRules, l.rawCache}
+}
+
+func (l *DNSListener) installPolicy(policy *dnsRuntimePolicy) {
+	l.policyMu.Lock()
+	l.querySlots, l.tcpSlots, l.queryBytes = policy.querySlots, policy.tcpSlots, policy.queryBytes
+	l.allowedClients, l.rateLimiter, l.globalLimiter = policy.allowedClients, policy.rateLimiter, policy.globalLimiter
+	l.dnsRules, l.rawCache = policy.dnsRules, policy.rawCache
+	l.policyMu.Unlock()
+}
+
+// Reload atomically replaces DNS policy and resource limits when the socket
+// identity is unchanged. Existing TCP sessions retain their connection slot;
+// each new query observes the latest policy.
+func (l *DNSListener) Reload(cfg *Config) error {
+	if err := ValidateConfig(cfg); err != nil {
+		return err
+	}
+	l.stateMu.Lock()
+	defer l.stateMu.Unlock()
+	if l.state != dnsListenerRunning {
+		return errors.New("DNS inbound: listener is not running")
+	}
+	if !SameListenerBinding(l.cfg, cfg) || l.cfg.DNSCertificateFile != cfg.DNSCertificateFile ||
+		l.cfg.DNSKeyFile != cfg.DNSKeyFile || EffectiveDNSDoHPath(l.cfg) != EffectiveDNSDoHPath(cfg) {
+		return errors.New("DNS inbound: listen identity changed")
+	}
+	policy, err := buildDNSRuntimePolicy(cfg)
+	if err != nil {
+		return err
+	}
+	l.installPolicy(policy)
+	l.setTag(cfg.Tag)
+	l.cfg = cfg
+	return nil
 }
 
 // Start binds all configured DNS transports.
@@ -102,33 +201,16 @@ func (l *DNSListener) startLocked() error {
 	if listenerType != "dns" && listenerType != "dot" && listenerType != "doh" {
 		return errors.New("DNS inbound: type must be dns, dot, or doh")
 	}
+	if listenerType == "doh" && l.cfg.MaxConcurrentQueries > maxDoHConcurrentStreams {
+		return errors.New("DNS inbound: DoH maxConcurrentQueries must not exceed ", maxDoHConcurrentStreams)
+	}
 	if l.client == nil {
 		return errors.New("DNS inbound: DNS client is unavailable")
 	}
 	if l.cfg.Port < 1 || l.cfg.Port > 65535 {
 		return errors.New("DNS inbound: port must be between 1 and 65535")
 	}
-	maxQueries, err := positiveLimit(l.cfg.MaxConcurrentQueries, defaultDNSMaxConcurrentQueries, "maxConcurrentQueries")
-	if err != nil {
-		return err
-	}
-	maxQueryBytes, err := queryByteLimit(l.cfg.MaxQueryBytes)
-	if err != nil {
-		return err
-	}
-	maxTCP, err := positiveLimit(l.cfg.MaxTCPConnections, defaultDNSMaxTCPConnections, "maxTCPConnections")
-	if err != nil {
-		return err
-	}
-	allowedClients, rateLimiter, globalLimiter, err := newDNSAccessPolicy(l.cfg)
-	if err != nil {
-		return err
-	}
-	dnsRules, err := compileDNSRules(l.cfg.DNSRules)
-	if err != nil {
-		return err
-	}
-	rawCache, err := newDNSRawCacheWithLimit(l.cfg.DNSRawCacheEntries, l.cfg.DNSRawCacheMaxTTLSeconds, l.cfg.DNSRawCacheMaxBytes)
+	policy, err := buildDNSRuntimePolicy(l.cfg)
 	if err != nil {
 		return err
 	}
@@ -160,27 +242,18 @@ func (l *DNSListener) startLocked() error {
 	}
 
 	l.ctx, l.cancel = context.WithCancel(context.Background())
-	l.querySlots = make(chan struct{}, maxQueries)
-	l.tcpSlots = make(chan struct{}, maxTCP)
-	l.queryBytes = maxQueryBytes
-	l.allowedClients = allowedClients
-	l.rateLimiter = rateLimiter
-	l.globalLimiter = globalLimiter
-	l.dnsRules = dnsRules
-	l.rawCache = rawCache
+	l.installPolicy(policy)
 	l.connMu.Lock()
 	l.conns = make(map[net.Conn]struct{})
+	l.dohConns = make(map[net.Conn]dohConnLease)
 	l.connMu.Unlock()
-	listenHost := strings.TrimSpace(l.cfg.Listen)
-	if listenHost == "" {
-		listenHost = "127.0.0.1"
-	}
-	if ip := net.ParseIP(strings.Trim(listenHost, "[]")); ip != nil && !ip.IsLoopback() && len(allowedClients) == 0 {
-		errors.LogWarning(context.Background(), "DNS inbound[", l.cfg.Tag, "] is non-loopback without dnsAllowedClients")
+	listenHost := normalizedInboundListen(l.cfg)
+	if ip := net.ParseIP(strings.Trim(listenHost, "[]")); ip != nil && !ip.IsLoopback() && len(policy.allowedClients) == 0 {
+		errors.LogWarning(context.Background(), "DNS inbound[", l.inboundTag(), "] is non-loopback without dnsAllowedClients")
 	}
 	addr := net.JoinHostPort(listenHost, strconv.Itoa(l.cfg.Port))
 	if listenerType == "doh" {
-		return l.startDoH(addr, maxTCP, maxQueries, serverTLS)
+		return l.startDoH(addr, serverTLS)
 	}
 
 	if wantTCP {
@@ -196,7 +269,7 @@ func (l *DNSListener) startLocked() error {
 		if listenerType == "dot" {
 			scheme = "dot://"
 		}
-		errors.LogInfo(context.Background(), "inbound[", l.cfg.Tag, "] listening on ", scheme, addr)
+		errors.LogInfo(context.Background(), "inbound[", l.inboundTag(), "] listening on ", scheme, addr)
 		l.wg.Add(1)
 		go l.acceptTCP()
 	}
@@ -211,7 +284,7 @@ func (l *DNSListener) startLocked() error {
 			return errors.New("DNS inbound UDP listen failed: ", addr).Base(err)
 		}
 		l.udp = conn
-		errors.LogInfo(context.Background(), "inbound[", l.cfg.Tag, "] listening on dns+udp://", addr)
+		errors.LogInfo(context.Background(), "inbound[", l.inboundTag(), "] listening on dns+udp://", addr)
 		l.wg.Add(1)
 		go l.serveUDP()
 	}
@@ -259,20 +332,29 @@ func (l *DNSListener) closeResourcesLocked() {
 	if l.cancel != nil {
 		l.cancel()
 	}
+	if l.httpServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := l.httpServer.Shutdown(ctx); err != nil {
+			_ = l.httpServer.Close()
+		}
+		cancel()
+	}
 	if l.tcp != nil {
 		_ = l.tcp.Close()
 	}
 	if l.udp != nil {
 		_ = l.udp.Close()
 	}
-	if l.httpServer != nil {
-		_ = l.httpServer.Close()
-	}
 	l.connMu.Lock()
 	for conn := range l.conns {
 		_ = conn.Close()
 	}
+	for _, lease := range l.dohConns {
+		<-lease.slots
+		commonmetrics.Add("bypasscore_dns_tcp_connections_active", -1, "inbound", lease.tag)
+	}
 	l.conns = nil
+	l.dohConns = nil
 	l.connMu.Unlock()
 	l.wg.Wait()
 	l.tcp = nil
@@ -280,18 +362,15 @@ func (l *DNSListener) closeResourcesLocked() {
 	l.httpServer = nil
 	l.ctx = nil
 	l.cancel = nil
-	l.querySlots = nil
-	l.tcpSlots = nil
-	l.allowedClients = nil
-	l.rateLimiter = nil
-	l.globalLimiter = nil
-	l.dnsRules = nil
-	l.rawCache = nil
+	l.policyMu.Lock()
+	l.querySlots, l.tcpSlots, l.allowedClients = nil, nil, nil
+	l.rateLimiter, l.globalLimiter, l.dnsRules, l.rawCache = nil, nil, nil, nil
+	l.policyMu.Unlock()
 }
 
 func (l *DNSListener) serveUDP() {
 	defer l.wg.Done()
-	buf := make([]byte, l.queryLimit()+1)
+	buf := make([]byte, maxDNSMessageSize+1)
 	for {
 		n, peer, err := l.udp.ReadFromUDP(buf)
 		if err != nil {
@@ -300,26 +379,31 @@ func (l *DNSListener) serveUDP() {
 			}
 			return
 		}
+		policy := l.currentPolicy()
+		if n > policy.queryBytes {
+			continue
+		}
 		peerIP, ok := clientIP(peer)
-		if !ok || !clientAllowed(peerIP, l.allowedClients) {
-			commonmetrics.Inc("bypasscore_dns_rejected_total", "inbound", l.cfg.Tag, "reason", "acl", "transport", "udp")
+		if !ok || !clientAllowed(peerIP, policy.allowedClients) {
+			commonmetrics.Inc("bypasscore_dns_rejected_total", "inbound", l.inboundTag(), "reason", "acl", "transport", "udp")
 			continue
 		}
 		now := time.Now()
-		if !l.globalLimiter.allow(now) || !l.rateLimiter.allow(peerIP, now) {
+		if !policy.globalLimiter.allow(now) || !policy.rateLimiter.allow(peerIP, now) {
 			// Drop unauthorized/rate-limited UDP silently. Replying would let a
 			// spoofed source turn the listener into a reflection endpoint.
-			commonmetrics.Inc("bypasscore_dns_rejected_total", "inbound", l.cfg.Tag, "reason", "rate", "transport", "udp")
+			commonmetrics.Inc("bypasscore_dns_rejected_total", "inbound", l.inboundTag(), "reason", "rate", "transport", "udp")
 			continue
 		}
-		commonmetrics.Inc("bypasscore_dns_queries_total", "inbound", l.cfg.Tag, "transport", "udp")
+		commonmetrics.Inc("bypasscore_dns_queries_total", "inbound", l.inboundTag(), "transport", "udp")
 		select {
-		case l.querySlots <- struct{}{}:
+		case policy.querySlots <- struct{}{}:
 			request := append([]byte(nil), buf[:n]...)
+			querySlots := policy.querySlots
 			l.wg.Add(1)
 			go func() {
 				defer l.wg.Done()
-				defer func() { <-l.querySlots }()
+				defer func() { <-querySlots }()
 				response, err := l.handleQuery(request, true)
 				if err != nil {
 					errors.LogErrorInner(context.Background(), err, "DNS inbound UDP query failed")
@@ -337,7 +421,7 @@ func (l *DNSListener) serveUDP() {
 			// unbounded number of goroutines or silently timing out the client.
 			response := errorResponse(buf[:n], dnsmessage.RCodeServerFailure)
 			if len(response) > 0 {
-				commonmetrics.Inc("bypasscore_dns_rejected_total", "inbound", l.cfg.Tag, "reason", "busy", "transport", "udp")
+				commonmetrics.Inc("bypasscore_dns_rejected_total", "inbound", l.inboundTag(), "reason", "busy", "transport", "udp")
 				_, _ = l.udp.WriteToUDP(response, peer)
 			}
 		}
@@ -345,8 +429,9 @@ func (l *DNSListener) serveUDP() {
 }
 
 func (l *DNSListener) queryLimit() int {
-	if l.queryBytes >= 512 && l.queryBytes <= maxDNSMessageSize {
-		return l.queryBytes
+	queryBytes := l.currentPolicy().queryBytes
+	if queryBytes >= 512 && queryBytes <= maxDNSMessageSize {
+		return queryBytes
 	}
 	return defaultDNSMaxQueryBytes
 }
@@ -367,23 +452,25 @@ func (l *DNSListener) acceptTCP() {
 			}
 			continue
 		}
+		policy := l.currentPolicy()
 		peerIP, ok := clientIP(conn.RemoteAddr())
-		if !ok || !clientAllowed(peerIP, l.allowedClients) {
-			commonmetrics.Inc("bypasscore_dns_rejected_total", "inbound", l.cfg.Tag, "reason", "acl", "transport", "tcp")
+		if !ok || !clientAllowed(peerIP, policy.allowedClients) {
+			commonmetrics.Inc("bypasscore_dns_rejected_total", "inbound", l.inboundTag(), "reason", "acl", "transport", "tcp")
 			_ = conn.Close()
 			continue
 		}
 
 		select {
-		case l.tcpSlots <- struct{}{}:
+		case policy.tcpSlots <- struct{}{}:
 			if !l.trackConn(conn, true) {
-				<-l.tcpSlots
+				<-policy.tcpSlots
 				_ = conn.Close()
 				return
 			}
 			l.wg.Add(1)
-			commonmetrics.Add("bypasscore_dns_tcp_connections_active", 1, "inbound", l.cfg.Tag)
-			go l.serveTCP(conn)
+			inboundTag := l.inboundTag()
+			commonmetrics.Add("bypasscore_dns_tcp_connections_active", 1, "inbound", inboundTag)
+			go l.serveTCP(conn, policy.tcpSlots, inboundTag)
 		default:
 			_ = conn.Close()
 		}
@@ -404,12 +491,12 @@ func (l *DNSListener) trackConn(conn net.Conn, add bool) bool {
 	return true
 }
 
-func (l *DNSListener) serveTCP(conn net.Conn) {
+func (l *DNSListener) serveTCP(conn net.Conn, tcpSlots chan struct{}, inboundTag string) {
 	defer l.wg.Done()
-	defer func() { <-l.tcpSlots }()
+	defer func() { <-tcpSlots }()
 	defer l.trackConn(conn, false)
 	defer conn.Close()
-	defer commonmetrics.Add("bypasscore_dns_tcp_connections_active", -1, "inbound", l.cfg.Tag)
+	defer commonmetrics.Add("bypasscore_dns_tcp_connections_active", -1, "inbound", inboundTag)
 	peerIP, ok := clientIP(conn.RemoteAddr())
 	if !ok {
 		return
@@ -417,6 +504,7 @@ func (l *DNSListener) serveTCP(conn net.Conn) {
 
 	var length [2]byte
 	for {
+		policy := l.currentPolicy()
 		_ = conn.SetReadDeadline(time.Now().Add(dnsTCPIdleTimeout))
 		if _, err := io.ReadFull(conn, length[:]); err != nil {
 			if !goerrors.Is(err, io.EOF) && l.ctx.Err() == nil {
@@ -427,7 +515,7 @@ func (l *DNSListener) serveTCP(conn net.Conn) {
 			return
 		}
 		size := int(binary.BigEndian.Uint16(length[:]))
-		if size == 0 || size > l.queryLimit() {
+		if size == 0 || size > policy.queryBytes {
 			return
 		}
 		request := make([]byte, size)
@@ -436,8 +524,8 @@ func (l *DNSListener) serveTCP(conn net.Conn) {
 		}
 		_ = conn.SetReadDeadline(time.Time{})
 		now := time.Now()
-		if !l.globalLimiter.allow(now) || !l.rateLimiter.allow(peerIP, now) {
-			commonmetrics.Inc("bypasscore_dns_rejected_total", "inbound", l.cfg.Tag, "reason", "rate", "transport", "tcp")
+		if !policy.globalLimiter.allow(now) || !policy.rateLimiter.allow(peerIP, now) {
+			commonmetrics.Inc("bypasscore_dns_rejected_total", "inbound", l.inboundTag(), "reason", "rate", "transport", "tcp")
 			response := errorResponse(request, dnsmessage.RCodeRefused)
 			if len(response) == 0 || len(response) > maxDNSMessageSize {
 				return
@@ -449,12 +537,12 @@ func (l *DNSListener) serveTCP(conn net.Conn) {
 			}
 			continue
 		}
-		commonmetrics.Inc("bypasscore_dns_queries_total", "inbound", l.cfg.Tag, "transport", "tcp")
+		commonmetrics.Inc("bypasscore_dns_queries_total", "inbound", l.inboundTag(), "transport", "tcp")
 
 		select {
-		case l.querySlots <- struct{}{}:
+		case policy.querySlots <- struct{}{}:
 			response, err := l.handleQuery(request, false)
-			<-l.querySlots
+			<-policy.querySlots
 			if err != nil {
 				errors.LogErrorInner(context.Background(), err, "DNS inbound TCP query failed")
 				return
@@ -474,7 +562,7 @@ func (l *DNSListener) serveTCP(conn net.Conn) {
 		case <-l.ctx.Done():
 			return
 		default:
-			commonmetrics.Inc("bypasscore_dns_rejected_total", "inbound", l.cfg.Tag, "reason", "busy", "transport", "tcp")
+			commonmetrics.Inc("bypasscore_dns_rejected_total", "inbound", l.inboundTag(), "reason", "busy", "transport", "tcp")
 			response := errorResponse(request, dnsmessage.RCodeServerFailure)
 			if len(response) == 0 || len(response) > maxDNSMessageSize {
 				return
@@ -628,22 +716,23 @@ func (l *DNSListener) forwardRawQuery(ctx context.Context, request *dnsmessage.M
 		return responseFor(request, dnsmessage.RCodeNotImplemented, nil, udp, edns), nil
 	}
 	now := time.Now()
-	response, cached := l.rawCache.get(raw, now)
+	rawCache := l.currentPolicy().rawCache
+	response, cached := rawCache.get(raw, now)
 	if !cached {
-		commonmetrics.Inc("bypasscore_dns_raw_cache_total", "inbound", l.cfg.Tag, "result", "miss")
+		commonmetrics.Inc("bypasscore_dns_raw_cache_total", "inbound", l.inboundTag(), "result", "miss")
 		var err error
 		response, err = client.LookupRawContext(ctx, request.Questions[0].Name.String(), raw)
 		if err != nil {
 			return responseFor(request, dnsmessage.RCodeServerFailure, nil, udp, edns), nil
 		}
 		if err := dnsfeature.ValidateRawResponse(raw, response); err != nil {
-			commonmetrics.Inc("bypasscore_dns_upstream_invalid_total", "inbound", l.cfg.Tag)
+			commonmetrics.Inc("bypasscore_dns_upstream_invalid_total", "inbound", l.inboundTag())
 			errors.LogErrorInner(context.Background(), err, "DNS inbound rejected an invalid raw upstream response")
 			return responseFor(request, dnsmessage.RCodeServerFailure, nil, udp, edns), nil
 		}
-		l.rawCache.put(raw, response, now)
+		rawCache.put(raw, response, now)
 	} else {
-		commonmetrics.Inc("bypasscore_dns_raw_cache_total", "inbound", l.cfg.Tag, "result", "hit")
+		commonmetrics.Inc("bypasscore_dns_raw_cache_total", "inbound", l.inboundTag(), "result", "hit")
 	}
 	if udp {
 		limit := 512
@@ -662,7 +751,7 @@ func (l *DNSListener) recordDNSResponse(response []byte, transport string) {
 		return
 	}
 	rcode := strconv.Itoa(int(response[3] & 0x0f))
-	commonmetrics.Inc("bypasscore_dns_responses_total", "inbound", l.cfg.Tag, "rcode", rcode, "transport", transport)
+	commonmetrics.Inc("bypasscore_dns_responses_total", "inbound", l.inboundTag(), "rcode", rcode, "transport", transport)
 }
 
 func truncatedResponseFor(request *dnsmessage.Message, edns *ednsRequest) []byte {
