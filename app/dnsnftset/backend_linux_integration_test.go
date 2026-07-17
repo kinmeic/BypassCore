@@ -3,6 +3,7 @@
 package dnsnftset
 
 import (
+	"bytes"
 	"fmt"
 	"net"
 	"os"
@@ -13,6 +14,22 @@ import (
 	bcnet "github.com/eugene/bypasscore/common/net"
 	"github.com/google/nftables"
 )
+
+func TestNFTElementsEncodePlainIntervalEndpoints(t *testing.T) {
+	set := &nftables.Set{Interval: true}
+	key := net.ParseIP("192.0.2.1").To4()
+	timeout := 30 * time.Second
+	elements := nftElements(set, update{key: key, timeout: timeout})
+	if len(elements) != 2 {
+		t.Fatalf("elements=%d, want 2", len(elements))
+	}
+	if !bytes.Equal(elements[0].Key, key) || elements[0].IntervalEnd || elements[0].Timeout != timeout {
+		t.Fatalf("unexpected interval start: %#v", elements[0])
+	}
+	if !bytes.Equal(elements[1].Key, nextAddress(key)) || !elements[1].IntervalEnd || elements[1].Timeout != timeout {
+		t.Fatalf("unexpected interval end: %#v", elements[1])
+	}
+}
 
 func TestKernelNFTSetWriter(t *testing.T) {
 	if os.Getenv("BYPASSCORE_NFTSET_INTEGRATION") != "1" {
@@ -25,7 +42,7 @@ func TestKernelNFTSetWriter(t *testing.T) {
 	v4 := &nftables.Set{Table: table, Name: "result4", KeyType: nftables.TypeIPAddr, Interval: true, HasTimeout: true}
 	v6 := &nftables.Set{Table: table, Name: "result6", KeyType: nftables.TypeIP6Addr, Interval: true, HasTimeout: true}
 	existing := net.ParseIP("192.0.2.1").To4()
-	if err := create.AddSet(v4, []nftables.SetElement{{Key: existing, KeyEnd: nextAddress(existing)}}); err != nil {
+	if err := create.AddSet(v4, nftElements(v4, update{key: existing})); err != nil {
 		t.Fatal(err)
 	}
 	if err := create.AddSet(v6, nil); err != nil {

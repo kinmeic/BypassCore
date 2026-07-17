@@ -53,9 +53,13 @@ func (b *netlinkBackend) Add(updates []update) []writeResult {
 		ref := updates[indices[0]].set
 		set, err := b.resolve(ref)
 		if err == nil {
-			elements := make([]nftables.SetElement, 0, len(indices))
+			elementCapacity := len(indices)
+			if set.Interval {
+				elementCapacity *= 2
+			}
+			elements := make([]nftables.SetElement, 0, elementCapacity)
 			for _, index := range indices {
-				elements = append(elements, nftElement(set, updates[index]))
+				elements = append(elements, nftElements(set, updates[index])...)
 			}
 			conn := &nftables.Conn{}
 			err = conn.SetAddElements(set, elements)
@@ -97,7 +101,7 @@ func (b *netlinkBackend) Add(updates []update) []writeResult {
 
 func addOne(set *nftables.Set, item update) error {
 	conn := &nftables.Conn{}
-	if err := conn.SetAddElements(set, []nftables.SetElement{nftElement(set, item)}); err != nil {
+	if err := conn.SetAddElements(set, nftElements(set, item)); err != nil {
 		return fmt.Errorf("DNS result NFTSets: prepare %s element %s: %w", item.set.String(), net.IP(item.key), err)
 	}
 	if err := conn.Flush(); err != nil {
@@ -106,15 +110,19 @@ func addOne(set *nftables.Set, item update) error {
 	return nil
 }
 
-func nftElement(set *nftables.Set, item update) nftables.SetElement {
-	element := nftables.SetElement{Key: item.key, Timeout: item.timeout}
-	if set.Interval {
-		// nftables represents one address in an interval set as [key, key+1).
-		// ChinaDNS-NG emitted an explicit interval-end element; KeyEnd is the
-		// equivalent compact netlink representation supported by this library.
-		element.KeyEnd = nextAddress(item.key)
+func nftElements(set *nftables.Set, item update) []nftables.SetElement {
+	start := nftables.SetElement{Key: item.key, Timeout: item.timeout}
+	if !set.Interval {
+		return []nftables.SetElement{start}
 	}
-	return element
+	// A plain address interval set represents one address as [key, key+1).
+	// Match ChinaDNS-NG's netlink encoding explicitly: one ordinary start
+	// element followed by an interval-end element. KeyEnd is for concatenated
+	// interval keys and is rejected by the kernel for this set shape.
+	return []nftables.SetElement{
+		start,
+		{Key: nextAddress(item.key), IntervalEnd: true, Timeout: item.timeout},
+	}
 }
 
 func nextAddress(key []byte) []byte {
