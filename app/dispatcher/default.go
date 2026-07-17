@@ -121,6 +121,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, conn net.Conn, dest bcnet.Des
 		return d.bridge(ctx, conn, dialer, originalDest)
 	}
 	outTag = route.GetOutboundTag()
+	usedDefault := route.IsFallback()
 	errors.LogDebug(ctx, "route: ", dest.String(), " → ", outTag)
 
 	// Look up the outbound dialer.
@@ -130,7 +131,11 @@ func (d *Dispatcher) Dispatch(ctx context.Context, conn net.Conn, dest bcnet.Des
 		return errors.New("routed outbound ", outTag, " not found")
 	}
 
-	commonmetrics.Inc("bypasscore_route_decisions_total", "outbound", outTag, "result", "matched")
+	result := "matched"
+	if usedDefault {
+		result = "default"
+	}
+	commonmetrics.Inc("bypasscore_route_decisions_total", "outbound", outTag, "result", result)
 	return d.bridge(ctx, conn, dialer, originalDest)
 }
 

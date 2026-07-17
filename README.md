@@ -139,10 +139,12 @@ validation rejects unknown tags.
 
 Successful A/AAAA results can be emitted to a local Unix datagram consumer for
 a lightweight nftables/NFTSet updater. Delivery is bounded and non-blocking;
-the event contains `domain`, `ips`, `ttl`, `serverTag`, and `timestamp`:
+events include a monotonic `sequence`, `configRevision`, expiry time, and the
+cumulative loss counter in addition to the DNS result. Delivery remains
+best-effort, but a consumer can resynchronize from `GET /v1/dns/results`:
 
 ```json
-{"dnsResultEvents":{"socket":"/run/bypasscore/dns-results.sock","queueSize":1024,"maxDatagramBytes":8192}}
+{"dnsResultEvents":{"socket":"/run/bypasscore/dns-results.sock","queueSize":256,"maxDatagramBytes":8192,"maxQueueBytes":1048576}}
 ```
 
 To expose the internal resolver to dnsmasq or LAN clients, add a DNS inbound:
@@ -238,13 +240,14 @@ disabled unless explicitly enabled.
 ```
 
 Endpoints are `/healthz`, `/readyz`, `/metrics`, and, when enabled,
-`/debug/pprof/`. `/healthz` is liveness; `/readyz` becomes successful only
-after all configured inbounds have started.
+`/debug/pprof/`. `/healthz` is liveness; `/readyz` is derived from every
+inbound's live state. An unexpected TCP/UDP/DoH serving-loop failure marks that
+inbound failed and terminates the daemon so the service manager can restart it.
 
 Enable the local control plane (it never opens a TCP port):
 
 ```json
-{"control":{"enabled":true,"socket":"/run/bypasscore/control.sock","mode":"0660","maxRequestBytes":1048576,"maxConcurrentRequests":32}}
+{"control":{"enabled":true,"socket":"/run/bypasscore/control.sock","mode":"0660","maxRequestBytes":524288,"maxInflightRequestBytes":2097152,"maxConcurrentRequests":16}}
 ```
 
 It speaks HTTP/JSON over the Unix socket:
@@ -260,14 +263,20 @@ It speaks HTTP/JSON over the Unix socket:
 | `POST /v1/dns/resolve` | Resolve with the running DNS state |
 | `GET /v1/observatory` | Current probe results |
 | `GET /v1/metrics` | Metrics as JSON |
+| `GET /v1/dns/results` | Bounded unexpired DNS-result snapshot for event consumer resync |
 
 Example: `curl --unix-socket /run/bypasscore/control.sock http://localhost/v1/status`.
+Validate and reload share one non-queueing mutation slot; a concurrent request
+gets `503 busy`. Reload accepts `If-Match: <revision-or-config-hash>` and returns
+`409 revision_conflict` for stale writers. Body limits also have a process-wide
+in-flight byte budget.
 `SIGHUP` uses the same transactional reload path. A candidate runtime is fully
 built and validated before one atomic swap. Existing TCP/UDP flows retain the
 old snapshot and drain naturally; after 30 seconds the retired snapshot is
 force-closed. Routing, outbounds, DNS, Observatory, DNS result events, and
-inbound/metrics parameters can change live. Adding/removing listeners or
-changing an inbound address, port, type, network, TLS files, DoH path, metrics
+non-routing inbound resource policies and metrics parameters can change live.
+Adding/removing listeners or changing an inbound tag, sniffing policy, DNS
+action rules, address, port, type, network, TLS files, DoH path, metrics
 listen address, or control socket returns `restart_required` and leaves the
 running revision intact.
 

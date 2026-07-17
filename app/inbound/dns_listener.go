@@ -72,16 +72,23 @@ type DNSListener struct {
 	conns      map[net.Conn]struct{}
 	dohConns   map[net.Conn]dohConnLease
 	runtimeTag atomic.Pointer[string]
+	health     *healthTracker
 }
 
 // NewDNS creates a normal (non-transparent) DNS listener.
 func NewDNS(cfg *Config, client dnsfeature.Client) *DNSListener {
 	l := &DNSListener{cfg: cfg, client: client, conns: make(map[net.Conn]struct{})}
+	tag := ""
 	if cfg != nil {
 		l.setTag(cfg.Tag)
+		tag = cfg.Tag
 	}
+	l.health = newHealthTracker(tag)
 	return l
 }
+
+func (l *DNSListener) Status() HealthStatus   { return l.health.snapshot() }
+func (l *DNSListener) Failures() <-chan error { return l.health.failures }
 
 func (l *DNSListener) setTag(tag string) { value := tag; l.runtimeTag.Store(&value) }
 func (l *DNSListener) inboundTag() string {
@@ -151,26 +158,46 @@ func (l *DNSListener) installPolicy(policy *dnsRuntimePolicy) {
 // identity is unchanged. Existing TCP sessions retain their connection slot;
 // each new query observes the latest policy.
 func (l *DNSListener) Reload(cfg *Config) error {
-	if err := ValidateConfig(cfg); err != nil {
-		return err
-	}
-	l.stateMu.Lock()
-	defer l.stateMu.Unlock()
-	if l.state != dnsListenerRunning {
-		return errors.New("DNS inbound: listener is not running")
-	}
-	if !SameListenerBinding(l.cfg, cfg) || l.cfg.DNSCertificateFile != cfg.DNSCertificateFile ||
-		l.cfg.DNSKeyFile != cfg.DNSKeyFile || EffectiveDNSDoHPath(l.cfg) != EffectiveDNSDoHPath(cfg) {
-		return errors.New("DNS inbound: listen identity changed")
-	}
-	policy, err := buildDNSRuntimePolicy(cfg)
+	commit, err := l.PrepareReload(cfg)
 	if err != nil {
 		return err
 	}
-	l.installPolicy(policy)
-	l.setTag(cfg.Tag)
-	l.cfg = cfg
-	return nil
+	return commit()
+}
+
+func (l *DNSListener) PrepareReload(cfg *Config) (func() error, error) {
+	if err := ValidateConfig(cfg); err != nil {
+		return nil, err
+	}
+	l.stateMu.Lock()
+	if l.state != dnsListenerRunning {
+		l.stateMu.Unlock()
+		return nil, errors.New("DNS inbound: listener is not running")
+	}
+	if !SameListenerBinding(l.cfg, cfg) || l.cfg.DNSCertificateFile != cfg.DNSCertificateFile ||
+		l.cfg.DNSKeyFile != cfg.DNSKeyFile || EffectiveDNSDoHPath(l.cfg) != EffectiveDNSDoHPath(cfg) {
+		l.stateMu.Unlock()
+		return nil, errors.New("DNS inbound: listen identity changed")
+	}
+	if l.cfg.Tag != cfg.Tag {
+		l.stateMu.Unlock()
+		return nil, errors.New("DNS inbound: tag changes require restart")
+	}
+	l.stateMu.Unlock()
+	policy, err := buildDNSRuntimePolicy(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return func() error {
+		l.stateMu.Lock()
+		defer l.stateMu.Unlock()
+		if l.state != dnsListenerRunning || !SameListenerBinding(l.cfg, cfg) || l.cfg.Tag != cfg.Tag {
+			return errors.New("DNS inbound: listener changed after reload preparation")
+		}
+		l.installPolicy(policy)
+		l.cfg = cfg
+		return nil
+	}, nil
 }
 
 // Start binds all configured DNS transports.
@@ -184,12 +211,15 @@ func (l *DNSListener) Start() error {
 		return errors.New("DNS inbound: listener is closed")
 	}
 	l.state = dnsListenerStarting
+	l.health.set(l.inboundTag(), "starting", nil, false)
 	if err := l.startLocked(); err != nil {
 		l.closeResourcesLocked()
 		l.state = dnsListenerNew
+		l.health.set(l.inboundTag(), "failed", err, false)
 		return err
 	}
 	l.state = dnsListenerRunning
+	l.health.set(l.inboundTag(), "running", nil, false)
 	return nil
 }
 
@@ -321,10 +351,12 @@ func (l *DNSListener) Close() error {
 	}
 	if l.state == dnsListenerNew {
 		l.state = dnsListenerClosed
+		l.health.set(l.inboundTag(), "closed", nil, false)
 		return nil
 	}
 	l.state = dnsListenerClosed
 	l.closeResourcesLocked()
+	l.health.set(l.inboundTag(), "closed", nil, false)
 	return nil
 }
 
@@ -371,13 +403,25 @@ func (l *DNSListener) closeResourcesLocked() {
 func (l *DNSListener) serveUDP() {
 	defer l.wg.Done()
 	buf := make([]byte, maxDNSMessageSize+1)
+	degraded := false
 	for {
 		n, peer, err := l.udp.ReadFromUDP(buf)
 		if err != nil {
-			if l.ctx.Err() == nil {
-				errors.LogErrorInner(context.Background(), err, "DNS inbound UDP read failed")
+			if l.ctx.Err() != nil {
+				return
 			}
-			return
+			errors.LogErrorInner(context.Background(), err, "DNS inbound UDP read failed")
+			if !isRetryableNetworkError(err) {
+				l.health.setComponent(l.inboundTag(), "udp", "failed", err, true)
+				return
+			}
+			l.health.setComponent(l.inboundTag(), "udp", "degraded", err, false)
+			degraded = true
+			continue
+		}
+		if degraded {
+			l.health.setComponent(l.inboundTag(), "udp", "running", nil, false)
+			degraded = false
 		}
 		policy := l.currentPolicy()
 		if n > policy.queryBytes {
@@ -438,6 +482,7 @@ func (l *DNSListener) queryLimit() int {
 
 func (l *DNSListener) acceptTCP() {
 	defer l.wg.Done()
+	degraded := false
 	for {
 		conn, err := l.tcp.Accept()
 		if err != nil {
@@ -445,12 +490,22 @@ func (l *DNSListener) acceptTCP() {
 				return
 			}
 			errors.LogErrorInner(context.Background(), err, "DNS inbound TCP accept failed")
+			if !isRetryableNetworkError(err) {
+				l.health.setComponent(l.inboundTag(), "tcp", "failed", err, true)
+				return
+			}
+			l.health.setComponent(l.inboundTag(), "tcp", "degraded", err, false)
+			degraded = true
 			select {
 			case <-l.ctx.Done():
 				return
 			case <-time.After(100 * time.Millisecond):
 			}
 			continue
+		}
+		if degraded {
+			l.health.setComponent(l.inboundTag(), "tcp", "running", nil, false)
+			degraded = false
 		}
 		policy := l.currentPolicy()
 		peerIP, ok := clientIP(conn.RemoteAddr())

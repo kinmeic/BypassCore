@@ -130,11 +130,12 @@ transport.Bridge (双向拷贝)
 引用不存在的 outbound 会在配置校验阶段直接报错。
 
 如需把解析结果交给轻量 NFTSet/nftables 消费者，可开启非阻塞 Unix datagram
-事件出口。事件包含 `domain`、`ips`、`ttl`、`serverTag`、`timestamp`，队列满、
-消费者离线或写入超时都不会阻塞 DNS：
+事件出口。事件还包含单调递增 `sequence`、`configRevision`、过期时间及累计丢失数。
+通道仍是 best-effort，但消费者发现断号后可通过 `GET /v1/dns/results` 全量同步当前
+未过期结果；队列满、消费者离线或写入超时都不会阻塞 DNS：
 
 ```json
-{"dnsResultEvents":{"socket":"/run/bypasscore/dns-results.sock","queueSize":1024,"maxDatagramBytes":8192}}
+{"dnsResultEvents":{"socket":"/run/bypasscore/dns-results.sock","queueSize":256,"maxDatagramBytes":8192,"maxQueueBytes":1048576}}
 ```
 
 如需向 dnsmasq 或局域网客户端提供内部解析服务，可增加一个 DNS inbound：
@@ -222,12 +223,14 @@ TCP 嗅探可用 `sniffingTimeoutMs`（默认 500）和 `sniffingMaxBytes`（默
 ```
 
 端点为 `/healthz`、`/readyz`、`/metrics`，启用后还有 `/debug/pprof/`。
-`/healthz` 只表示进程存活；所有 inbound 成功监听后 `/readyz` 才返回就绪。
+`/healthz` 只表示进程存活；`/readyz` 聚合每个 inbound 的实时状态。任一 TCP、UDP
+或 DoH 服务循环意外退出都会标记该 inbound 为 failed，并让 daemon 退出，交由
+procd/服务管理器重启。
 
 本地控制面只使用 Unix Socket，不会开放 TCP 端口：
 
 ```json
-{"control":{"enabled":true,"socket":"/run/bypasscore/control.sock","mode":"0660","maxRequestBytes":1048576,"maxConcurrentRequests":32}}
+{"control":{"enabled":true,"socket":"/run/bypasscore/control.sock","mode":"0660","maxRequestBytes":524288,"maxInflightRequestBytes":2097152,"maxConcurrentRequests":16}}
 ```
 
 | 方法与路径 | 用途 |
@@ -241,13 +244,17 @@ TCP 嗅探可用 `sniffingTimeoutMs`（默认 500）和 `sniffingMaxBytes`（默
 | `POST /v1/dns/resolve` | 使用当前运行实例解析 DNS |
 | `GET /v1/observatory` | 当前探测结果 |
 | `GET /v1/metrics` | JSON 指标 |
+| `GET /v1/dns/results` | 供事件消费者重同步的有界、未过期 DNS 结果快照 |
 
 调用示例：`curl --unix-socket /run/bypasscore/control.sock http://localhost/v1/status`。
+Validate/Reload 共用一个不排队的 mutation 槽，并发请求会立即返回 `503 busy`。
+Reload 支持 `If-Match: <revision-or-config-hash>`，旧写入者会得到
+`409 revision_conflict`；请求体还受全局在途字节预算约束。
 `SIGHUP` 也走同一条事务式重载路径：候选 runtime 先完整构建和校验，再一次原子
 切换。已有 TCP/UDP 流量继续持有旧快照并自然排空，30 秒后仍未结束的旧快照会被
-强制回收。routing、outbound、DNS、Observatory、DNS 结果事件以及不改变 socket
-绑定的 inbound/metrics 参数均可热更新。增加/删除监听器，或修改 inbound 的
-地址、端口、类型、网络、TLS 文件、DoH path，以及 metrics 监听地址、control
+强制回收。routing、outbound、DNS、Observatory、DNS 结果事件以及不影响路由语义的
+inbound 资源策略/metrics 参数均可热更新。增加/删除监听器，或修改 inbound tag、
+sniffing、DNS action rules、地址、端口、类型、网络、TLS 文件、DoH path，以及 metrics 监听地址、control
 socket 时会返回 `restart_required`，当前 revision 保持不变。
 
 Routing 可用显式默认出口取代最后一条 catch-all 规则：

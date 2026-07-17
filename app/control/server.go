@@ -15,20 +15,23 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const (
-	DefaultSocket          = "/run/bypasscore/control.sock"
-	defaultMaxRequestBytes = int64(1 << 20)
+	DefaultSocket           = "/run/bypasscore/control.sock"
+	defaultMaxRequestBytes  = int64(512 << 10)
+	defaultMaxInflightBytes = int64(2 << 20)
 )
 
 type Config struct {
-	Enabled               bool   `json:"enabled,omitempty"`
-	Socket                string `json:"socket,omitempty"`
-	Mode                  string `json:"mode,omitempty"`
-	MaxRequestBytes       int64  `json:"maxRequestBytes,omitempty"`
-	MaxConcurrentRequests int    `json:"maxConcurrentRequests,omitempty"`
+	Enabled                 bool   `json:"enabled,omitempty"`
+	Socket                  string `json:"socket,omitempty"`
+	Mode                    string `json:"mode,omitempty"`
+	MaxRequestBytes         int64  `json:"maxRequestBytes,omitempty"`
+	MaxInflightRequestBytes int64  `json:"maxInflightRequestBytes,omitempty"`
+	MaxConcurrentRequests   int    `json:"maxConcurrentRequests,omitempty"`
 }
 
 type Capabilities struct {
@@ -54,11 +57,12 @@ type Backend interface {
 	Status(context.Context) (any, error)
 	Ready(context.Context) (any, error)
 	Validate(context.Context, []byte) (any, error)
-	Reload(context.Context, []byte) (any, error)
+	Reload(context.Context, []byte, ...string) (any, error)
 	Explain(context.Context, RouteExplainRequest) (any, error)
 	Resolve(context.Context, DNSResolveRequest) (any, error)
 	Observatory(context.Context) (any, error)
 	Metrics(context.Context) (any, error)
+	DNSResults(context.Context) (any, error)
 }
 
 // APIError is returned as a stable machine-readable control-plane error.
@@ -71,15 +75,17 @@ type APIError struct {
 func (e *APIError) Error() string { return e.Message }
 
 type Server struct {
-	config       Config
-	backend      Backend
-	capabilities Capabilities
-	listener     net.Listener
-	httpServer   *http.Server
-	semaphore    chan struct{}
-	mu           sync.Mutex
-	closed       bool
-	socketInfo   os.FileInfo
+	config        Config
+	backend       Backend
+	capabilities  Capabilities
+	listener      net.Listener
+	httpServer    *http.Server
+	semaphore     chan struct{}
+	mutation      chan struct{}
+	inflightBytes atomic.Int64
+	mu            sync.Mutex
+	closed        bool
+	socketInfo    os.FileInfo
 }
 
 func New(config *Config, backend Backend, capabilities Capabilities) (*Server, error) {
@@ -90,7 +96,7 @@ func New(config *Config, backend Backend, capabilities Capabilities) (*Server, e
 	if err != nil {
 		return nil, err
 	}
-	return &Server{config: c, backend: backend, capabilities: capabilities, semaphore: make(chan struct{}, c.MaxConcurrentRequests)}, nil
+	return &Server{config: c, backend: backend, capabilities: capabilities, semaphore: make(chan struct{}, c.MaxConcurrentRequests), mutation: make(chan struct{}, 1)}, nil
 }
 
 // Validate checks control transport settings without opening the socket.
@@ -122,17 +128,32 @@ func normalizeConfig(config *Config) (Config, error) {
 	if !filepath.IsAbs(c.Socket) {
 		return Config{}, errors.New("control: socket path must be absolute")
 	}
-	if c.MaxRequestBytes <= 0 {
+	if c.MaxRequestBytes < 0 {
+		return Config{}, errors.New("control: maxRequestBytes must not be negative")
+	}
+	if c.MaxRequestBytes == 0 {
 		c.MaxRequestBytes = defaultMaxRequestBytes
 	}
-	if c.MaxRequestBytes > 16<<20 {
-		return Config{}, errors.New("control: maxRequestBytes exceeds 16 MiB")
+	if c.MaxRequestBytes > 2<<20 {
+		return Config{}, errors.New("control: maxRequestBytes exceeds 2 MiB")
 	}
-	if c.MaxConcurrentRequests <= 0 {
-		c.MaxConcurrentRequests = 32
+	if c.MaxInflightRequestBytes < 0 {
+		return Config{}, errors.New("control: maxInflightRequestBytes must not be negative")
 	}
-	if c.MaxConcurrentRequests > 1024 {
-		return Config{}, errors.New("control: maxConcurrentRequests exceeds 1024")
+	if c.MaxInflightRequestBytes == 0 {
+		c.MaxInflightRequestBytes = defaultMaxInflightBytes
+	}
+	if c.MaxInflightRequestBytes < c.MaxRequestBytes || c.MaxInflightRequestBytes > 8<<20 {
+		return Config{}, errors.New("control: maxInflightRequestBytes must be between maxRequestBytes and 8 MiB")
+	}
+	if c.MaxConcurrentRequests < 0 {
+		return Config{}, errors.New("control: maxConcurrentRequests must not be negative")
+	}
+	if c.MaxConcurrentRequests == 0 {
+		c.MaxConcurrentRequests = 16
+	}
+	if c.MaxConcurrentRequests > 64 {
+		return Config{}, errors.New("control: maxConcurrentRequests exceeds 64")
 	}
 	mode, err := parseMode(c.Mode)
 	if err != nil {
@@ -250,8 +271,9 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("GET /v1/ready", s.noBody(s.backend.Ready))
 	mux.HandleFunc("GET /v1/observatory", s.noBody(s.backend.Observatory))
 	mux.HandleFunc("GET /v1/metrics", s.noBody(s.backend.Metrics))
-	mux.HandleFunc("POST /v1/config/validate", s.rawBody(s.backend.Validate))
-	mux.HandleFunc("POST /v1/config/reload", s.rawBody(s.backend.Reload))
+	mux.HandleFunc("GET /v1/dns/results", s.noBody(s.backend.DNSResults))
+	mux.HandleFunc("POST /v1/config/validate", s.mutationOnly(s.rawBody(s.backend.Validate)))
+	mux.HandleFunc("POST /v1/config/reload", s.mutationOnly(s.reloadBody()))
 	mux.HandleFunc("POST /v1/route/explain", decodeBody(s, func(ctx context.Context, request RouteExplainRequest) (any, error) {
 		return s.backend.Explain(ctx, request)
 	}))
@@ -280,18 +302,71 @@ func (s *Server) noBody(call func(context.Context) (any, error)) http.HandlerFun
 
 func (s *Server) rawBody(call func(context.Context, []byte) (any, error)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.config.MaxRequestBytes))
+		body, release, err := s.readBody(w, r)
 		if err != nil {
-			writeError(w, &APIError{Code: "invalid_request", Message: err.Error(), Status: http.StatusBadRequest})
+			writeError(w, err)
 			return
 		}
+		defer release()
 		result, err := call(r.Context(), body)
 		writeResult(w, result, err)
 	}
 }
 
+func (s *Server) reloadBody() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		body, release, err := s.readBody(w, r)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		defer release()
+		result, err := s.backend.Reload(r.Context(), body, r.Header.Get("If-Match"))
+		writeResult(w, result, err)
+	}
+}
+
+func (s *Server) mutationOnly(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case s.mutation <- struct{}{}:
+			defer func() { <-s.mutation }()
+		default:
+			writeError(w, &APIError{Code: "busy", Message: "a validate or reload request is already running", Status: http.StatusServiceUnavailable})
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (s *Server) readBody(w http.ResponseWriter, r *http.Request) ([]byte, func(), error) {
+	reserved := s.config.MaxRequestBytes
+	for {
+		current := s.inflightBytes.Load()
+		if current+reserved > s.config.MaxInflightRequestBytes {
+			return nil, nil, &APIError{Code: "busy", Message: "control request byte budget exhausted", Status: http.StatusServiceUnavailable}
+		}
+		if s.inflightBytes.CompareAndSwap(current, current+reserved) {
+			break
+		}
+	}
+	release := func() { s.inflightBytes.Add(-reserved) }
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.config.MaxRequestBytes))
+	if err != nil {
+		release()
+		return nil, nil, &APIError{Code: "request_too_large", Message: err.Error(), Status: http.StatusRequestEntityTooLarge}
+	}
+	return body, release, nil
+}
+
 func decodeBody[T any](s *Server, call func(context.Context, T) (any, error)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if _, release, err := s.readBodyBudget(); err != nil {
+			writeError(w, err)
+			return
+		} else {
+			defer release()
+		}
 		var request T
 		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, s.config.MaxRequestBytes))
 		decoder.DisallowUnknownFields()
@@ -306,6 +381,19 @@ func decodeBody[T any](s *Server, call func(context.Context, T) (any, error)) ht
 		}
 		result, err := call(r.Context(), request)
 		writeResult(w, result, err)
+	}
+}
+
+func (s *Server) readBodyBudget() (int64, func(), error) {
+	reserved := s.config.MaxRequestBytes
+	for {
+		current := s.inflightBytes.Load()
+		if current+reserved > s.config.MaxInflightRequestBytes {
+			return 0, nil, &APIError{Code: "busy", Message: "control request byte budget exhausted", Status: http.StatusServiceUnavailable}
+		}
+		if s.inflightBytes.CompareAndSwap(current, current+reserved) {
+			return reserved, func() { s.inflightBytes.Add(-reserved) }, nil
+		}
 	}
 }
 

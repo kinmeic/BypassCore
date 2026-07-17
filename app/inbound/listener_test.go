@@ -60,13 +60,31 @@ func TestSameListenerBindingUsesEffectiveAddress(t *testing.T) {
 
 func TestListenerReloadAdoptsNewConfig(t *testing.T) {
 	initial := &Config{Tag: "old", Type: "redirect", Listen: "127.0.0.1", Port: 1234, Network: "tcp"}
-	next := &Config{Tag: "new", Type: "redirect", Listen: "127.0.0.1", Port: 1234, Network: "tcp", Sniffing: true}
+	next := &Config{Tag: "old", Type: "redirect", Listen: "127.0.0.1", Port: 1234, Network: "tcp", Sniffing: true}
 	listener := New(initial, dispatcher.New(nil, nil, nil))
 	listener.state = listenerRunning
 	if err := listener.Reload(next); err != nil {
 		t.Fatal(err)
 	}
-	if listener.cfg != next || listener.inboundTag() != "new" {
+	if listener.cfg != next || listener.inboundTag() != "old" {
 		t.Fatal("listener retained its initial configuration after reload")
 	}
 }
+
+func TestHealthTrackerAggregatesTransportStates(t *testing.T) {
+	health := newHealthTracker("mixed")
+	health.set("mixed", "running", nil, false)
+	health.setComponent("mixed", "tcp", "degraded", assertError("tcp resource pressure"), false)
+	health.setComponent("mixed", "udp", "running", nil, false)
+	if status := health.snapshot(); status.State != "degraded" || status.LastError == "" {
+		t.Fatalf("unexpected degraded status: %#v", status)
+	}
+	health.setComponent("mixed", "tcp", "running", nil, false)
+	if status := health.snapshot(); status.State != "running" || status.LastError != "" {
+		t.Fatalf("unexpected recovered status: %#v", status)
+	}
+}
+
+type assertError string
+
+func (e assertError) Error() string { return string(e) }

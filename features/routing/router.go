@@ -7,7 +7,6 @@ import (
 )
 
 // Router is a feature to choose an outbound tag for the given request.
-//
 type Router interface {
 	features.Feature
 
@@ -19,7 +18,6 @@ type Router interface {
 }
 
 // Route is the routing result of Router feature.
-//
 type Route interface {
 	// A Route is also a routing context.
 	Context
@@ -32,10 +30,13 @@ type Route interface {
 
 	// GetRuleTag returns the matching rule tag for debugging if exists
 	GetRuleTag() string
+
+	// IsFallback reports whether the route came from finalOutboundTag rather
+	// than from a matching rule.
+	IsFallback() bool
 }
 
 // RouterType return the type of Router interface. Can be used to implement common.HasType.
-//
 func RouterType() interface{} {
 	return (*Router)(nil)
 }

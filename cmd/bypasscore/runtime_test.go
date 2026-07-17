@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/eugene/bypasscore/app/control"
+	"github.com/eugene/bypasscore/app/dnsevent"
 	appinbound "github.com/eugene/bypasscore/app/inbound"
 	appoutbound "github.com/eugene/bypasscore/app/outbound"
 	bcnet "github.com/eugene/bypasscore/common/net"
@@ -92,6 +93,16 @@ func TestReloadCompatibilityAllowsMutableInboundOnly(t *testing.T) {
 	next.Inbounds[0].Port = 54
 	if err := reloadCompatibility(current, next); err == nil {
 		t.Fatal("port change did not require restart")
+	}
+	next.Inbounds[0].Port = 53
+	next.Inbounds[0].Tag = "renamed"
+	if err := reloadCompatibility(current, next); err == nil {
+		t.Fatal("inbound tag change did not require restart")
+	}
+	next.Inbounds[0].Tag = "dns"
+	next.Inbounds[0].Sniffing = true
+	if err := reloadCompatibility(current, next); err == nil {
+		t.Fatal("routing-affecting sniffing change did not require restart")
 	}
 }
 
@@ -186,5 +197,78 @@ func TestDecodeConfigRejectsDuplicateKeys(t *testing.T) {
 	_, _, err := decodeConfig([]byte(`{"outbounds":[],"routing":{},"routing":{"rules":[]}}`))
 	if err == nil || !strings.Contains(err.Error(), "duplicate JSON key") {
 		t.Fatalf("duplicate key accepted: %v", err)
+	}
+}
+
+func TestReloadIfMatchRejectsStaleRevision(t *testing.T) {
+	registerDialerFactory()
+	cfg := &Config{Outbounds: []*appoutbound.Outbound{{Tag: "direct", Mode: appoutbound.ModeFreedom}}, Routing: conf.RouterConfig{FinalOutboundTag: "direct"}}
+	service, err := newRuntimeService(context.Background(), "", cfg, "initial")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	raw := []byte(`{"outbounds":[{"tag":"direct","mode":"freedom"}],"routing":{"finalOutboundTag":"direct","domainStrategy":"IPIfNonMatch"}}`)
+	if _, err := service.Reload(context.Background(), raw, "0"); err == nil || !strings.Contains(err.Error(), "If-Match") {
+		t.Fatalf("stale revision accepted: %v", err)
+	}
+}
+
+func TestExplainMarksFinalOutboundAsDefault(t *testing.T) {
+	registerDialerFactory()
+	cfg := &Config{Outbounds: []*appoutbound.Outbound{{Tag: "direct", Mode: appoutbound.ModeFreedom}}, Routing: conf.RouterConfig{FinalOutboundTag: "direct"}}
+	service, err := newRuntimeService(context.Background(), "", cfg, "initial")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	result, err := service.Explain(context.Background(), control.RouteExplainRequest{Destination: "tcp:example.com:443"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := result.(map[string]any)
+	if value["default"] != true || value["matched"] != false || value["outboundTag"] != "direct" {
+		t.Fatalf("unexpected explanation: %#v", value)
+	}
+}
+
+type fakeReloadableInbound struct{ status appinbound.HealthStatus }
+
+func (f *fakeReloadableInbound) Reload(*appinbound.Config) error { return nil }
+func (f *fakeReloadableInbound) PrepareReload(*appinbound.Config) (func() error, error) {
+	return func() error { return nil }, nil
+}
+func (f *fakeReloadableInbound) Status() appinbound.HealthStatus { return f.status }
+func (f *fakeReloadableInbound) Failures() <-chan error          { return make(chan error) }
+
+func TestReadinessAggregatesInboundHealth(t *testing.T) {
+	service := &runtimeService{inbounds: []reloadableInbound{&fakeReloadableInbound{status: appinbound.HealthStatus{Tag: "dns", State: "failed", LastError: "read loop stopped"}}}}
+	service.listeners.Store(true)
+	statuses, ready := service.inboundHealth(1)
+	if ready || len(statuses) != 1 || statuses[0].LastError == "" {
+		t.Fatalf("failed inbound produced readiness=%v statuses=%v", ready, statuses)
+	}
+}
+
+func TestDNSResultsProvidesUnexpiredResyncSnapshot(t *testing.T) {
+	registerDialerFactory()
+	cfg := &Config{Outbounds: []*appoutbound.Outbound{{Tag: "direct", Mode: appoutbound.ModeFreedom}}, Routing: conf.RouterConfig{FinalOutboundTag: "direct"}}
+	service, err := newRuntimeService(context.Background(), "", cfg, "initial")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	now := time.Now().Unix()
+	service.dnsEventSequence.Store(2)
+	service.recordDNSResult(dnsevent.Event{Sequence: 1, Domain: "expired.test", ServerTag: "dns", ExpiresAt: now - 1})
+	service.recordDNSResult(dnsevent.Event{Sequence: 2, Domain: "alive.test", ServerTag: "dns", ExpiresAt: now + 60})
+	result, err := service.DNSResults(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := result.(map[string]any)
+	results := value["results"].([]dnsevent.Event)
+	if value["lastSequence"] != uint64(2) || len(results) != 1 || results[0].Domain != "alive.test" {
+		t.Fatalf("unexpected resync snapshot: %#v", value)
 	}
 }

@@ -92,7 +92,7 @@ func TestPickRouteFinalOutbound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if route.GetOutboundTag() != "final" || route.GetRuleTag() != "" {
+	if route.GetOutboundTag() != "final" || route.GetRuleTag() != "" || !route.IsFallback() {
 		t.Fatalf("unexpected final route: %#v", route)
 	}
 }

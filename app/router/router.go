@@ -37,6 +37,7 @@ type Route struct {
 	outboundGroupTags []string
 	outboundTag       string
 	ruleTag           string
+	fallback          bool
 }
 
 // Init initializes the Router.
@@ -149,7 +150,7 @@ func (r *Router) PickRoute(ctx routing.Context) (routing.Route, error) {
 			finalTag := r.finalOutboundTag
 			r.mu.RUnlock()
 			if finalTag != "" {
-				return &Route{Context: ctx, outboundTag: finalTag}, nil
+				return &Route{Context: ctx, outboundTag: finalTag, fallback: true}, nil
 			}
 		}
 		return nil, err
@@ -422,6 +423,8 @@ func (r *Route) GetOutboundTag() string {
 func (r *Route) GetRuleTag() string {
 	return r.ruleTag
 }
+
+func (r *Route) IsFallback() bool { return r.fallback }
 
 func init() {
 	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {

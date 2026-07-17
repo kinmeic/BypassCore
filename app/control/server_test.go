@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -19,7 +20,7 @@ func (testBackend) Ready(context.Context) (any, error)  { return map[string]any{
 func (testBackend) Validate(context.Context, []byte) (any, error) {
 	return map[string]any{"valid": true}, nil
 }
-func (testBackend) Reload(context.Context, []byte) (any, error) {
+func (testBackend) Reload(context.Context, []byte, ...string) (any, error) {
 	return map[string]any{"reloaded": true}, nil
 }
 func (testBackend) Explain(_ context.Context, request RouteExplainRequest) (any, error) {
@@ -30,6 +31,7 @@ func (testBackend) Resolve(_ context.Context, request DNSResolveRequest) (any, e
 }
 func (testBackend) Observatory(context.Context) (any, error) { return []any{}, nil }
 func (testBackend) Metrics(context.Context) (any, error)     { return []any{}, nil }
+func (testBackend) DNSResults(context.Context) (any, error)  { return []any{}, nil }
 
 func TestUnixControlServer(t *testing.T) {
 	socket := filepath.Join(t.TempDir(), "control.sock")
@@ -126,11 +128,59 @@ func TestCloseDoesNotRemoveReplacementSocket(t *testing.T) {
 
 func TestEquivalentConfigAppliesDefaults(t *testing.T) {
 	left := &Config{Enabled: true}
-	right := &Config{Enabled: true, Socket: DefaultSocket, Mode: "0660", MaxRequestBytes: defaultMaxRequestBytes, MaxConcurrentRequests: 32}
+	right := &Config{Enabled: true, Socket: DefaultSocket, Mode: "0660", MaxRequestBytes: defaultMaxRequestBytes, MaxInflightRequestBytes: defaultMaxInflightBytes, MaxConcurrentRequests: 16}
 	if !EquivalentConfig(left, right) {
 		t.Fatal("effective defaults were treated as a restart change")
 	}
 	if EquivalentConfig(left, &Config{Enabled: true, Socket: "/tmp/other.sock"}) {
 		t.Fatal("different socket was treated as equivalent")
+	}
+}
+
+type blockingBackend struct {
+	testBackend
+	started chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingBackend) Validate(context.Context, []byte) (any, error) {
+	close(b.started)
+	<-b.release
+	return map[string]any{"valid": true}, nil
+}
+
+func TestMutationRequestsFailBusyInsteadOfQueueing(t *testing.T) {
+	backend := &blockingBackend{started: make(chan struct{}), release: make(chan struct{})}
+	server, err := New(&Config{Enabled: true, Socket: filepath.Join(t.TempDir(), "control.sock")}, backend, Capabilities{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := server.handler()
+	done := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/config/validate", bytes.NewBufferString(`{}`)))
+		close(done)
+	}()
+	<-backend.started
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/config/reload", bytes.NewBufferString(`{}`)))
+	if recorder.Code != http.StatusServiceUnavailable || !bytes.Contains(recorder.Body.Bytes(), []byte(`"code":"busy"`)) {
+		t.Fatalf("second mutation status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	close(backend.release)
+	<-done
+}
+
+func TestControlResourceLimits(t *testing.T) {
+	base := &Config{Enabled: true, Socket: "/tmp/control.sock"}
+	tooLarge := *base
+	tooLarge.MaxRequestBytes = 2<<20 + 1
+	if err := Validate(&tooLarge); err == nil {
+		t.Fatal("oversized request limit accepted")
+	}
+	tooConcurrent := *base
+	tooConcurrent.MaxConcurrentRequests = 65
+	if err := Validate(&tooConcurrent); err == nil {
+		t.Fatal("oversized concurrency accepted")
 	}
 }

@@ -76,6 +76,7 @@ func (l *DNSListener) startDoH(address string, tlsConfig *tls.Config) error {
 		defer l.wg.Done()
 		if err := server.Serve(l.tcp); err != nil && err != http.ErrServerClosed && l.ctx.Err() == nil {
 			errors.LogErrorInner(context.Background(), err, "DNS inbound DoH serve failed")
+			l.health.setComponent(l.inboundTag(), "doh", "failed", err, true)
 		}
 	}()
 	errors.LogInfo(context.Background(), "inbound[", l.inboundTag(), "] listening on doh://", address, path)

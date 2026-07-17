@@ -32,6 +32,18 @@ func TestValidateRoutingTargetsRejectsUnknownFinalOutbound(t *testing.T) {
 	}
 }
 
+func TestValidateRuntimeConfigRejectsUnknownDNSOutbound(t *testing.T) {
+	cfg, _, err := decodeConfig([]byte(`{"outbounds":[{"tag":"direct","mode":"freedom"}],"dns":{"servers":[{"address":"tls://1.1.1.1:853","tag":"remote","outboundTag":"missing-outbound"}]},"routing":{"finalOutboundTag":"direct"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := appoutbound.NewManager(&appoutbound.Config{Outbounds: cfg.Outbounds})
+	defer manager.Close()
+	if err := validateRuntimeConfigWithOutbounds(cfg, manager); err == nil {
+		t.Fatal("unknown DNS outbound passed CLI-equivalent validation")
+	}
+}
+
 func TestRunDaemonDNSContextShutdownReleasesPort(t *testing.T) {
 	probe, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
 	if err != nil {

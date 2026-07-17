@@ -146,12 +146,14 @@
     "enabled": true,
     "socket": "/run/bypasscore/control.sock",
     "mode": "0660",
-    "maxRequestBytes": 1048576,
-    "maxConcurrentRequests": 32
+    "maxRequestBytes": 524288,
+    "maxInflightRequestBytes": 2097152,
+    "maxConcurrentRequests": 16
   },
   "dnsResultEvents": {
     "socket": "/run/bypasscore/dns-results.sock",
-    "queueSize": 1024,
-    "maxDatagramBytes": 8192
+    "queueSize": 256,
+    "maxDatagramBytes": 8192,
+    "maxQueueBytes": 1048576
   }
 }

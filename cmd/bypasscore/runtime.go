@@ -10,6 +10,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,7 +51,7 @@ func capabilities() control.Capabilities {
 			"control-unix-http-json", "dns-inbound", "raw-dns", "metrics",
 			"routing-reload", "full-reload", "runtime-snapshot-reload", "inbound-parameter-reload", "dns-outbound-tag",
 			"routing-final-outbound", "socks5-udp", "transparent-tcp-redirect",
-			"transparent-tcp-udp-tproxy", "dns-result-unixgram", "observatory", "ready-status", "ipv6",
+			"transparent-tcp-udp-tproxy", "dns-result-unixgram", "dns-result-resync", "observatory", "ready-status", "inbound-health", "reload-if-match", "ipv6",
 		},
 	}
 }
@@ -71,7 +73,15 @@ func runRuntimeDaemon(ctx context.Context, configPath string, cfg *Config, hash 
 			return errors.New("start metrics: ").Base(err)
 		}
 		service.metrics = metricsServer
-		metricsServer.SetReadiness(func() bool { return service.listeners.Load() })
+		metricsServer.SetReadiness(func() bool {
+			snapshot, err := service.acquire()
+			if err != nil {
+				return false
+			}
+			defer snapshot.release()
+			_, ready := service.inboundHealth(len(snapshot.config.Inbounds))
+			return ready
+		})
 		defer metricsServer.Close()
 	}
 	var controlServer *control.Server
@@ -115,7 +125,7 @@ type runtimeService struct {
 	configPath       string
 	mu               sync.RWMutex
 	current          *runtimeSnapshot
-	reloadMu         sync.Mutex
+	reloadBusy       atomic.Bool
 	closed           bool
 	startedAt        time.Time
 	listeners        atomic.Bool
@@ -130,10 +140,16 @@ type runtimeService struct {
 	cancel           context.CancelFunc
 	retiredMu        sync.Mutex
 	retired          []*runtimeSnapshot
+	dnsEventSequence atomic.Uint64
+	dnsResultMu      sync.Mutex
+	dnsResults       map[string]dnsevent.Event
 }
 
 type reloadableInbound interface {
 	Reload(*appinbound.Config) error
+	PrepareReload(*appinbound.Config) (func() error, error)
+	Status() appinbound.HealthStatus
+	Failures() <-chan error
 }
 
 type reloadStatus struct {
@@ -151,8 +167,8 @@ type outboundRuntimeStatus struct {
 
 func newRuntimeService(ctx context.Context, configPath string, cfg *Config, hash string) (*runtimeService, error) {
 	lifecycleCtx, cancel := context.WithCancel(ctx)
-	s := &runtimeService{configPath: configPath, startedAt: time.Now(), outboundStatus: make(map[string]outboundRuntimeStatus), ctx: lifecycleCtx, cancel: cancel}
-	snapshot, err := s.buildSnapshot(lifecycleCtx, cfg, 1, hash)
+	s := &runtimeService{configPath: configPath, startedAt: time.Now(), outboundStatus: make(map[string]outboundRuntimeStatus), dnsResults: make(map[string]dnsevent.Event), ctx: lifecycleCtx, cancel: cancel}
+	snapshot, err := s.buildSnapshot(lifecycleCtx, cfg, 1, hash, true)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -167,7 +183,7 @@ func newRuntimeService(ctx context.Context, configPath string, cfg *Config, hash
 	return s, nil
 }
 
-func (s *runtimeService) buildSnapshot(ctx context.Context, cfg *Config, revision uint64, hash string) (*runtimeSnapshot, error) {
+func (s *runtimeService) buildSnapshot(ctx context.Context, cfg *Config, revision uint64, hash string, runtimeResources bool) (*runtimeSnapshot, error) {
 	manager := appoutbound.NewManager(&appoutbound.Config{Outbounds: cfg.Outbounds})
 	fail := func(err error) (*runtimeSnapshot, error) {
 		_ = manager.Close()
@@ -183,17 +199,20 @@ func (s *runtimeService) buildSnapshot(ctx context.Context, cfg *Config, revisio
 	if err := validateRoutingTargets(routerCfg, manager); err != nil {
 		return fail(errors.New("routing config: ").Base(err))
 	}
-	if err := validateRuntimeConfigWithOutbounds(cfg, manager); err != nil {
+	var dnsCfg *appdns.Config
+	if cfg.DNS != nil {
+		dnsCfg, err = cfg.DNS.Build()
+		if err != nil {
+			return fail(errors.New("build dns config: ").Base(err))
+		}
+	}
+	if err := validateRuntimeConfigWithBuiltDNS(cfg, manager, dnsCfg); err != nil {
 		return fail(err)
 	}
 
 	var dnsClient featdns.Client
 	var routedDNS *appdns.DNS
-	if cfg.DNS != nil {
-		dnsCfg, err := cfg.DNS.Build()
-		if err != nil {
-			return fail(errors.New("build dns config: ").Base(err))
-		}
+	if dnsCfg != nil {
 		routedDNS, err = appdns.New(ctx, dnsCfg)
 		if err != nil {
 			return fail(errors.New("create dns server: ").Base(err))
@@ -235,14 +254,23 @@ func (s *runtimeService) buildSnapshot(ctx context.Context, cfg *Config, revisio
 		conns: make(map[*leasedConn]struct{}),
 	}
 	if routedDNS != nil {
-		if cfg.DNSResultEvents != nil {
+		if runtimeResources && cfg.DNSResultEvents != nil {
 			sink, err := dnsevent.New(cfg.DNSResultEvents)
 			if err != nil {
 				snapshot.closeResources()
 				return nil, err
 			}
 			snapshot.dnsEvents = sink
-			routedDNS.SetResultObserver(sink.Emit)
+		}
+		if runtimeResources {
+			routedDNS.SetResultObserver(func(result appdns.Result) {
+				sequence := s.dnsEventSequence.Add(1)
+				event := dnsevent.NewEvent(result, revision, sequence)
+				if snapshot.dnsEvents != nil {
+					snapshot.dnsEvents.EmitEvent(event)
+				}
+				s.recordDNSResult(event)
+			})
 		}
 		routedDNS.SetTaggedDialer(func(dialCtx context.Context, dest bcnet.Destination, tag string) (net.Conn, error) {
 			return s.dialDNS(snapshot, dialCtx, dest, tag)
@@ -269,6 +297,7 @@ func (s *runtimeService) dialDNS(snapshot *runtimeSnapshot, ctx context.Context,
 		}
 		if err == nil {
 			outboundTag, ruleTag = decision.GetOutboundTag(), decision.GetRuleTag()
+			usedDefault = decision.IsFallback()
 			selected = snapshot.outbound.GetDialer(outboundTag)
 		} else {
 			selected = snapshot.outbound.GetDefaultDialer()
@@ -465,6 +494,7 @@ func (s *runtimeService) DialRouted(ctx context.Context, routeContext routing.Co
 		usedDefault = true
 	} else {
 		outboundTag, ruleTag = route.GetOutboundTag(), route.GetRuleTag()
+		usedDefault = route.IsFallback()
 		outboundDialer = snapshot.outbound.GetDialer(outboundTag)
 	}
 	if outboundDialer == nil {
@@ -670,6 +700,10 @@ func (s *runtimeService) Status(context.Context) (any, error) {
 	if snapshot.routedDNS != nil {
 		upstreams = snapshot.routedDNS.UpstreamStatus()
 	}
+	dnsEventStatus := map[string]any{"enabled": false}
+	if snapshot.dnsEvents != nil {
+		dnsEventStatus = map[string]any{"enabled": true, "stats": snapshot.dnsEvents.Stats(), "lastSequence": s.dnsEventSequence.Load()}
+	}
 	s.outboundStatusMu.RLock()
 	outbounds := make([]outboundRuntimeStatus, 0, len(snapshot.config.Outbounds))
 	for _, configured := range snapshot.config.Outbounds {
@@ -678,48 +712,71 @@ func (s *runtimeService) Status(context.Context) (any, error) {
 		outbounds = append(outbounds, status)
 	}
 	s.outboundStatusMu.RUnlock()
+	health, ready := s.inboundHealth(len(snapshot.config.Inbounds))
 	inbounds := make([]map[string]any, 0, len(snapshot.config.Inbounds))
-	for _, configured := range snapshot.config.Inbounds {
-		inbounds = append(inbounds, map[string]any{"tag": configured.Tag, "type": configured.Type, "listen": net.JoinHostPort(configured.Listen, strconv.Itoa(configured.Port)), "running": s.listeners.Load()})
+	for index, configured := range snapshot.config.Inbounds {
+		state := appinbound.HealthStatus{Tag: configured.Tag, State: "starting"}
+		if index < len(health) {
+			state = health[index]
+		}
+		inbounds = append(inbounds, map[string]any{"tag": state.Tag, "type": configured.Type, "listen": net.JoinHostPort(configured.Listen, strconv.Itoa(configured.Port)), "state": state.State, "running": state.State == "running", "lastError": state.LastError, "updatedAt": state.UpdatedAt})
 	}
 	var observation any
 	if snapshot.observer != nil {
 		observation, _ = snapshot.observer.GetObservation(context.Background())
 	}
 	return map[string]any{
-		"running": true, "ready": s.listeners.Load(), "startedAt": s.startedAt,
+		"running": true, "ready": ready, "startedAt": s.startedAt,
 		"configHash": snapshot.hash, "configRevision": snapshot.revision,
 		"activeSnapshotReferences": snapshot.refs.Load() - 1, "retiredSnapshots": retiredCount, "lastReload": reload,
-		"geodataLoaded": true, "inbounds": inbounds, "dnsUpstreams": upstreams, "outbounds": outbounds, "observatory": observation,
+		"geodataLoaded": true, "inbounds": inbounds, "dnsUpstreams": upstreams, "dnsResultEvents": dnsEventStatus, "outbounds": outbounds, "observatory": observation,
 	}, nil
 }
 func (s *runtimeService) Ready(context.Context) (any, error) {
-	ready := s.listeners.Load()
 	snapshot, err := s.acquire()
 	if err != nil {
-		return map[string]any{"ready": false, "checks": map[string]bool{"runtime": false, "inbounds": ready, "geodata": false}}, nil
+		return map[string]any{"ready": false, "checks": map[string]bool{"runtime": false, "inbounds": false, "geodata": false}}, nil
 	}
 	defer snapshot.release()
+	_, ready := s.inboundHealth(len(snapshot.config.Inbounds))
 	return map[string]any{
 		"ready": ready, "configHash": snapshot.hash, "configRevision": snapshot.revision,
 		"checks": map[string]bool{"runtime": true, "inbounds": ready, "geodata": true},
 	}, nil
+}
+
+func (s *runtimeService) inboundHealth(expected int) ([]appinbound.HealthStatus, bool) {
+	s.inboundMu.RLock()
+	listeners := append([]reloadableInbound(nil), s.inbounds...)
+	s.inboundMu.RUnlock()
+	statuses := make([]appinbound.HealthStatus, 0, len(listeners))
+	ready := s.listeners.Load() && expected > 0 && len(listeners) == expected
+	for _, listener := range listeners {
+		status := listener.Status()
+		statuses = append(statuses, status)
+		if status.State != "running" {
+			ready = false
+		}
+	}
+	return statuses, ready
 }
 func (s *runtimeService) Validate(ctx context.Context, raw []byte) (any, error) {
 	cfg, hash, err := s.configFromRequest(raw)
 	if err != nil {
 		return nil, invalidConfigError(err)
 	}
-	snapshot, err := s.buildSnapshot(ctx, cfg, 0, hash)
+	snapshot, err := s.buildSnapshot(ctx, cfg, 0, hash, false)
 	if err != nil {
 		return nil, invalidConfigError(err)
 	}
-	snapshot.retire()
+	snapshot.closeResources()
 	return map[string]any{"valid": true, "configHash": hash}, nil
 }
-func (s *runtimeService) Reload(ctx context.Context, raw []byte) (any, error) {
-	s.reloadMu.Lock()
-	defer s.reloadMu.Unlock()
+func (s *runtimeService) Reload(ctx context.Context, raw []byte, expectedValues ...string) (any, error) {
+	if !s.reloadBusy.CompareAndSwap(false, true) {
+		return nil, &control.APIError{Code: "busy", Message: "a configuration reload is already running", Status: http.StatusServiceUnavailable}
+	}
+	defer s.reloadBusy.Store(false)
 	cfg, hash, err := s.configFromRequest(raw)
 	if err != nil {
 		s.recordReload(err)
@@ -728,6 +785,17 @@ func (s *runtimeService) Reload(ctx context.Context, raw []byte) (any, error) {
 	current, err := s.acquire()
 	if err != nil {
 		return nil, err
+	}
+	if len(expectedValues) > 0 {
+		expected := strings.Trim(strings.TrimSpace(expectedValues[0]), `"`)
+		expected = strings.TrimPrefix(expected, "W/")
+		expected = strings.Trim(expected, `"`)
+		if expected != "" && expected != strconv.FormatUint(current.revision, 10) && expected != current.hash {
+			current.release()
+			err := &control.APIError{Code: "revision_conflict", Message: "If-Match does not match the active config revision or hash", Status: http.StatusConflict}
+			s.recordReload(err)
+			return nil, err
+		}
 	}
 	if hash == current.hash {
 		revision := current.revision
@@ -740,7 +808,7 @@ func (s *runtimeService) Reload(ctx context.Context, raw []byte) (any, error) {
 		return nil, err
 	}
 	nextRevision := current.revision + 1
-	next, err := s.buildSnapshot(s.ctx, cfg, nextRevision, hash)
+	next, err := s.buildSnapshot(s.ctx, cfg, nextRevision, hash, true)
 	if err != nil {
 		current.release()
 		s.recordReload(err)
@@ -754,7 +822,9 @@ func (s *runtimeService) Reload(ctx context.Context, raw []byte) (any, error) {
 	}
 	if s.metrics != nil && cfg.Metrics != nil {
 		if err := s.metrics.Reload(cfg.Metrics); err != nil {
-			_ = s.reloadInbounds(cfg.Inbounds, current.config.Inbounds)
+			if rollbackErr := s.reloadInbounds(cfg.Inbounds, current.config.Inbounds); rollbackErr != nil {
+				err = errors.New("metrics reload failed and inbound rollback failed: ").Base(stderrors.Join(err, rollbackErr))
+			}
 			next.retire()
 			current.release()
 			s.recordReload(err)
@@ -762,10 +832,16 @@ func (s *runtimeService) Reload(ctx context.Context, raw []byte) (any, error) {
 		}
 	}
 	if err := next.activate(); err != nil {
-		_ = s.reloadInbounds(cfg.Inbounds, current.config.Inbounds)
-		if s.metrics != nil && current.config.Metrics != nil {
-			_ = s.metrics.Reload(current.config.Metrics)
+		rollbackErrors := []error{err}
+		if rollbackErr := s.reloadInbounds(cfg.Inbounds, current.config.Inbounds); rollbackErr != nil {
+			rollbackErrors = append(rollbackErrors, rollbackErr)
 		}
+		if s.metrics != nil && current.config.Metrics != nil {
+			if rollbackErr := s.metrics.Reload(current.config.Metrics); rollbackErr != nil {
+				rollbackErrors = append(rollbackErrors, rollbackErr)
+			}
+		}
+		err = stderrors.Join(rollbackErrors...)
 		next.retire()
 		current.release()
 		s.recordReload(err)
@@ -774,9 +850,18 @@ func (s *runtimeService) Reload(ctx context.Context, raw []byte) (any, error) {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
+		rollbackErrors := []error{errors.New("runtime is closed")}
+		if rollbackErr := s.reloadInbounds(cfg.Inbounds, current.config.Inbounds); rollbackErr != nil {
+			rollbackErrors = append(rollbackErrors, rollbackErr)
+		}
+		if s.metrics != nil && current.config.Metrics != nil {
+			if rollbackErr := s.metrics.Reload(current.config.Metrics); rollbackErr != nil {
+				rollbackErrors = append(rollbackErrors, rollbackErr)
+			}
+		}
 		next.retire()
 		current.release()
-		return nil, errors.New("runtime is closed")
+		return nil, stderrors.Join(rollbackErrors...)
 	}
 	old := s.current
 	s.current = next
@@ -856,7 +941,8 @@ func (s *runtimeService) Explain(_ context.Context, request control.RouteExplain
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"matched": decision.GetRuleTag() != "", "default": false, "ruleTag": decision.GetRuleTag(), "outboundTag": decision.GetOutboundTag(), "configHash": snapshot.hash, "configRevision": snapshot.revision}, nil
+	isDefault := decision.IsFallback()
+	return map[string]any{"matched": !isDefault && decision.GetRuleTag() != "", "default": isDefault, "ruleTag": decision.GetRuleTag(), "outboundTag": decision.GetOutboundTag(), "configHash": snapshot.hash, "configRevision": snapshot.revision}, nil
 }
 func (s *runtimeService) Resolve(ctx context.Context, request control.DNSResolveRequest) (any, error) {
 	if strings.TrimSpace(request.Domain) == "" {
@@ -896,6 +982,47 @@ func (s *runtimeService) Observatory(context.Context) (any, error) {
 	return map[string]any{"enabled": true, "status": result}, nil
 }
 func (s *runtimeService) Metrics(context.Context) (any, error) { return commonmetrics.Snapshot(), nil }
+func (s *runtimeService) DNSResults(context.Context) (any, error) {
+	snapshot, err := s.acquire()
+	if err != nil {
+		return nil, err
+	}
+	defer snapshot.release()
+	now := time.Now().Unix()
+	s.dnsResultMu.Lock()
+	results := make([]dnsevent.Event, 0, len(s.dnsResults))
+	for key, event := range s.dnsResults {
+		if event.ExpiresAt <= now {
+			delete(s.dnsResults, key)
+			continue
+		}
+		results = append(results, event)
+	}
+	s.dnsResultMu.Unlock()
+	sort.Slice(results, func(i, j int) bool { return results[i].Sequence < results[j].Sequence })
+	eventStats := dnsevent.Stats{}
+	if snapshot.dnsEvents != nil {
+		eventStats = snapshot.dnsEvents.Stats()
+	}
+	return map[string]any{"configRevision": snapshot.revision, "lastSequence": s.dnsEventSequence.Load(), "eventStats": eventStats, "results": results}, nil
+}
+
+func (s *runtimeService) recordDNSResult(event dnsevent.Event) {
+	key := strings.ToLower(event.Domain) + "\x00" + event.ServerTag
+	s.dnsResultMu.Lock()
+	s.dnsResults[key] = event
+	if len(s.dnsResults) > 4096 {
+		oldestKey := ""
+		oldestSequence := ^uint64(0)
+		for candidate, value := range s.dnsResults {
+			if value.Sequence < oldestSequence {
+				oldestKey, oldestSequence = candidate, value.Sequence
+			}
+		}
+		delete(s.dnsResults, oldestKey)
+	}
+	s.dnsResultMu.Unlock()
+}
 
 func (s *runtimeService) configFromRequest(raw []byte) (*Config, string, error) {
 	if len(strings.TrimSpace(string(raw))) == 0 {
@@ -946,8 +1073,15 @@ func reloadCompatibility(current, next *Config) error {
 		return &control.APIError{Code: "restart_required", Message: "adding or removing inbound listeners requires restart", Status: http.StatusConflict}
 	}
 	for index := range current.Inbounds {
+		if current.Inbounds[index].Tag != next.Inbounds[index].Tag {
+			return &control.APIError{Code: "restart_required", Message: "inbound tag changes require restart", Status: http.StatusConflict}
+		}
 		if !sameInboundBinding(current.Inbounds[index], next.Inbounds[index]) {
 			return &control.APIError{Code: "restart_required", Message: "inbound listen identity changed", Status: http.StatusConflict}
+		}
+		left, right := current.Inbounds[index], next.Inbounds[index]
+		if left.Sniffing != right.Sniffing || left.SniffingTimeoutMs != right.SniffingTimeoutMs || left.SniffingMaxBytes != right.SniffingMaxBytes || !reflect.DeepEqual(left.DNSRules, right.DNSRules) {
+			return &control.APIError{Code: "restart_required", Message: "routing-affecting inbound sniffing or DNS rule changes require restart", Status: http.StatusConflict}
 		}
 	}
 	if (current.Metrics == nil) != (next.Metrics == nil) || metricsListen(current.Metrics) != metricsListen(next.Metrics) {
@@ -991,18 +1125,27 @@ func (s *runtimeService) reloadInbounds(previous, next []*appinbound.Config) err
 	if len(listeners) != len(next) {
 		return &control.APIError{Code: "restart_required", Message: "inbound listener set changed", Status: http.StatusConflict}
 	}
+	commits := make([]func() error, len(next))
 	for index, config := range next {
 		listener := listeners[index]
 		if listener == nil {
 			return &control.APIError{Code: "restart_required", Message: "inbound listener set changed", Status: http.StatusConflict}
 		}
-		if err := listener.Reload(config); err != nil {
-			for rollbackIndex, old := range previous {
-				if rollbackIndex < len(listeners) && listeners[rollbackIndex] != nil {
-					_ = listeners[rollbackIndex].Reload(old)
+		commit, err := listener.PrepareReload(config)
+		if err != nil {
+			return &control.APIError{Code: "reload_failed", Message: err.Error(), Status: http.StatusInternalServerError}
+		}
+		commits[index] = commit
+	}
+	for index, commit := range commits {
+		if err := commit(); err != nil {
+			rollbackErrors := []error{err}
+			for rollbackIndex := 0; rollbackIndex < index; rollbackIndex++ {
+				if rollbackErr := listeners[rollbackIndex].Reload(previous[rollbackIndex]); rollbackErr != nil {
+					rollbackErrors = append(rollbackErrors, rollbackErr)
 				}
 			}
-			return &control.APIError{Code: "reload_failed", Message: err.Error(), Status: http.StatusInternalServerError}
+			return &control.APIError{Code: "reload_failed", Message: stderrors.Join(rollbackErrors...).Error(), Status: http.StatusInternalServerError}
 		}
 	}
 	return nil

@@ -53,7 +53,7 @@ type Config struct {
 }
 
 // version is overridden by release builds with -ldflags=-X main.version=... .
-var version = "1.0.10"
+var version = "1.1.0"
 var commit = "unknown"
 var buildDate = "unknown"
 
@@ -121,7 +121,14 @@ func run() error {
 	if err := validateRoutingTargets(routerCfg, ohm); err != nil {
 		return errors.New("routing config: ").Base(err)
 	}
-	if err := validateRuntimeConfig(cfg); err != nil {
+	var builtDNSConfig *appdns.Config
+	if cfg.DNS != nil {
+		builtDNSConfig, err = cfg.DNS.Build()
+		if err != nil {
+			return errors.New("build dns config: ").Base(err)
+		}
+	}
+	if err := validateRuntimeConfigWithBuiltDNS(cfg, ohm, builtDNSConfig); err != nil {
 		return err
 	}
 	if *checkConfig {
@@ -135,12 +142,8 @@ func run() error {
 	baseCtx := context.Background()
 	var dnsClient featdns.Client
 	var routedDNS *appdns.DNS
-	if cfg.DNS != nil {
-		dnsCfg, err := cfg.DNS.Build()
-		if err != nil {
-			return errors.New("build dns config: ").Base(err)
-		}
-		srv, err := appdns.New(baseCtx, dnsCfg)
+	if builtDNSConfig != nil {
+		srv, err := appdns.New(baseCtx, builtDNSConfig)
 		if err != nil {
 			return errors.New("create dns server: ").Base(err)
 		}
@@ -294,11 +297,19 @@ func validateRoutingTargets(cfg *router.Config, ohm *appoutbound.Manager) error 
 	return nil
 }
 
-func validateRuntimeConfig(cfg *Config) error {
-	return validateRuntimeConfigWithOutbounds(cfg, nil)
+func validateRuntimeConfigWithOutbounds(cfg *Config, ohm *appoutbound.Manager) error {
+	var dnsConfig *appdns.Config
+	if cfg.DNS != nil {
+		var err error
+		dnsConfig, err = cfg.DNS.Build()
+		if err != nil {
+			return errors.New("build dns config: ").Base(err)
+		}
+	}
+	return validateRuntimeConfigWithBuiltDNS(cfg, ohm, dnsConfig)
 }
 
-func validateRuntimeConfigWithOutbounds(cfg *Config, ohm *appoutbound.Manager) error {
+func validateRuntimeConfigWithBuiltDNS(cfg *Config, ohm *appoutbound.Manager, dnsConfig *appdns.Config) error {
 	seen := make(map[string]struct{}, len(cfg.Inbounds))
 	for index, inbound := range cfg.Inbounds {
 		if err := appinbound.ValidateConfig(inbound); err != nil {
@@ -312,11 +323,7 @@ func validateRuntimeConfigWithOutbounds(cfg *Config, ohm *appoutbound.Manager) e
 			return errors.New("invalid sniffing settings for inbound ", inbound.Tag).Base(err)
 		}
 	}
-	if cfg.DNS != nil {
-		dnsConfig, err := cfg.DNS.Build()
-		if err != nil {
-			return errors.New("build dns config: ").Base(err)
-		}
+	if dnsConfig != nil {
 		if ohm != nil {
 			for _, server := range dnsConfig.NameServer {
 				if tag := server.GetOutboundTag(); tag != "" && ohm.GetOutbound(tag) == nil {
@@ -346,11 +353,9 @@ func validateRuntimeConfigWithOutbounds(cfg *Config, ohm *appoutbound.Manager) e
 		if cfg.DNS == nil {
 			return errors.New("dnsResultEvents requires a DNS configuration")
 		}
-		sink, err := dnsevent.New(cfg.DNSResultEvents)
-		if err != nil {
+		if err := dnsevent.Validate(cfg.DNSResultEvents); err != nil {
 			return errors.New("dnsResultEvents config: ").Base(err)
 		}
-		_ = sink.Close()
 	}
 	return nil
 }
@@ -396,7 +401,11 @@ func runTest(r *router.Router, ohm *appoutbound.Manager, dest string) error {
 		fmt.Printf("  ip:         %s\n", target.Address.IP())
 	}
 	fmt.Printf("  port:       %d (%s)\n", target.Port, target.Network)
-	fmt.Printf("Matched rule: %s\n", orDash(ruleTag))
+	if route.IsFallback() {
+		fmt.Printf("Matched rule: - (final/default)\n")
+	} else {
+		fmt.Printf("Matched rule: %s\n", orDash(ruleTag))
+	}
 	fmt.Printf("Outbound tag: %s\n", tag)
 	if ob := ohm.GetOutbound(tag); ob != nil {
 		describeOutbound(ob)
@@ -476,6 +485,13 @@ func runDaemonWithReload(r featrouting.Router, ohm dispatcher.DialerManager, dns
 		Close() error
 	}
 	var listeners []listener
+	type inboundFailure struct {
+		tag string
+		err error
+	}
+	failureCh := make(chan inboundFailure, len(inbounds))
+	monitorCtx, stopMonitors := context.WithCancel(context.Background())
+	defer stopMonitors()
 	closeListeners := func() {
 		for i := len(listeners) - 1; i >= 0; i-- {
 			_ = listeners[i].Close()
@@ -508,6 +524,15 @@ func runDaemonWithReload(r featrouting.Router, ohm dispatcher.DialerManager, dns
 		if live, ok := r.(*runtimeService); ok {
 			if reloadable, ok := ln.(reloadableInbound); ok {
 				live.registerInbound(reloadable)
+				go func(tag string, failures <-chan error) {
+					select {
+					case err := <-failures:
+						if err != nil {
+							failureCh <- inboundFailure{tag: tag, err: err}
+						}
+					case <-monitorCtx.Done():
+					}
+				}(ibCfg.Tag, reloadable.Failures())
 			}
 		}
 		listeners = append(listeners, ln)
@@ -531,6 +556,9 @@ func runDaemonWithReload(r featrouting.Router, ohm dispatcher.DialerManager, dns
 	defer signal.Stop(sigCh)
 	for {
 		select {
+		case failure := <-failureCh:
+			closeListeners()
+			return errors.New("inbound ", failure.tag, " failed; daemon must restart: ").Base(failure.err)
 		case received := <-sigCh:
 			if received == syscall.SIGHUP {
 				if reload == nil {

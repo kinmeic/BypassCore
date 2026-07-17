@@ -46,9 +46,10 @@ type udpTproxyListener struct {
 	limits       atomic.Pointer[udpResourceLimits]
 	runtimeTag   atomic.Pointer[string]
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	ctx     context.Context
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
+	onState func(string, error)
 }
 
 // udpSession represents one client's UDP relay: the outbound connection +
@@ -93,7 +94,7 @@ func (l *udpTproxyListener) currentLimits() udpResourceLimits {
 }
 
 // startUDP creates a UDP TPROXY listener.
-func startUDP(cfg *Config, d *dispatcher.Dispatcher) (*udpTproxyListener, error) {
+func startUDP(cfg *Config, d *dispatcher.Dispatcher, onState func(string, error)) (*udpTproxyListener, error) {
 	limits, err := udpResourceLimitsFromConfig(cfg)
 	if err != nil {
 		return nil, err
@@ -161,6 +162,7 @@ func startUDP(cfg *Config, d *dispatcher.Dispatcher) (*udpTproxyListener, error)
 		dispatcher:   d,
 		conn:         udpConn,
 		sourceCounts: make(map[string]int),
+		onState:      onState,
 	}
 	l.setLimits(limits)
 	l.setTag(cfg.Tag)
@@ -181,6 +183,7 @@ func (l *udpTproxyListener) recvLoop() {
 
 	buf := make([]byte, 65535)
 	oob := make([]byte, 1024)
+	degraded := false
 
 	for {
 		select {
@@ -195,7 +198,23 @@ func (l *udpTproxyListener) recvLoop() {
 				return
 			}
 			errors.LogErrorInner(context.Background(), err, "UDP tproxy read failed")
+			if !isRetryableNetworkError(err) {
+				if l.onState != nil {
+					l.onState("failed", err)
+				}
+				return
+			}
+			if !degraded && l.onState != nil {
+				l.onState("degraded", err)
+			}
+			degraded = true
 			continue
+		}
+		if degraded {
+			if l.onState != nil {
+				l.onState("running", nil)
+			}
+			degraded = false
 		}
 
 		// Extract original destination from OOB control message.

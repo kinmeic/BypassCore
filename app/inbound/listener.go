@@ -37,6 +37,7 @@ type Listener struct {
 	stateMu    sync.Mutex
 	state      listenerState
 	runtimeTag atomic.Pointer[string]
+	health     *healthTracker
 }
 
 type listenerState uint8
@@ -55,11 +56,17 @@ func New(cfg *Config, d *dispatcher.Dispatcher) *Listener {
 		dispatcher:  d,
 		activeConns: make(map[net.Conn]struct{}),
 	}
+	tag := ""
 	if cfg != nil {
 		l.setTag(cfg.Tag)
+		tag = cfg.Tag
 	}
+	l.health = newHealthTracker(tag)
 	return l
 }
+
+func (l *Listener) Status() HealthStatus   { return l.health.snapshot() }
+func (l *Listener) Failures() <-chan error { return l.health.failures }
 
 func (l *Listener) setTag(tag string) { value := tag; l.runtimeTag.Store(&value) }
 func (l *Listener) inboundTag() string {
@@ -73,36 +80,58 @@ func (l *Listener) inboundTag() string {
 // sockets. Existing flows keep their current resources; new flows use the new
 // sniffing and UDP limits.
 func (l *Listener) Reload(cfg *Config) error {
-	if err := ValidateConfig(cfg); err != nil {
-		return err
-	}
-	l.stateMu.Lock()
-	defer l.stateMu.Unlock()
-	if l.state != listenerRunning {
-		return errors.New("inbound: listener is not running")
-	}
-	if !SameListenerBinding(l.cfg, cfg) {
-		return errors.New("inbound: listen identity changed")
-	}
-	sniffer, err := dispatcher.NewSnifferWithOptions(cfg.Sniffing, cfg.SniffingTimeoutMs, cfg.SniffingMaxBytes)
+	commit, err := l.PrepareReload(cfg)
 	if err != nil {
 		return err
 	}
+	return commit()
+}
+
+// PrepareReload validates and allocates all mutable policy objects without
+// changing live traffic. The returned commit only publishes prepared values.
+func (l *Listener) PrepareReload(cfg *Config) (func() error, error) {
+	if err := ValidateConfig(cfg); err != nil {
+		return nil, err
+	}
+	l.stateMu.Lock()
+	if l.state != listenerRunning {
+		l.stateMu.Unlock()
+		return nil, errors.New("inbound: listener is not running")
+	}
+	if !SameListenerBinding(l.cfg, cfg) {
+		l.stateMu.Unlock()
+		return nil, errors.New("inbound: listen identity changed")
+	}
+	if l.cfg.Tag != cfg.Tag {
+		l.stateMu.Unlock()
+		return nil, errors.New("inbound: tag changes require restart")
+	}
+	hasUDP := l.udpListener != nil
+	l.stateMu.Unlock()
+	sniffer, err := dispatcher.NewSnifferWithOptions(cfg.Sniffing, cfg.SniffingTimeoutMs, cfg.SniffingMaxBytes)
+	if err != nil {
+		return nil, err
+	}
 	var limits udpResourceLimits
-	if l.udpListener != nil {
+	if hasUDP {
 		limits, err = udpResourceLimitsFromConfig(cfg)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
-	l.dispatcher.SetSniffer(sniffer)
-	l.setTag(cfg.Tag)
-	if l.udpListener != nil {
-		l.udpListener.setTag(cfg.Tag)
-		l.udpListener.setLimits(limits)
-	}
-	l.cfg = cfg
-	return nil
+	return func() error {
+		l.stateMu.Lock()
+		defer l.stateMu.Unlock()
+		if l.state != listenerRunning || !SameListenerBinding(l.cfg, cfg) || l.cfg.Tag != cfg.Tag {
+			return errors.New("inbound: listener changed after reload preparation")
+		}
+		l.dispatcher.SetSniffer(sniffer)
+		if l.udpListener != nil {
+			l.udpListener.setLimits(limits)
+		}
+		l.cfg = cfg
+		return nil
+	}, nil
 }
 
 // SameListenerBinding reports whether two configs use the same kernel sockets.
@@ -179,12 +208,15 @@ func (l *Listener) Start() error {
 		return errors.New("inbound: listener is closed")
 	}
 	l.state = listenerStarting
+	l.health.set(l.inboundTag(), "starting", nil, false)
 	if err := l.startLocked(); err != nil {
 		l.closeResourcesLocked()
 		l.state = listenerNew
+		l.health.set(l.inboundTag(), "failed", err, false)
 		return err
 	}
 	l.state = listenerRunning
+	l.health.set(l.inboundTag(), "running", nil, false)
 	return nil
 }
 
@@ -234,7 +266,9 @@ func (l *Listener) startLocked() error {
 	}
 
 	if wantUDP {
-		udpLn, err := startUDP(l.cfg, l.dispatcher)
+		udpLn, err := startUDP(l.cfg, l.dispatcher, func(state string, err error) {
+			l.health.setComponent(l.inboundTag(), "udp", state, err, state == "failed")
+		})
 		if err != nil {
 			return errors.New("inbound UDP listen failed").Base(err)
 		}
@@ -276,6 +310,7 @@ func (l *Listener) Close() error {
 	}
 	l.state = listenerClosed
 	l.closeResourcesLocked()
+	l.health.set(l.inboundTag(), "closed", nil, false)
 	return nil
 }
 
@@ -307,6 +342,7 @@ func (l *Listener) closeResourcesLocked() {
 // acceptLoop accepts TCP connections and dispatches them.
 func (l *Listener) acceptLoop() {
 	defer l.wg.Done()
+	degraded := false
 	for {
 		conn, err := l.tcpListener.Accept()
 		if err != nil {
@@ -314,6 +350,12 @@ func (l *Listener) acceptLoop() {
 				return
 			}
 			errors.LogErrorInner(context.Background(), err, "inbound accept failed")
+			if !isRetryableNetworkError(err) {
+				l.health.setComponent(l.inboundTag(), "tcp", "failed", err, true)
+				return
+			}
+			l.health.setComponent(l.inboundTag(), "tcp", "degraded", err, false)
+			degraded = true
 			// Back off on persistent errors (e.g. EMFILE) to avoid burning CPU.
 			select {
 			case <-l.ctx.Done():
@@ -321,6 +363,10 @@ func (l *Listener) acceptLoop() {
 			case <-time.After(100 * time.Millisecond):
 			}
 			continue
+		}
+		if degraded {
+			l.health.setComponent(l.inboundTag(), "tcp", "running", nil, false)
+			degraded = false
 		}
 		l.wg.Add(1)
 		go l.handleConn(conn)
