@@ -14,6 +14,7 @@
   - `proxy` — SOCKS5 client 拨到本地 naiveproxy/sing-box 的 socks 端口
 - **DNS 子系统**：多上游 DNS + 缓存 + 域名分流 + IP 过滤，UDP / TCP / DoT(RFC 7858) / DoH(RFC 8484)
 - **DNS 监听服务**：通过普通 UDP/TCP 端口提供 A/AAAA 解析，并将 MX/TXT/SRV/PTR/CAA 等记录类型沿相同 tagged outbound 转发
+- **原生 DNS→NFTSet**：在 Linux 上通过 netlink 把指定 DNS server tag 的 A/AAAA 结果批量写入 IPv4/IPv6 nftables set，元素超时跟随 DNS TTL
 - **负载均衡**：random / roundrobin / leastping / leastload + Observatory 健康探测
 - **进程匹配**：按源进程名/路径分流（Linux/macOS/Windows）
 - **domainStrategy**：AsIs / IpIfNonMatch / IpOnDemand
@@ -129,10 +130,42 @@ transport.Bridge (双向拷贝)
 每个 DNS server 还可直接配置 `outboundTag`，无需再生成隐藏 DNS 路由规则；
 引用不存在的 outbound 会在配置校验阶段直接报错。
 
-如需把解析结果交给轻量 NFTSet/nftables 消费者，可开启非阻塞 Unix datagram
-事件出口。事件还包含单调递增 `sequence`、`configRevision`、过期时间及累计丢失数。
-通道仍是 best-effort，但消费者发现断号后可通过 `GET /v1/dns/results` 全量同步当前
-未过期结果；队列满、消费者离线或写入超时都不会阻塞 DNS：
+Linux 上可让 BypassCore 根据最终命中的 DNS server tag，直接通过 netlink 把成功的
+A/AAAA 结果写入预先创建的 nftables set，从而删除 ChinaDNS-NG 辅助进程、额外监听
+端口以及 dnsmasq 域名列表复制链：
+
+```json
+{
+  "dnsResultNFTSets": {
+    "queueSize": 256,
+    "batchSize": 128,
+    "flushIntervalMs": 25,
+    "policies": [
+      {
+        "serverTags": ["cn"],
+        "ipv4Set": "inet@bypass@direct_dns4",
+        "ipv6Set": "inet@bypass@direct_dns6"
+      }
+    ]
+  }
+}
+```
+
+写入队列有界且不阻塞 DNS 请求，更新会合并批处理，新元素的 timeout 使用 DNS TTL。
+与 ChinaDNS-NG 的安全默认值一致，`0.0.0.0/8`、`127.0.0.0/8`、`::`、`::1`
+会被过滤，不会成为路由豁免。
+目标 set 必须已存在，key 类型分别为 `ipv4_addr`/`ipv6_addr`，并带 `timeout` flag；
+名称使用 `family@table@set`，支持 `inet`、`ip` 和 `ip6` family。外部编排器建表后可
+调用 `POST /v1/dns/nftsets/probe` 一次性检查存在性、类型与 timeout 能力；队列丢弃、
+写入错误会进入 status/readiness。配置了 writer 时，在首次完整 probe 成功前 readiness
+保持 false。每次成功 probe 还会刷新内核 set 元数据并清除 writer 的 TTL 去重状态，
+因此外部编排器在 flush 或重建 set 后应再次调用；热重载会在快照切换前探测候选目标，
+失败时继续保留当前 revision。
+
+如仍需外部消费者，也可开启非阻塞 Unix datagram 事件出口。事件包含单调递增
+`sequence`、`configRevision`、过期时间及累计丢失数。通道是 best-effort，消费者
+发现断号后可通过 `GET /v1/dns/results` 全量同步当前未过期结果；队列满、消费者离线
+或写入超时都不会阻塞 DNS：
 
 ```json
 {"dnsResultEvents":{"socket":"/run/bypasscore/dns-results.sock","queueSize":256,"maxDatagramBytes":8192,"maxQueueBytes":1048576}}
@@ -245,6 +278,8 @@ procd/服务管理器重启。
 | `GET /v1/observatory` | 当前探测结果 |
 | `GET /v1/metrics` | JSON 指标 |
 | `GET /v1/dns/results` | 供事件消费者重同步的有界、未过期 DNS 结果快照 |
+| `GET /v1/dns/nftsets` | 原生 DNS 结果 NFTSet writer 的健康状态与计数器 |
+| `POST /v1/dns/nftsets/probe` | 检查目标 set 的存在性、地址类型及 timeout 支持 |
 
 调用示例：`curl --unix-socket /run/bypasscore/control.sock http://localhost/v1/status`。
 Validate/Reload 共用一个不排队的 mutation 槽，并发请求会立即返回 `503 busy`。
@@ -252,8 +287,9 @@ Reload 支持 `If-Match: <revision-or-config-hash>`，旧写入者会得到
 `409 revision_conflict`；请求体还受全局在途字节预算约束。
 `SIGHUP` 也走同一条事务式重载路径：候选 runtime 先完整构建和校验，再一次原子
 切换。已有 TCP/UDP 流量继续持有旧快照并自然排空，30 秒后仍未结束的旧快照会被
-强制回收。routing、outbound、DNS、Observatory、DNS 结果事件以及不影响路由语义的
-inbound 资源策略/metrics 参数均可热更新。增加/删除监听器，或修改 inbound tag、
+强制回收。routing、outbound、DNS、Observatory、DNS 结果事件/NFTSet 策略以及不影响
+路由语义的 inbound 资源策略/metrics 参数均可热更新；候选 NFTSet 策略必须在切换前
+通过内核目标探测。增加/删除监听器，或修改 inbound tag、
 sniffing、DNS action rules、地址、端口、类型、网络、TLS 文件、DoH path，以及 metrics 监听地址、control
 socket 时会返回 `restart_required`，当前 revision 保持不变。
 
@@ -304,6 +340,7 @@ app/outbound/      outbound 描述符 + Manager (tag 查找 + dialer factory)
 app/router/        路由核心 (规则匹配 + PickRoute + balancer)
 app/observatory/   出站健康探测
 app/dns/           DNS 子系统 (多上游 + 缓存 + DoT/DoH)
+app/dnsnftset/     DNS server tag → nftables set 的有界原生 netlink writer
 proxy/freedom/     直连拨号器 (net.Dial + 源IP/接口绑定)
 proxy/blackhole/   丢弃拨号器
 proxy/socks/       SOCKS5 client 拨号器
@@ -321,9 +358,11 @@ cmd/bypasscore/    CLI 入口 (run/test/resolve/observe)
 
 GitHub Actions 会在真实 network namespace 拓扑中验证 TCP REDIRECT、TCP/UDP
 TPROXY、IPv6、SOCKS5 UDP、透明回复源地址恢复、IPv4/IPv6 UDP/TCP DNS 监听、
-原始 TXT 转发、DNS UDP 截断后的 TCP 回退，以及 UDP session/FD/RSS 上限。
+原始 TXT 转发、DNS UDP 截断后的 TCP 回退、带 timeout 的原生 NFTSet 写入，以及 UDP session/FD/RSS 上限。
 本地 Linux 主机可用 root 权限运行：
 
 ```bash
 integration/netns/run.sh
+go test -c -o /tmp/bypasscore-dnsnftset.test ./app/dnsnftset
+sudo env BYPASSCORE_NFTSET_INTEGRATION=1 /tmp/bypasscore-dnsnftset.test -test.run '^TestKernelNFTSetWriter$' -test.v
 ```

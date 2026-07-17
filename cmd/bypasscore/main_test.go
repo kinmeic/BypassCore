@@ -44,6 +44,18 @@ func TestValidateRuntimeConfigRejectsUnknownDNSOutbound(t *testing.T) {
 	}
 }
 
+func TestValidateRuntimeConfigRejectsUnknownDNSNFTSetServerTag(t *testing.T) {
+	cfg, _, err := decodeConfig([]byte(`{"outbounds":[{"tag":"direct","mode":"freedom"}],"dns":{"servers":[{"address":"1.1.1.1","tag":"direct"}]},"dnsResultNFTSets":{"policies":[{"serverTags":["typo"],"ipv4Set":"inet@bypass@direct4"}]},"routing":{"finalOutboundTag":"direct"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := appoutbound.NewManager(&appoutbound.Config{Outbounds: cfg.Outbounds})
+	defer manager.Close()
+	if err := validateRuntimeConfigWithOutbounds(cfg, manager); err == nil {
+		t.Fatal("unknown DNS-result NFTSet server tag passed validation")
+	}
+}
+
 func TestRunDaemonDNSContextShutdownReleasesPort(t *testing.T) {
 	probe, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
 	if err != nil {

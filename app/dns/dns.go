@@ -235,7 +235,8 @@ func (s *DNS) SetTaggedDialer(dial TaggedDialer) {
 	}
 }
 
-// SetResultObserver installs a non-blocking caller-owned result sink hook.
+// SetResultObserver installs a non-blocking caller-owned hook for the final
+// upstream result selected by serial or parallel policy evaluation.
 func (s *DNS) SetResultObserver(observer ResultObserver) {
 	var holder *resultObserver
 	if observer != nil {
@@ -510,6 +511,7 @@ func (s *DNS) serialQuery(ctx context.Context, domain string, option dns.IPOptio
 		ips, ttl, err := client.QueryIP(ctx, domain, option)
 
 		if len(ips) > 0 {
+			client.notifySelectedResult(domain, ips, ttl)
 			return ips, ttl, nil
 		}
 
@@ -555,6 +557,7 @@ func (s *DNS) parallelQuery(ctx context.Context, domain string, option dns.IPOpt
 			for j := g.start; j <= g.end; j++ {
 				r := results[j]
 				if r != nil && r.err == nil && len(r.ips) > 0 {
+					clients[r.index].notifySelectedResult(domain, r.ips, r.ttl)
 					return r.ips, r.ttl, nil
 				}
 			}

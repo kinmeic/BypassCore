@@ -267,10 +267,13 @@ func (c *Client) QueryIP(ctx context.Context, domain string, option dns_feature.
 			errors.LogDebug(context.Background(), "domain ", domain, " unpriorIPs ", ips, " matched at server ", c.Name())
 		}
 	}
+	return ips, ttl, nil
+}
+
+func (c *Client) notifySelectedResult(domain string, ips []bcnet.IP, ttl uint32) {
 	if observer := c.observer.Load(); observer != nil {
 		observer.call(Result{Domain: domain, IPs: append([]bcnet.IP(nil), ips...), TTL: ttl, ServerTag: c.metricTag, At: time.Now()})
 	}
-	return ips, ttl, nil
 }
 
 // QueryRaw forwards one complete DNS wire message through the same tagged

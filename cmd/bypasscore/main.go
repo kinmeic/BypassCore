@@ -22,6 +22,7 @@ import (
 	"github.com/eugene/bypasscore/app/dispatcher"
 	appdns "github.com/eugene/bypasscore/app/dns"
 	"github.com/eugene/bypasscore/app/dnsevent"
+	"github.com/eugene/bypasscore/app/dnsnftset"
 	appinbound "github.com/eugene/bypasscore/app/inbound"
 	appmetrics "github.com/eugene/bypasscore/app/metrics"
 	"github.com/eugene/bypasscore/app/observatory"
@@ -42,18 +43,19 @@ import (
 
 // Config is the top-level BypassCore config (outbounds + routing + dns + inbounds).
 type Config struct {
-	Outbounds       []*appoutbound.Outbound `json:"outbounds"`
-	Routing         conf.RouterConfig       `json:"routing"`
-	DNS             *conf.DNSConfig         `json:"dns"`
-	Inbounds        []*appinbound.Config    `json:"inbounds"`
-	Observatory     *observatory.Config     `json:"observatory"`
-	Metrics         *appmetrics.Config      `json:"metrics,omitempty"`
-	Control         *control.Config         `json:"control,omitempty"`
-	DNSResultEvents *dnsevent.Config        `json:"dnsResultEvents,omitempty"`
+	Outbounds        []*appoutbound.Outbound `json:"outbounds"`
+	Routing          conf.RouterConfig       `json:"routing"`
+	DNS              *conf.DNSConfig         `json:"dns"`
+	Inbounds         []*appinbound.Config    `json:"inbounds"`
+	Observatory      *observatory.Config     `json:"observatory"`
+	Metrics          *appmetrics.Config      `json:"metrics,omitempty"`
+	Control          *control.Config         `json:"control,omitempty"`
+	DNSResultEvents  *dnsevent.Config        `json:"dnsResultEvents,omitempty"`
+	DNSResultNFTSets *dnsnftset.Config       `json:"dnsResultNFTSets,omitempty"`
 }
 
 // version is overridden by release builds with -ldflags=-X main.version=... .
-var version = "1.1.0"
+var version = "1.2.0"
 var commit = "unknown"
 var buildDate = "unknown"
 
@@ -355,6 +357,30 @@ func validateRuntimeConfigWithBuiltDNS(cfg *Config, ohm *appoutbound.Manager, dn
 		}
 		if err := dnsevent.Validate(cfg.DNSResultEvents); err != nil {
 			return errors.New("dnsResultEvents config: ").Base(err)
+		}
+	}
+	if cfg.DNSResultNFTSets != nil {
+		if cfg.DNS == nil || dnsConfig == nil {
+			return errors.New("dnsResultNFTSets requires a DNS configuration")
+		}
+		if err := dnsnftset.Validate(cfg.DNSResultNFTSets); err != nil {
+			return errors.New("dnsResultNFTSets config: ").Base(err)
+		}
+		availableTags := make(map[string]struct{}, len(dnsConfig.NameServer))
+		for _, server := range dnsConfig.NameServer {
+			tag := strings.TrimSpace(server.GetTag())
+			if tag == "" {
+				tag = "_default"
+			}
+			availableTags[tag] = struct{}{}
+		}
+		for policyIndex, policy := range cfg.DNSResultNFTSets.Policies {
+			for _, rawTag := range policy.ServerTags {
+				tag := strings.TrimSpace(rawTag)
+				if _, exists := availableTags[tag]; !exists {
+					return errors.New("dnsResultNFTSets policy ", policyIndex, " references unknown DNS server tag: ", tag)
+				}
+			}
 		}
 	}
 	return nil

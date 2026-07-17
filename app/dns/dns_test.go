@@ -4,6 +4,7 @@ import (
 	"context"
 	goerrors "errors"
 	"testing"
+	"time"
 
 	"github.com/eugene/bypasscore/common/geodata"
 	bcnet "github.com/eugene/bypasscore/common/net"
@@ -15,6 +16,23 @@ type rawSelectionServer struct {
 	name    string
 	calls   int
 	invalid bool
+}
+
+type ipSelectionServer struct {
+	name  string
+	ip    bcnet.IP
+	delay time.Duration
+}
+
+func (s *ipSelectionServer) Name() string       { return s.name }
+func (*ipSelectionServer) IsDisableCache() bool { return true }
+func (s *ipSelectionServer) QueryIP(ctx context.Context, _ string, _ dns_feature.IPOption) ([]bcnet.IP, uint32, error) {
+	select {
+	case <-time.After(s.delay):
+		return []bcnet.IP{s.ip}, 60, nil
+	case <-ctx.Done():
+		return nil, 0, ctx.Err()
+	}
 }
 
 func (s *rawSelectionServer) Name() string       { return s.name }
@@ -117,6 +135,42 @@ func TestLookupRawFallsBackAfterInvalidAssociatedResponse(t *testing.T) {
 	}
 	if err := dns_feature.ValidateRawResponse(query, response); err != nil {
 		t.Fatalf("fallback response is invalid: %v", err)
+	}
+}
+
+func TestParallelQueryObservesOnlySelectedResult(t *testing.T) {
+	clientOption := dns_feature.IPOption{IPv4Enable: true, IPv6Enable: true}
+	preferred := &Client{
+		server:    &ipSelectionServer{name: "preferred", ip: bcnet.ParseAddress("192.0.2.1").IP(), delay: 20 * time.Millisecond},
+		metricTag: "preferred", policyID: 1, timeout: time.Second, ipOption: &clientOption,
+	}
+	fallback := &Client{
+		server:    &ipSelectionServer{name: "fallback", ip: bcnet.ParseAddress("192.0.2.2").IP(), delay: time.Millisecond},
+		metricTag: "fallback", policyID: 2, timeout: time.Second, ipOption: &clientOption,
+	}
+	server := &DNS{ctx: context.Background(), clients: []*Client{preferred, fallback}}
+	selected := make(chan Result, 2)
+	server.SetResultObserver(func(result Result) { selected <- result })
+
+	ips, _, err := server.parallelQuery(context.Background(), "parallel.test", dns_feature.IPOption{IPv4Enable: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ips) != 1 || !ips[0].Equal(preferred.server.(*ipSelectionServer).ip) {
+		t.Fatalf("unexpected selected IPs: %v", ips)
+	}
+	select {
+	case result := <-selected:
+		if result.ServerTag != "preferred" || len(result.IPs) != 1 || !result.IPs[0].Equal(ips[0]) {
+			t.Fatalf("observed non-selected result: %#v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("selected result was not observed")
+	}
+	select {
+	case result := <-selected:
+		t.Fatalf("extra non-selected result was observed: %#v", result)
+	case <-time.After(30 * time.Millisecond):
 	}
 }
 

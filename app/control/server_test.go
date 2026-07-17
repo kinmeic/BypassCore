@@ -29,13 +29,15 @@ func (testBackend) Explain(_ context.Context, request RouteExplainRequest) (any,
 func (testBackend) Resolve(_ context.Context, request DNSResolveRequest) (any, error) {
 	return request, nil
 }
-func (testBackend) Observatory(context.Context) (any, error) { return []any{}, nil }
-func (testBackend) Metrics(context.Context) (any, error)     { return []any{}, nil }
-func (testBackend) DNSResults(context.Context) (any, error)  { return []any{}, nil }
+func (testBackend) Observatory(context.Context) (any, error)     { return []any{}, nil }
+func (testBackend) Metrics(context.Context) (any, error)         { return []any{}, nil }
+func (testBackend) DNSResults(context.Context) (any, error)      { return []any{}, nil }
+func (testBackend) DNSNFTSets(context.Context) (any, error)      { return []any{}, nil }
+func (testBackend) ProbeDNSNFTSets(context.Context) (any, error) { return []any{}, nil }
 
 func TestUnixControlServer(t *testing.T) {
 	socket := filepath.Join(t.TempDir(), "control.sock")
-	server, err := New(&Config{Enabled: true, Socket: socket}, testBackend{}, Capabilities{Version: "test", ConfigSchema: 3})
+	server, err := New(&Config{Enabled: true, Socket: socket}, testBackend{}, Capabilities{Version: "test", ConfigSchema: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,6 +64,21 @@ func TestUnixControlServer(t *testing.T) {
 	}
 	if status["running"] != true {
 		t.Fatalf("unexpected status: %#v", status)
+	}
+	for method, path := range map[string]string{
+		http.MethodGet:  "/v1/dns/nftsets",
+		http.MethodPost: "/v1/dns/nftsets/probe",
+	} {
+		request, _ := http.NewRequest(method, "http://unix"+path, nil)
+		response, err = client.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("%s %s status=%d", method, path, response.StatusCode)
+		}
 	}
 
 	request, _ := http.NewRequest(http.MethodPost, "http://unix/v1/route/explain", bytes.NewBufferString(`{"destination":"tcp:example.com:443","unknown":true}`))

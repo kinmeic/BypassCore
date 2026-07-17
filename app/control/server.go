@@ -63,6 +63,8 @@ type Backend interface {
 	Observatory(context.Context) (any, error)
 	Metrics(context.Context) (any, error)
 	DNSResults(context.Context) (any, error)
+	DNSNFTSets(context.Context) (any, error)
+	ProbeDNSNFTSets(context.Context) (any, error)
 }
 
 // APIError is returned as a stable machine-readable control-plane error.
@@ -272,6 +274,8 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("GET /v1/observatory", s.noBody(s.backend.Observatory))
 	mux.HandleFunc("GET /v1/metrics", s.noBody(s.backend.Metrics))
 	mux.HandleFunc("GET /v1/dns/results", s.noBody(s.backend.DNSResults))
+	mux.HandleFunc("GET /v1/dns/nftsets", s.noBody(s.backend.DNSNFTSets))
+	mux.HandleFunc("POST /v1/dns/nftsets/probe", s.mutationOnly(s.noBody(s.backend.ProbeDNSNFTSets)))
 	mux.HandleFunc("POST /v1/config/validate", s.mutationOnly(s.rawBody(s.backend.Validate)))
 	mux.HandleFunc("POST /v1/config/reload", s.mutationOnly(s.reloadBody()))
 	mux.HandleFunc("POST /v1/route/explain", decodeBody(s, func(ctx context.Context, request RouteExplainRequest) (any, error) {

@@ -20,6 +20,8 @@ domain through sniffing, match routing rules, and forward through an outbound.
   UDP, TCP, DoT (RFC 7858), and DoH (RFC 8484)
 - A local UDP/TCP DNS listening service with routed A/AAAA and raw
   MX/TXT/SRV/PTR/CAA forwarding through the same tagged outbound policy
+- Native Linux netlink writer for placing selected DNS A/AAAA results into
+  IPv4/IPv6 nftables sets, with bounded batching and DNS-TTL element timeouts
 - Load balancing with random, round-robin, least-ping, and least-load policies,
   plus Observatory health checks
 - Process matching on Linux, macOS, and Windows
@@ -137,11 +139,48 @@ protocol or inboundTag rules. A server-level `outboundTag` bypasses synthetic
 DNS routing rules and forces that upstream through the named outbound; config
 validation rejects unknown tags.
 
-Successful A/AAAA results can be emitted to a local Unix datagram consumer for
-a lightweight nftables/NFTSet updater. Delivery is bounded and non-blocking;
-events include a monotonic `sequence`, `configRevision`, expiry time, and the
-cumulative loss counter in addition to the DNS result. Delivery remains
-best-effort, but a consumer can resynchronize from `GET /v1/dns/results`:
+On Linux, BypassCore can write successful A/AAAA results from selected DNS
+server tags directly into pre-created nftables sets over netlink. This removes
+the helper process, loopback DNS port, and domain-list duplication otherwise
+needed for helper-style ChinaDNS-NG integration:
+
+```json
+{
+  "dnsResultNFTSets": {
+    "queueSize": 256,
+    "batchSize": 128,
+    "flushIntervalMs": 25,
+    "policies": [
+      {
+        "serverTags": ["cn"],
+        "ipv4Set": "inet@bypass@direct_dns4",
+        "ipv6Set": "inet@bypass@direct_dns6"
+      }
+    ]
+  }
+}
+```
+
+The writer only observes results accepted from the configured tagged upstream,
+never blocks a DNS request, coalesces netlink updates, and gives each new set
+element the DNS TTL. Like ChinaDNS-NG's safe default, it filters `0.0.0.0/8`,
+`127.0.0.0/8`, `::`, and `::1` rather than turning them into routing
+exemptions. Target sets must already exist, have the matching
+`ipv4_addr`/`ipv6_addr` key type, and use the `timeout` flag; table families
+`inet`, `ip`, and `ip6` are supported through `family@table@set` notation.
+`POST /v1/dns/nftsets/probe` validates all targets after a supervisor creates
+its ruleset. A configured writer remains unready until that full probe succeeds;
+status/readiness then expose queue drops and write failures. Every successful
+probe also refreshes kernel set metadata and invalidates writer-side TTL
+deduplication, so supervisors should call it after flushing or recreating sets.
+Reload probes a candidate writer before the runtime snapshot swap, so an
+invalid replacement keeps the current revision active.
+
+Successful A/AAAA results can also be emitted to an optional local Unix
+datagram consumer. Delivery is bounded and non-blocking; events include a
+monotonic `sequence`, `configRevision`, expiry time, and cumulative loss
+counter. Delivery remains best-effort, but a consumer can resynchronize from
+`GET /v1/dns/results`:
 
 ```json
 {"dnsResultEvents":{"socket":"/run/bypasscore/dns-results.sock","queueSize":256,"maxDatagramBytes":8192,"maxQueueBytes":1048576}}
@@ -264,6 +303,8 @@ It speaks HTTP/JSON over the Unix socket:
 | `GET /v1/observatory` | Current probe results |
 | `GET /v1/metrics` | Metrics as JSON |
 | `GET /v1/dns/results` | Bounded unexpired DNS-result snapshot for event consumer resync |
+| `GET /v1/dns/nftsets` | Native DNS-result NFTSet writer health and counters |
+| `POST /v1/dns/nftsets/probe` | Validate configured set existence, type, and timeout support |
 
 Example: `curl --unix-socket /run/bypasscore/control.sock http://localhost/v1/status`.
 Validate and reload share one non-queueing mutation slot; a concurrent request
@@ -273,8 +314,10 @@ in-flight byte budget.
 `SIGHUP` uses the same transactional reload path. A candidate runtime is fully
 built and validated before one atomic swap. Existing TCP/UDP flows retain the
 old snapshot and drain naturally; after 30 seconds the retired snapshot is
-force-closed. Routing, outbounds, DNS, Observatory, DNS result events, and
-non-routing inbound resource policies and metrics parameters can change live.
+force-closed. Routing, outbounds, DNS, Observatory, DNS result events/NFTSet
+policies, and non-routing inbound resource policies and metrics parameters can
+change live. A candidate NFTSet policy must pass its kernel target probe before
+the swap.
 Adding/removing listeners or changing an inbound tag, sniffing policy, DNS
 action rules, address, port, type, network, TLS files, DoH path, metrics
 listen address, or control socket returns `restart_required` and leaves the
@@ -308,7 +351,8 @@ rules, download them into the working directory or `$BYPASSCORE_ASSETS` from
 
 The main packages are `app/inbound` (transparent-proxy and DNS listeners),
 `app/dispatcher`, `app/dialer`,
-`app/outbound`, `app/router`, `app/observatory`, and `app/dns`; protocol
+`app/outbound`, `app/router`, `app/observatory`, `app/dns`, and
+`app/dnsnftset`; protocol
 sniffers live under `common/protocol`, outbound implementations under
 `proxy`, shared interfaces under `features`, transport under `transport`, and
 JSON configuration under `infra/conf`. The CLI entry point is
@@ -319,9 +363,11 @@ JSON configuration under `infra/conf`. The CLI entry point is
 GitHub Actions validates a real network-namespace topology covering TCP
 REDIRECT, TCP/UDP TPROXY, IPv6, SOCKS5 UDP, transparent reply source-address
 restoration, the UDP/TCP DNS listener over IPv4/IPv6, raw TXT forwarding,
-UDP-to-TCP DNS truncation fallback, and UDP session/FD/RSS resource limits. On
-a Linux host, run:
+UDP-to-TCP DNS truncation fallback, native timed NFTSet writes, and UDP
+session/FD/RSS resource limits. On a Linux host, run:
 
 ```bash
 sudo integration/netns/run.sh
+go test -c -o /tmp/bypasscore-dnsnftset.test ./app/dnsnftset
+sudo env BYPASSCORE_NFTSET_INTEGRATION=1 /tmp/bypasscore-dnsnftset.test -test.run '^TestKernelNFTSetWriter$' -test.v
 ```

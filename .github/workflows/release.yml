@@ -46,8 +46,10 @@ jobs:
       - name: Verify Linux transparent proxy data plane
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq iproute2 iptables
+          sudo apt-get install -y -qq iproute2 iptables nftables
           sudo modprobe xt_TPROXY || true
+          go test -c -o /tmp/bypasscore-dnsnftset.test ./app/dnsnftset
+          sudo env BYPASSCORE_NFTSET_INTEGRATION=1 /tmp/bypasscore-dnsnftset.test -test.count=1 -test.run '^TestKernelNFTSetWriter$' -test.v
           integration/netns/run.sh
 
       - name: Install UPX

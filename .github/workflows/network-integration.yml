@@ -29,13 +29,18 @@ jobs:
       - name: Install network namespace tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq iproute2 iptables
+          sudo apt-get install -y -qq iproute2 iptables nftables
           sudo modprobe xt_TPROXY || true
           sudo modprobe nf_tproxy_ipv4 || true
           sudo modprobe nf_tproxy_ipv6 || true
 
       - name: Unit and race tests
         run: go test -race -count=1 ./...
+
+      - name: Verify native DNS result NFTSet writer
+        run: |
+          go test -c -o /tmp/bypasscore-dnsnftset.test ./app/dnsnftset
+          sudo env BYPASSCORE_NFTSET_INTEGRATION=1 /tmp/bypasscore-dnsnftset.test -test.count=1 -test.run '^TestKernelNFTSetWriter$' -test.v
 
       - name: Run REDIRECT, TPROXY, IPv6 and SOCKS UDP tests
         run: integration/netns/run.sh

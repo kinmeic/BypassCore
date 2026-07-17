@@ -22,6 +22,7 @@ import (
 	"github.com/eugene/bypasscore/app/dialer"
 	appdns "github.com/eugene/bypasscore/app/dns"
 	"github.com/eugene/bypasscore/app/dnsevent"
+	"github.com/eugene/bypasscore/app/dnsnftset"
 	appinbound "github.com/eugene/bypasscore/app/inbound"
 	appmetrics "github.com/eugene/bypasscore/app/metrics"
 	"github.com/eugene/bypasscore/app/observatory"
@@ -46,12 +47,12 @@ const maxConfigBytes = 16 << 20
 func capabilities() control.Capabilities {
 	return control.Capabilities{
 		Version:      version,
-		ConfigSchema: 3,
+		ConfigSchema: 4,
 		Features: []string{
 			"control-unix-http-json", "dns-inbound", "raw-dns", "metrics",
 			"routing-reload", "full-reload", "runtime-snapshot-reload", "inbound-parameter-reload", "dns-outbound-tag",
 			"routing-final-outbound", "socks5-udp", "transparent-tcp-redirect",
-			"transparent-tcp-udp-tproxy", "dns-result-unixgram", "dns-result-resync", "observatory", "ready-status", "inbound-health", "reload-if-match", "ipv6",
+			"transparent-tcp-udp-tproxy", "dns-result-unixgram", "dns-result-resync", "dns-result-nftset", "dns-result-nftset-probe", "observatory", "ready-status", "inbound-health", "reload-if-match", "ipv6",
 		},
 	}
 }
@@ -80,6 +81,9 @@ func runRuntimeDaemon(ctx context.Context, configPath string, cfg *Config, hash 
 			}
 			defer snapshot.release()
 			_, ready := service.inboundHealth(len(snapshot.config.Inbounds))
+			if snapshot.dnsNFTSets != nil {
+				ready = ready && snapshot.dnsNFTSets.Status().Ready
+			}
 			return ready
 		})
 		defer metricsServer.Close()
@@ -100,15 +104,16 @@ func runRuntimeDaemon(ctx context.Context, configPath string, cfg *Config, hash 
 }
 
 type runtimeSnapshot struct {
-	config    *Config
-	hash      string
-	revision  uint64
-	router    *router.Router
-	outbound  *appoutbound.Manager
-	dns       featdns.Client
-	routedDNS *appdns.DNS
-	observer  *observatory.Observer
-	dnsEvents *dnsevent.Sink
+	config     *Config
+	hash       string
+	revision   uint64
+	router     *router.Router
+	outbound   *appoutbound.Manager
+	dns        featdns.Client
+	routedDNS  *appdns.DNS
+	observer   *observatory.Observer
+	dnsEvents  *dnsevent.Sink
+	dnsNFTSets *dnsnftset.Writer
 
 	refs       atomic.Int64
 	retired    atomic.Bool
@@ -262,12 +267,23 @@ func (s *runtimeService) buildSnapshot(ctx context.Context, cfg *Config, revisio
 			}
 			snapshot.dnsEvents = sink
 		}
+		if runtimeResources && cfg.DNSResultNFTSets != nil {
+			writer, err := dnsnftset.New(cfg.DNSResultNFTSets)
+			if err != nil {
+				snapshot.closeResources()
+				return nil, err
+			}
+			snapshot.dnsNFTSets = writer
+		}
 		if runtimeResources {
 			routedDNS.SetResultObserver(func(result appdns.Result) {
 				sequence := s.dnsEventSequence.Add(1)
 				event := dnsevent.NewEvent(result, revision, sequence)
 				if snapshot.dnsEvents != nil {
 					snapshot.dnsEvents.EmitEvent(event)
+				}
+				if snapshot.dnsNFTSets != nil {
+					snapshot.dnsNFTSets.Emit(result)
 				}
 				s.recordDNSResult(event)
 			})
@@ -404,6 +420,9 @@ func (snapshot *runtimeSnapshot) closeResources() {
 		}
 		if snapshot.dnsEvents != nil {
 			_ = snapshot.dnsEvents.Close()
+		}
+		if snapshot.dnsNFTSets != nil {
+			_ = snapshot.dnsNFTSets.Close()
 		}
 		_ = snapshot.router.Close()
 		_ = snapshot.outbound.Close()
@@ -704,6 +723,10 @@ func (s *runtimeService) Status(context.Context) (any, error) {
 	if snapshot.dnsEvents != nil {
 		dnsEventStatus = map[string]any{"enabled": true, "stats": snapshot.dnsEvents.Stats(), "lastSequence": s.dnsEventSequence.Load()}
 	}
+	dnsNFTSetStatus := dnsnftset.Stats{Enabled: false, Ready: true}
+	if snapshot.dnsNFTSets != nil {
+		dnsNFTSetStatus = snapshot.dnsNFTSets.Status()
+	}
 	s.outboundStatusMu.RLock()
 	outbounds := make([]outboundRuntimeStatus, 0, len(snapshot.config.Outbounds))
 	for _, configured := range snapshot.config.Outbounds {
@@ -713,6 +736,7 @@ func (s *runtimeService) Status(context.Context) (any, error) {
 	}
 	s.outboundStatusMu.RUnlock()
 	health, ready := s.inboundHealth(len(snapshot.config.Inbounds))
+	ready = ready && dnsNFTSetStatus.Ready
 	inbounds := make([]map[string]any, 0, len(snapshot.config.Inbounds))
 	for index, configured := range snapshot.config.Inbounds {
 		state := appinbound.HealthStatus{Tag: configured.Tag, State: "starting"}
@@ -729,7 +753,7 @@ func (s *runtimeService) Status(context.Context) (any, error) {
 		"running": true, "ready": ready, "startedAt": s.startedAt,
 		"configHash": snapshot.hash, "configRevision": snapshot.revision,
 		"activeSnapshotReferences": snapshot.refs.Load() - 1, "retiredSnapshots": retiredCount, "lastReload": reload,
-		"geodataLoaded": true, "inbounds": inbounds, "dnsUpstreams": upstreams, "dnsResultEvents": dnsEventStatus, "outbounds": outbounds, "observatory": observation,
+		"geodataLoaded": true, "inbounds": inbounds, "dnsUpstreams": upstreams, "dnsResultEvents": dnsEventStatus, "dnsResultNFTSets": dnsNFTSetStatus, "outbounds": outbounds, "observatory": observation,
 	}, nil
 }
 func (s *runtimeService) Ready(context.Context) (any, error) {
@@ -738,10 +762,15 @@ func (s *runtimeService) Ready(context.Context) (any, error) {
 		return map[string]any{"ready": false, "checks": map[string]bool{"runtime": false, "inbounds": false, "geodata": false}}, nil
 	}
 	defer snapshot.release()
-	_, ready := s.inboundHealth(len(snapshot.config.Inbounds))
+	_, inboundsReady := s.inboundHealth(len(snapshot.config.Inbounds))
+	nftSetsReady := true
+	if snapshot.dnsNFTSets != nil {
+		nftSetsReady = snapshot.dnsNFTSets.Status().Ready
+	}
+	ready := inboundsReady && nftSetsReady
 	return map[string]any{
 		"ready": ready, "configHash": snapshot.hash, "configRevision": snapshot.revision,
-		"checks": map[string]bool{"runtime": true, "inbounds": ready, "geodata": true},
+		"checks": map[string]bool{"runtime": true, "inbounds": inboundsReady, "geodata": true, "dnsResultNFTSets": nftSetsReady},
 	}, nil
 }
 
@@ -813,6 +842,18 @@ func (s *runtimeService) Reload(ctx context.Context, raw []byte, expectedValues 
 		current.release()
 		s.recordReload(err)
 		return nil, invalidConfigError(err)
+	}
+	// Startup may intentionally precede supervisor-created sets, but a reload
+	// already has a live nftables environment. Validate the candidate writer
+	// before changing inbounds or swapping snapshots so failure preserves the
+	// complete current runtime transactionally.
+	if next.dnsNFTSets != nil {
+		if err := next.dnsNFTSets.Probe(); err != nil {
+			next.retire()
+			current.release()
+			s.recordReload(err)
+			return nil, &control.APIError{Code: "nftset_unavailable", Message: err.Error(), Status: http.StatusServiceUnavailable}
+		}
 	}
 	if err := s.reloadInbounds(current.config.Inbounds, cfg.Inbounds); err != nil {
 		next.retire()
@@ -1005,6 +1046,33 @@ func (s *runtimeService) DNSResults(context.Context) (any, error) {
 		eventStats = snapshot.dnsEvents.Stats()
 	}
 	return map[string]any{"configRevision": snapshot.revision, "lastSequence": s.dnsEventSequence.Load(), "eventStats": eventStats, "results": results}, nil
+}
+
+func (s *runtimeService) DNSNFTSets(context.Context) (any, error) {
+	snapshot, err := s.acquire()
+	if err != nil {
+		return nil, err
+	}
+	defer snapshot.release()
+	if snapshot.dnsNFTSets == nil {
+		return dnsnftset.Stats{Enabled: false, Ready: true}, nil
+	}
+	return snapshot.dnsNFTSets.Status(), nil
+}
+
+func (s *runtimeService) ProbeDNSNFTSets(context.Context) (any, error) {
+	snapshot, err := s.acquire()
+	if err != nil {
+		return nil, err
+	}
+	defer snapshot.release()
+	if snapshot.dnsNFTSets == nil {
+		return dnsnftset.Stats{Enabled: false, Ready: true}, nil
+	}
+	if err := snapshot.dnsNFTSets.Probe(); err != nil {
+		return nil, &control.APIError{Code: "nftset_unavailable", Message: err.Error(), Status: http.StatusServiceUnavailable}
+	}
+	return snapshot.dnsNFTSets.Status(), nil
 }
 
 func (s *runtimeService) recordDNSResult(event dnsevent.Event) {
