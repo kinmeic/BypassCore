@@ -41,8 +41,12 @@ func TestKernelNFTSetWriter(t *testing.T) {
 	create.AddTable(table)
 	v4 := &nftables.Set{Table: table, Name: "result4", KeyType: nftables.TypeIPAddr, Interval: true, HasTimeout: true}
 	v6 := &nftables.Set{Table: table, Name: "result6", KeyType: nftables.TypeIP6Addr, Interval: true, HasTimeout: true}
-	existing := net.ParseIP("192.0.2.1").To4()
-	if err := create.AddSet(v4, nftElements(v4, update{key: existing})); err != nil {
+	staticStart := net.ParseIP("192.0.2.0").To4()
+	staticEnd := net.ParseIP("192.0.2.2").To4()
+	if err := create.AddSet(v4, []nftables.SetElement{
+		{Key: staticStart},
+		{Key: staticEnd, IntervalEnd: true},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := create.AddSet(v6, nil); err != nil {
@@ -75,8 +79,8 @@ func TestKernelNFTSetWriter(t *testing.T) {
 	writer.Emit(appdns.Result{
 		ServerTag: "direct", TTL: 60,
 		IPs: []bcnet.IP{
-			bcnet.IP(net.ParseIP("192.0.2.1").To4()), // already exists: exercises per-element retry
-			bcnet.IP(net.ParseIP("192.0.2.2").To4()),
+			bcnet.IP(net.ParseIP("192.0.2.1").To4()), // inside static range: exercises per-element retry
+			bcnet.IP(net.ParseIP("192.0.2.3").To4()),
 			bcnet.IP(net.ParseIP("2001:db8::1").To16()),
 		},
 	})
@@ -89,12 +93,12 @@ func TestKernelNFTSetWriter(t *testing.T) {
 		if err4 == nil && err6 == nil {
 			elements4, read4 := lookup.GetSetElements(set4)
 			elements6, read6 := lookup.GetSetElements(set6)
-			if read4 == nil && read6 == nil && hasIP(elements4, "192.0.2.1") && hasIP(elements4, "192.0.2.2") && hasIP(elements6, "2001:db8::1") {
+			if read4 == nil && read6 == nil && hasPermanentInterval(elements4, "192.0.2.0", "192.0.2.2") && hasIP(elements4, "192.0.2.3") && hasIP(elements6, "2001:db8::1") {
 				status := writer.Status()
-				if !status.Ready || status.Added != 2 || status.Existing != 1 {
+				if !status.Ready || status.Applied != 2 || status.Existing != 1 {
 					t.Fatalf("writer became unhealthy: %#v", writer.Status())
 				}
-				if !hasExpiringIP(elements4, "192.0.2.2") || !hasExpiringIP(elements6, "2001:db8::1") {
+				if !hasExpiringIP(elements4, "192.0.2.3") || !hasExpiringIP(elements6, "2001:db8::1") {
 					t.Fatal("new elements were not installed with a timeout")
 				}
 				return
@@ -103,6 +107,19 @@ func TestKernelNFTSetWriter(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for kernel elements; status=%#v", writer.Status())
+}
+
+func hasPermanentInterval(elements []nftables.SetElement, start, end string) bool {
+	var permanentStart, intervalEnd bool
+	for _, element := range elements {
+		switch net.IP(element.Key).String() {
+		case start:
+			permanentStart = !element.IntervalEnd && element.Expires == 0
+		case end:
+			intervalEnd = element.IntervalEnd
+		}
+	}
+	return permanentStart && intervalEnd
 }
 
 func hasExpiringIP(elements []nftables.SetElement, want string) bool {

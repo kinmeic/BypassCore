@@ -174,7 +174,11 @@ status/readiness then expose queue drops and write failures. Every successful
 probe also refreshes kernel set metadata and invalidates writer-side TTL
 deduplication, so supervisors should call it after flushing or recreating sets.
 Reload probes a candidate writer before the runtime snapshot swap, so an
-invalid replacement keeps the current revision active.
+invalid replacement keeps the current revision active. The `applied` status
+counter covers kernel-accepted inserts and TTL refreshes; `existing` means a
+larger static interval/CIDR already contains the address. Permanent elements
+remain permanent, and covered addresses are deduplicated for their DNS TTL to
+avoid repeated conflict retries.
 
 Successful A/AAAA results can also be emitted to an optional local Unix
 datagram consumer. Delivery is bounded and non-blocking; events include a

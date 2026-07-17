@@ -28,7 +28,7 @@ type queuedResult struct{ updates []update }
 
 type writeResult struct {
 	err      error
-	added    bool
+	applied  bool
 	existing bool
 }
 
@@ -42,7 +42,7 @@ type Stats struct {
 	Queued       int64     `json:"queued"`
 	Dropped      uint64    `json:"dropped"`
 	Filtered     uint64    `json:"filtered"`
-	Added        uint64    `json:"added"`
+	Applied      uint64    `json:"applied"`
 	Existing     uint64    `json:"existing"`
 	Deduplicated uint64    `json:"deduplicated"`
 	Errors       uint64    `json:"errors"`
@@ -66,7 +66,7 @@ type Writer struct {
 	queued          atomic.Int64
 	dropped         atomic.Uint64
 	filtered        atomic.Uint64
-	added           atomic.Uint64
+	applied         atomic.Uint64
 	existing        atomic.Uint64
 	deduplicated    atomic.Uint64
 	errors          atomic.Uint64
@@ -216,7 +216,7 @@ func (w *Writer) Status() Stats {
 	w.statusMu.RLock()
 	status := Stats{
 		Enabled: true, Ready: w.ready, Probed: w.probed, Policies: len(w.config.Policies), Targets: len(w.targets),
-		Queued: w.queued.Load(), Dropped: w.dropped.Load(), Filtered: w.filtered.Load(), Added: w.added.Load(), Existing: w.existing.Load(),
+		Queued: w.queued.Load(), Dropped: w.dropped.Load(), Filtered: w.filtered.Load(), Applied: w.applied.Load(), Existing: w.existing.Load(),
 		Deduplicated: w.deduplicated.Load(), Errors: w.errors.Load(), LastSuccess: w.lastSuccess, LastError: w.lastError,
 	}
 	w.statusMu.RUnlock()
@@ -365,18 +365,20 @@ func (w *Writer) flush(raw []update, known map[string]time.Time) {
 	var failures []error
 	seenFailures := make(map[string]struct{})
 	for i, result := range results {
-		if result.err == nil && result.added {
+		if result.err == nil && result.applied {
 			known[keys[i]] = now.Add(unique[i].timeout)
-			w.added.Add(1)
-			commonmetrics.Inc("bypasscore_dns_nftset_elements_total", "result", "added", "set", unique[i].set.String())
+			w.applied.Add(1)
+			commonmetrics.Inc("bypasscore_dns_nftset_elements_total", "result", "applied", "set", unique[i].set.String())
 			continue
 		}
 		if result.err == nil && result.existing {
-			// Do not assume that a pre-existing element has the requested TTL. It
-			// may belong to a retiring writer and be close to expiry. A short
-			// suppression window still prevents a popular static/range element
-			// from forcing an EEXIST retry transaction on every cached DNS answer.
-			known[keys[i]] = now.Add(time.Second)
+			// For interval sets EEXIST means that a different, overlapping
+			// interval already contains this address. Exact dynamic elements are
+			// accepted above and have their timeout refreshed by the kernel. The
+			// overlap therefore comes from a static CIDR/range; suppress it for
+			// this DNS TTL, while Probe still invalidates the cache after an
+			// external set flush or recreation.
+			known[keys[i]] = now.Add(unique[i].timeout)
 			w.existing.Add(1)
 			commonmetrics.Inc("bypasscore_dns_nftset_elements_total", "result", "existing", "set", unique[i].set.String())
 			continue

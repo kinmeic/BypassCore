@@ -69,13 +69,16 @@ func (b *netlinkBackend) Add(updates []update) []writeResult {
 		}
 		if err == nil {
 			for _, index := range indices {
-				results[index].added = true
+				results[index].applied = true
 			}
 			continue
 		}
-		// One pre-existing element makes an add transaction fail atomically. Retry
-		// individually so existing static safety entries do not suppress new ones.
-		// Refresh cached metadata first: a supervisor may have recreated the table.
+		// An overlapping static interval makes this set's transaction fail
+		// atomically. Retry individually so that CIDR/GeoIP membership is reported
+		// as existing without suppressing unrelated DNS results. Exact elements
+		// take the successful path above: the kernel refreshes dynamic timeouts and
+		// leaves permanent elements permanent. Refresh cached metadata first
+		// because a supervisor may have recreated the table.
 		b.invalidate(key, set)
 		set, resolveErr := b.resolve(ref)
 		if resolveErr != nil {
@@ -88,7 +91,7 @@ func (b *netlinkBackend) Add(updates []update) []writeResult {
 			oneErr := addOne(set, updates[index])
 			switch {
 			case oneErr == nil:
-				results[index].added = true
+				results[index].applied = true
 			case isAlreadyExists(oneErr):
 				results[index].existing = true
 			default:

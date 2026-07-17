@@ -41,7 +41,7 @@ func (f *fakeBackend) Add(updates []update) []writeResult {
 		if existing {
 			results[i].existing = true
 		} else {
-			results[i].added = true
+			results[i].applied = true
 		}
 	}
 	return results
@@ -97,7 +97,7 @@ func TestWriterFiltersUnsafeDNSResultAddresses(t *testing.T) {
 		},
 	})
 	deadline := time.Now().Add(time.Second)
-	for writer.Status().Added != 1 && time.Now().Before(deadline) {
+	for writer.Status().Applied != 1 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
 	backend.mu.Lock()
@@ -127,12 +127,12 @@ func TestSuccessfulProbeInvalidatesWriterDedupe(t *testing.T) {
 	result := appdns.Result{ServerTag: "direct", TTL: 60, IPs: []bcnet.IP{bcnet.IP(net.ParseIP("192.0.2.1").To4())}}
 	writer.Emit(result)
 	deadline := time.Now().Add(time.Second)
-	for writer.Status().Added != 1 && time.Now().Before(deadline) {
+	for writer.Status().Applied != 1 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
 	writer.Emit(result)
 	time.Sleep(20 * time.Millisecond)
-	if status := writer.Status(); status.Added != 1 || status.Deduplicated == 0 {
+	if status := writer.Status(); status.Applied != 1 || status.Deduplicated == 0 {
 		t.Fatalf("duplicate was not suppressed before reprobe: %#v", status)
 	}
 
@@ -144,7 +144,7 @@ func TestSuccessfulProbeInvalidatesWriterDedupe(t *testing.T) {
 	}
 	writer.Emit(result)
 	time.Sleep(20 * time.Millisecond)
-	if status := writer.Status(); status.Added != 1 {
+	if status := writer.Status(); status.Applied != 1 {
 		t.Fatalf("failed probe invalidated dedupe: %#v", status)
 	}
 
@@ -156,10 +156,10 @@ func TestSuccessfulProbeInvalidatesWriterDedupe(t *testing.T) {
 	}
 	writer.Emit(result)
 	deadline = time.Now().Add(time.Second)
-	for writer.Status().Added != 2 && time.Now().Before(deadline) {
+	for writer.Status().Applied != 2 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if status := writer.Status(); status.Added != 2 || !status.Ready {
+	if status := writer.Status(); status.Applied != 2 || !status.Ready {
 		t.Fatalf("successful reprobe did not permit repopulation: %#v", status)
 	}
 }
@@ -183,7 +183,7 @@ func TestWriterEnforcesNetlinkBatchSize(t *testing.T) {
 	}
 	writer.Emit(result)
 	deadline := time.Now().Add(time.Second)
-	for writer.Status().Added != 10 && time.Now().Before(deadline) {
+	for writer.Status().Applied != 10 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
 	backend.mu.Lock()
@@ -245,7 +245,7 @@ func TestWriterFiltersFamiliesDeduplicatesAndProbes(t *testing.T) {
 		backend.mu.Lock()
 		count := len(backend.updates)
 		backend.mu.Unlock()
-		if count == 2 && writer.Status().Added == 2 {
+		if count == 2 && writer.Status().Applied == 2 {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
@@ -267,7 +267,7 @@ func TestWriterFiltersFamiliesDeduplicatesAndProbes(t *testing.T) {
 		}
 	}
 	status := writer.Status()
-	if !status.Ready || !status.Probed || status.Added != 2 || status.Deduplicated == 0 {
+	if !status.Ready || !status.Probed || status.Applied != 2 || status.Deduplicated == 0 {
 		t.Fatalf("unexpected status: %#v", status)
 	}
 }
@@ -290,7 +290,7 @@ func TestWriterRequiresSuccessfulProbeForReadiness(t *testing.T) {
 	}
 	writer.Emit(appdns.Result{ServerTag: "direct", TTL: 60, IPs: []bcnet.IP{bcnet.IP(net.ParseIP("192.0.2.1").To4())}})
 	deadline := time.Now().Add(time.Second)
-	for writer.Status().Added == 0 && time.Now().Before(deadline) {
+	for writer.Status().Applied == 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
 	if status := writer.Status(); status.Ready || !status.Probed {
