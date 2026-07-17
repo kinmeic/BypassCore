@@ -118,10 +118,12 @@ func nftElements(set *nftables.Set, item update) []nftables.SetElement {
 	// A plain address interval set represents one address as [key, key+1).
 	// Match ChinaDNS-NG's netlink encoding explicitly: one ordinary start
 	// element followed by an interval-end element. KeyEnd is for concatenated
-	// interval keys and is rejected by the kernel for this set shape.
+	// interval keys and is rejected by the kernel for this set shape. nftables
+	// attaches per-element timeout only to the start; the kernel rejects a
+	// timeout attribute on the interval-end marker.
 	return []nftables.SetElement{
 		start,
-		{Key: nextAddress(item.key), IntervalEnd: true, Timeout: item.timeout},
+		{Key: nextAddress(item.key), IntervalEnd: true},
 	}
 }
 

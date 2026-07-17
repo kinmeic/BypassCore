@@ -26,7 +26,7 @@ func TestNFTElementsEncodePlainIntervalEndpoints(t *testing.T) {
 	if !bytes.Equal(elements[0].Key, key) || elements[0].IntervalEnd || elements[0].Timeout != timeout {
 		t.Fatalf("unexpected interval start: %#v", elements[0])
 	}
-	if !bytes.Equal(elements[1].Key, nextAddress(key)) || !elements[1].IntervalEnd || elements[1].Timeout != timeout {
+	if !bytes.Equal(elements[1].Key, nextAddress(key)) || !elements[1].IntervalEnd || elements[1].Timeout != 0 {
 		t.Fatalf("unexpected interval end: %#v", elements[1])
 	}
 }
