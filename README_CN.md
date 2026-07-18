@@ -19,6 +19,7 @@
 - **进程匹配**：按源进程名/路径分流（Linux/macOS/Windows）
 - **domainStrategy**：AsIs / IpIfNonMatch / IpOnDemand
 - **本地控制面**：只监听 Unix Socket 的 HTTP/JSON API，提供运行状态、readiness、配置校验/重载、路由解释、DNS 测试、Observatory 和指标
+- **原生 TCP connect 探测**：可通过控制面或无需配置文件的一次性 CLI 测量握手延迟，不再依赖外部 `tcping` 进程
 - **事务式运行时快照**：路由、outbound、DNS、Observatory 及不改变绑定的 inbound/metrics 参数可热更新，旧连接自然排空
 
 ## 快速开始
@@ -48,6 +49,9 @@ make run-test DEST="tcp:www.baidu.com:443"
 
 # DNS 解析演示
 make run-resolve DOMAIN=example.com
+
+# 不加载配置，测量 TCP 握手延迟
+./bin/bypasscore -tcp-probe example.com:443 -json
 
 # Observatory 探测
 make observe
@@ -277,6 +281,7 @@ procd/服务管理器重启。
 | `POST /v1/config/reload` | 事务式加载请求体；空请求体重新读取 `-config` |
 | `POST /v1/route/explain` | 解释 `{"destination":"tcp:example.com:443"}` 的真实路由 |
 | `POST /v1/dns/resolve` | 使用当前运行实例解析 DNS |
+| `POST /v1/network/tcp-probe` | 测量 `{"host":"example.com","port":443,"timeoutMs":3000}` 的 TCP 握手延迟 |
 | `GET /v1/observatory` | 当前探测结果 |
 | `GET /v1/metrics` | JSON 指标 |
 | `GET /v1/dns/results` | 供事件消费者重同步的有界、未过期 DNS 结果快照 |

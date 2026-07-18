@@ -28,6 +28,7 @@ import (
 	"github.com/eugene/bypasscore/app/observatory"
 	appoutbound "github.com/eugene/bypasscore/app/outbound"
 	"github.com/eugene/bypasscore/app/router"
+	"github.com/eugene/bypasscore/app/tcpprobe"
 	"github.com/eugene/bypasscore/common"
 	"github.com/eugene/bypasscore/common/errors"
 	commonmetrics "github.com/eugene/bypasscore/common/metrics"
@@ -52,7 +53,7 @@ func capabilities() control.Capabilities {
 			"control-unix-http-json", "dns-inbound", "raw-dns", "metrics",
 			"routing-reload", "full-reload", "runtime-snapshot-reload", "inbound-parameter-reload", "dns-outbound-tag",
 			"routing-final-outbound", "socks5-udp", "transparent-tcp-redirect",
-			"transparent-tcp-udp-tproxy", "dns-result-unixgram", "dns-result-resync", "dns-result-nftset", "dns-result-nftset-probe", "observatory", "ready-status", "inbound-health", "reload-if-match", "ipv6",
+			"transparent-tcp-udp-tproxy", "dns-result-unixgram", "dns-result-resync", "dns-result-nftset", "dns-result-nftset-probe", "observatory", "ready-status", "inbound-health", "reload-if-match", "tcp-connect-probe", "ipv6",
 		},
 	}
 }
@@ -1006,6 +1007,19 @@ func (s *runtimeService) Resolve(ctx context.Context, request control.DNSResolve
 		values = append(values, ip.String())
 	}
 	return map[string]any{"domain": request.Domain, "ips": values, "ttl": ttl, "latencyMs": time.Since(start).Milliseconds()}, nil
+}
+func (s *runtimeService) TCPProbe(ctx context.Context, request control.TCPProbeRequest) (any, error) {
+	result, err := tcpprobe.Connect(ctx, request.Host, request.Port, time.Duration(request.TimeoutMs)*time.Millisecond)
+	if err == nil {
+		return result, nil
+	}
+	if stderrors.Is(err, tcpprobe.ErrInvalidRequest) {
+		return nil, &control.APIError{Code: "invalid_tcp_probe", Message: err.Error(), Status: http.StatusBadRequest}
+	}
+	if stderrors.Is(err, context.DeadlineExceeded) {
+		return nil, &control.APIError{Code: "tcp_probe_timeout", Message: err.Error(), Status: http.StatusGatewayTimeout}
+	}
+	return nil, &control.APIError{Code: "tcp_probe_failed", Message: err.Error(), Status: http.StatusBadGateway}
 }
 func (s *runtimeService) Observatory(context.Context) (any, error) {
 	snapshot, err := s.acquire()

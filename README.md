@@ -28,6 +28,8 @@ domain through sniffing, match routing rules, and forward through an outbound.
 - `domainStrategy`: `AsIs`, `IpIfNonMatch`, and `IpOnDemand`
 - Unix-socket HTTP/JSON control plane for live status, readiness, validation,
   reload, route explanation, DNS resolution, Observatory, and metrics
+- Native TCP connect latency probes through the control plane or a config-free
+  one-shot CLI, without an external `tcping` process
 - Transactional runtime snapshots: routing, outbounds, DNS, Observatory, and
   non-binding inbound/metrics parameters reload without dropping old flows
 
@@ -58,6 +60,9 @@ make run-test DEST="tcp:www.baidu.com:443"
 
 # Demonstrate DNS resolution
 make run-resolve DOMAIN=example.com
+
+# Measure TCP handshake latency without loading a configuration
+./bin/bypasscore -tcp-probe example.com:443 -json
 
 # Run Observatory probes
 make observe
@@ -304,6 +309,7 @@ It speaks HTTP/JSON over the Unix socket:
 | `POST /v1/config/reload` | Transactionally activate a JSON config; empty body reloads `-config` |
 | `POST /v1/route/explain` | Explain a route for `{"destination":"tcp:example.com:443"}` |
 | `POST /v1/dns/resolve` | Resolve with the running DNS state |
+| `POST /v1/network/tcp-probe` | Measure a TCP handshake for `{"host":"example.com","port":443,"timeoutMs":3000}` |
 | `GET /v1/observatory` | Current probe results |
 | `GET /v1/metrics` | Metrics as JSON |
 | `GET /v1/dns/results` | Bounded unexpired DNS-result snapshot for event consumer resync |

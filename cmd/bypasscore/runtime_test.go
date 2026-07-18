@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"github.com/eugene/bypasscore/app/dnsevent"
 	appinbound "github.com/eugene/bypasscore/app/inbound"
 	appoutbound "github.com/eugene/bypasscore/app/outbound"
+	"github.com/eugene/bypasscore/app/tcpprobe"
 	bcnet "github.com/eugene/bypasscore/common/net"
 	bcsession "github.com/eugene/bypasscore/common/session"
 	featdns "github.com/eugene/bypasscore/features/dns"
@@ -81,6 +83,47 @@ func TestRuntimeReloadDrainsLeasedConnection(t *testing.T) {
 	}
 	if old.refs.Load() != 0 {
 		t.Fatalf("old snapshot reference leaked: %d", old.refs.Load())
+	}
+}
+
+func TestRuntimeTCPProbe(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	accepted := make(chan struct{})
+	go func() {
+		connection, acceptErr := listener.Accept()
+		if acceptErr == nil {
+			_ = connection.Close()
+		}
+		close(accepted)
+	}()
+
+	service := &runtimeService{}
+	value, err := service.TCPProbe(context.Background(), control.TCPProbeRequest{
+		Host:      "127.0.0.1",
+		Port:      listener.Addr().(*net.TCPAddr).Port,
+		TimeoutMs: 1000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, ok := value.(tcpprobe.Result)
+	if !ok || result.LatencyMs < 0 || result.RemoteAddress == "" {
+		t.Fatalf("invalid latency: %v", value)
+	}
+	select {
+	case <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("server did not accept runtime probe")
+	}
+
+	_, err = service.TCPProbe(context.Background(), control.TCPProbeRequest{Host: "127.0.0.1", Port: 0})
+	var apiErr *control.APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusBadRequest || apiErr.Code != "invalid_tcp_probe" {
+		t.Fatalf("invalid request error=%v", err)
 	}
 }
 

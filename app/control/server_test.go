@@ -29,6 +29,9 @@ func (testBackend) Explain(_ context.Context, request RouteExplainRequest) (any,
 func (testBackend) Resolve(_ context.Context, request DNSResolveRequest) (any, error) {
 	return request, nil
 }
+func (testBackend) TCPProbe(_ context.Context, request TCPProbeRequest) (any, error) {
+	return request, nil
+}
 func (testBackend) Observatory(context.Context) (any, error)     { return []any{}, nil }
 func (testBackend) Metrics(context.Context) (any, error)         { return []any{}, nil }
 func (testBackend) DNSResults(context.Context) (any, error)      { return []any{}, nil }
@@ -90,6 +93,17 @@ func TestUnixControlServer(t *testing.T) {
 	_ = response.Body.Close()
 	if response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("unknown field status=%d", response.StatusCode)
+	}
+
+	request, _ = http.NewRequest(http.MethodPost, "http://unix/v1/network/tcp-probe", bytes.NewBufferString(`{"host":"127.0.0.1","port":443}`))
+	response, err = client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("TCP probe status=%d", response.StatusCode)
 	}
 }
 

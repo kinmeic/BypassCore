@@ -53,6 +53,12 @@ type DNSResolveRequest struct {
 	IPv6   *bool  `json:"ipv6,omitempty"`
 }
 
+type TCPProbeRequest struct {
+	Host      string `json:"host"`
+	Port      int    `json:"port"`
+	TimeoutMs int    `json:"timeoutMs,omitempty"`
+}
+
 type Backend interface {
 	Status(context.Context) (any, error)
 	Ready(context.Context) (any, error)
@@ -65,6 +71,7 @@ type Backend interface {
 	DNSResults(context.Context) (any, error)
 	DNSNFTSets(context.Context) (any, error)
 	ProbeDNSNFTSets(context.Context) (any, error)
+	TCPProbe(context.Context, TCPProbeRequest) (any, error)
 }
 
 // APIError is returned as a stable machine-readable control-plane error.
@@ -283,6 +290,9 @@ func (s *Server) handler() http.Handler {
 	}))
 	mux.HandleFunc("POST /v1/dns/resolve", decodeBody(s, func(ctx context.Context, request DNSResolveRequest) (any, error) {
 		return s.backend.Resolve(ctx, request)
+	}))
+	mux.HandleFunc("POST /v1/network/tcp-probe", decodeBody(s, func(ctx context.Context, request TCPProbeRequest) (any, error) {
+		return s.backend.TCPProbe(ctx, request)
 	}))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		select {

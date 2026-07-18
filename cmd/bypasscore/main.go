@@ -1,6 +1,7 @@
 // BypassCore CLI: load config, then either test a routing decision
-// (-test "tcp:host:port"), resolve a domain (-resolve "domain"), run an
-// observatory probe (-observe), or run as a daemon (-run).
+// (-test "tcp:host:port"), resolve a domain (-resolve "domain"), measure a TCP
+// handshake (-tcp-probe "host:port"), run an observatory probe (-observe), or
+// run as a daemon (-run).
 package main
 
 import (
@@ -13,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -28,6 +30,7 @@ import (
 	"github.com/eugene/bypasscore/app/observatory"
 	appoutbound "github.com/eugene/bypasscore/app/outbound"
 	"github.com/eugene/bypasscore/app/router"
+	"github.com/eugene/bypasscore/app/tcpprobe"
 	"github.com/eugene/bypasscore/common/errors"
 	bcnet "github.com/eugene/bypasscore/common/net"
 	bcsession "github.com/eugene/bypasscore/common/session"
@@ -55,7 +58,7 @@ type Config struct {
 }
 
 // version is overridden by release builds with -ldflags=-X main.version=... .
-var version = "1.2.0"
+var version = "1.3.0"
 var commit = "unknown"
 var buildDate = "unknown"
 
@@ -71,6 +74,8 @@ func run() error {
 	testDest := flag.String("test", "", `test a routing decision, e.g. "tcp:www.google.com:443"`)
 	resolve := flag.String("resolve", "", `resolve a domain via DNS, e.g. "example.com"`)
 	observe := flag.Bool("observe", false, "run a single observatory probe round")
+	tcpProbe := flag.String("tcp-probe", "", `measure one TCP handshake, e.g. "example.com:443"`)
+	tcpProbeTimeout := flag.Duration("tcp-probe-timeout", tcpprobe.DefaultTimeout, "TCP probe timeout")
 	runMode := flag.Bool("run", false, "run as a daemon (listen + dispatch)")
 	checkConfig := flag.Bool("check-config", false, "validate configuration and exit")
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warning, error")
@@ -97,6 +102,9 @@ func run() error {
 			fmt.Println(feature)
 		}
 		return nil
+	}
+	if *tcpProbe != "" {
+		return runTCPProbe(*tcpProbe, *tcpProbeTimeout, *jsonOutput)
 	}
 
 	cfg, configHash, err := loadConfigAndHash(*configPath)
@@ -245,6 +253,26 @@ func runResolve(dnsClient featdns.Client, domain string) error {
 	for _, ip := range ips {
 		fmt.Printf("  %s\n", ip)
 	}
+	return nil
+}
+
+func runTCPProbe(target string, timeout time.Duration, jsonOutput bool) error {
+	host, rawPort, err := net.SplitHostPort(target)
+	if err != nil {
+		return errors.New("TCP probe target must use host:port notation").Base(err)
+	}
+	port, err := strconv.Atoi(rawPort)
+	if err != nil {
+		return errors.New("TCP probe port is invalid").Base(err)
+	}
+	result, err := tcpprobe.Connect(context.Background(), host, port, timeout)
+	if err != nil {
+		return err
+	}
+	if jsonOutput {
+		return json.NewEncoder(os.Stdout).Encode(result)
+	}
+	fmt.Printf("connected to %s in %.3f ms\n", result.RemoteAddress, result.LatencyMs)
 	return nil
 }
 
