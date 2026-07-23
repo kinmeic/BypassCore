@@ -10,6 +10,7 @@ import (
 
 	"github.com/eugene/bypasscore/app/dialer"
 	bcnet "github.com/eugene/bypasscore/common/net"
+	"github.com/eugene/bypasscore/common/wgkey"
 	featoutbound "github.com/eugene/bypasscore/features/outbound"
 )
 
@@ -151,11 +152,75 @@ func TestModeString(t *testing.T) {
 		{ModeFreedom, "freedom"},
 		{ModeBlackhole, "blackhole"},
 		{ModeProxy, "proxy"},
+		{ModeWireGuard, "wireguard"},
 	}
 	for _, c := range cases {
 		if got := c.m.String(); got != c.want {
 			t.Errorf("Mode(%d).String() = %q, want %q", c.m, got, c.want)
 		}
+	}
+}
+
+func TestValidateWireGuard(t *testing.T) {
+	private, err := wgkey.GeneratePrivate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	public, err := wgkey.Public(private)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerPrivate, err := wgkey.GeneratePrivate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerPublic, err := wgkey.Public(peerPrivate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := &WireGuardConfig{
+		SecretKey: wgkey.Encode(private),
+		PublicKey: wgkey.Encode(public),
+		Address:   []string{"10.0.0.2/32"},
+		Peers: []*WireGuardPeerConfig{{
+			PublicKey:  wgkey.Encode(peerPublic),
+			Endpoint:   "vpn.example.com:51820",
+			AllowedIPs: []string{"0.0.0.0/0"},
+			KeepAlive:  25,
+		}},
+		MTU: 1420,
+	}
+	manager := NewManager(&Config{Outbounds: []*Outbound{{
+		Tag: "wg", Mode: ModeWireGuard, WireGuard: config,
+	}}})
+	if err := manager.Validate(); err != nil {
+		t.Fatalf("valid WireGuard config rejected: %v", err)
+	}
+
+	config.PublicKey = wgkey.Encode(peerPublic)
+	if err := manager.Validate(); err == nil {
+		t.Fatal("mismatched local public key was accepted")
+	}
+
+	config.PublicKey = ""
+	if err := manager.Validate(); err == nil {
+		t.Fatal("missing local public key was accepted")
+	}
+
+	config.PublicKey = wgkey.Encode(public)
+	config.Peers[0].Endpoint = "vpn.example.com:0"
+	if err := manager.Validate(); err == nil {
+		t.Fatal("zero peer endpoint port was accepted")
+	}
+
+	config.Peers[0].Endpoint = ":51820"
+	if err := manager.Validate(); err == nil {
+		t.Fatal("empty peer endpoint host was accepted")
+	}
+
+	config.SecretKey = wgkey.Encode([wgkey.Size]byte{})
+	if err := manager.Validate(); err == nil {
+		t.Fatal("all-zero local secret key was accepted")
 	}
 }
 

@@ -34,6 +34,7 @@ import (
 	"github.com/eugene/bypasscore/common/errors"
 	bcnet "github.com/eugene/bypasscore/common/net"
 	bcsession "github.com/eugene/bypasscore/common/session"
+	"github.com/eugene/bypasscore/common/wgkey"
 	"github.com/eugene/bypasscore/core"
 	featdns "github.com/eugene/bypasscore/features/dns"
 	featrouting "github.com/eugene/bypasscore/features/routing"
@@ -42,6 +43,7 @@ import (
 	"github.com/eugene/bypasscore/proxy/blackhole"
 	"github.com/eugene/bypasscore/proxy/freedom"
 	"github.com/eugene/bypasscore/proxy/socks"
+	wgoutbound "github.com/eugene/bypasscore/proxy/wireguard"
 )
 
 // Config is the top-level BypassCore config (outbounds + routing + dns + inbounds).
@@ -58,7 +60,7 @@ type Config struct {
 }
 
 // version is overridden by release builds with -ldflags=-X main.version=... .
-var version = "1.3.0"
+var version = "1.4.0"
 var commit = "unknown"
 var buildDate = "unknown"
 
@@ -82,6 +84,8 @@ func run() error {
 	showVersion := false
 	showCapabilities := flag.Bool("capabilities", false, "print supported capabilities and exit")
 	jsonOutput := flag.Bool("json", false, "use JSON output where supported")
+	wireGuardKeypair := flag.Bool("wireguard-generate-keypair", false, "generate a WireGuard private/public key pair and exit")
+	wireGuardPSK := flag.Bool("wireguard-generate-psk", false, "generate a WireGuard preshared key and exit")
 	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 	flag.BoolVar(&showVersion, "V", false, "print version and exit")
 	flag.Parse()
@@ -105,6 +109,30 @@ func run() error {
 	}
 	if *tcpProbe != "" {
 		return runTCPProbe(*tcpProbe, *tcpProbeTimeout, *jsonOutput)
+	}
+	if *wireGuardKeypair && *wireGuardPSK {
+		return errors.New("choose only one WireGuard key generation operation")
+	}
+	if *wireGuardKeypair {
+		private, err := wgkey.GeneratePrivate()
+		if err != nil {
+			return err
+		}
+		public, err := wgkey.Public(private)
+		if err != nil {
+			return err
+		}
+		return writeKeyResult(*jsonOutput, map[string]string{
+			"secretKey": wgkey.Encode(private),
+			"publicKey": wgkey.Encode(public),
+		})
+	}
+	if *wireGuardPSK {
+		key, err := wgkey.GeneratePreShared()
+		if err != nil {
+			return err
+		}
+		return writeKeyResult(*jsonOutput, map[string]string{"preSharedKey": wgkey.Encode(key)})
 	}
 
 	cfg, configHash, err := loadConfigAndHash(*configPath)
@@ -237,10 +265,25 @@ func registerDialerFactory() {
 			return freedom.New(ob.Tag, bindIP, bindIface)
 		case appoutbound.ModeProxy:
 			return socks.NewFromSettings(ob.Tag, ob.Upstream.Server, ob.Upstream.Settings)
+		case appoutbound.ModeWireGuard:
+			return wgoutbound.New(ob.Tag, ob.WireGuard)
 		default:
 			return blackhole.New(ob.Tag)
 		}
 	})
+}
+
+func writeKeyResult(jsonOutput bool, result map[string]string) error {
+	if jsonOutput {
+		return json.NewEncoder(os.Stdout).Encode(result)
+	}
+	if value := result["secretKey"]; value != "" {
+		fmt.Println("secretKey=" + value)
+		fmt.Println("publicKey=" + result["publicKey"])
+		return nil
+	}
+	fmt.Println("preSharedKey=" + result["preSharedKey"])
+	return nil
 }
 
 func runResolve(dnsClient featdns.Client, domain string) error {

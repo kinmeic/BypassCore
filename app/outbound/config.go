@@ -10,6 +10,7 @@
 package outbound
 
 import (
+	"io"
 	"strings"
 	"sync"
 
@@ -29,6 +30,8 @@ const (
 	ModeBlackhole
 	// ModeProxy forwards traffic to an upstream proxy server described by Upstream.
 	ModeProxy
+	// ModeWireGuard carries traffic through an in-process userspace WireGuard client.
+	ModeWireGuard
 )
 
 // String returns the JSON-friendly name of the mode.
@@ -40,12 +43,14 @@ func (m Mode) String() string {
 		return "blackhole"
 	case ModeProxy:
 		return "proxy"
+	case ModeWireGuard:
+		return "wireguard"
 	default:
 		return "unknown"
 	}
 }
 
-// UnmarshalJSON parses Mode from a JSON string ("freedom"/"blackhole"/"proxy").
+// UnmarshalJSON parses Mode from a JSON string.
 // Unknown values are rejected so a typo cannot silently become direct access.
 func (m *Mode) UnmarshalJSON(data []byte) error {
 	s := strings.Trim(strings.Trim(string(data), `"`), " ")
@@ -56,6 +61,8 @@ func (m *Mode) UnmarshalJSON(data []byte) error {
 		*m = ModeBlackhole
 	case "proxy":
 		*m = ModeProxy
+	case "wireguard", "wg":
+		*m = ModeWireGuard
 	default:
 		return errors.New("unknown outbound mode: ", s)
 	}
@@ -87,17 +94,37 @@ type UpstreamConfig struct {
 	Settings map[string]any `json:"settings,omitempty"`
 }
 
+// WireGuardPeerConfig describes one WireGuard peer.
+type WireGuardPeerConfig struct {
+	PublicKey    string   `json:"publicKey"`
+	Endpoint     string   `json:"endpoint"`
+	AllowedIPs   []string `json:"allowedIPs,omitempty"`
+	PreSharedKey string   `json:"preSharedKey,omitempty"`
+	KeepAlive    uint16   `json:"keepAlive,omitempty"`
+}
+
+// WireGuardConfig describes an outbound-only userspace WireGuard device.
+type WireGuardConfig struct {
+	SecretKey string                 `json:"secretKey"`
+	PublicKey string                 `json:"publicKey,omitempty"`
+	Address   []string               `json:"address,omitempty"`
+	Peers     []*WireGuardPeerConfig `json:"peers"`
+	MTU       int                    `json:"mtu,omitempty"`
+}
+
 // Outbound is a single outbound descriptor.
 type Outbound struct {
 	// Tag is the unique outbound identifier referenced by routing rules/balancers.
 	Tag string `json:"tag"`
 	// Mode determines how matched traffic is carried.
-	// Accepted JSON values: "freedom", "blackhole", "proxy".
+	// Accepted JSON values: "freedom", "blackhole", "proxy", "wireguard".
 	Mode Mode `json:"mode"`
 	// Bind is the optional L3 binding (only meaningful for ModeFreedom).
 	Bind *BindConfig `json:"bind,omitempty"`
 	// Upstream is the optional upstream proxy (required for ModeProxy).
 	Upstream *UpstreamConfig `json:"upstream,omitempty"`
+	// WireGuard is required for ModeWireGuard.
+	WireGuard *WireGuardConfig `json:"wireguard,omitempty"`
 }
 
 // Config is the outbound section of the BypassCore config.
@@ -141,6 +168,12 @@ func (h *handler) Start() error {
 func (h *handler) Close() error {
 	if h.external != nil {
 		return h.external.Close()
+	}
+	// Mark the lazy initializer complete without constructing an outbound that
+	// was never used. If initialization is already in progress, Do waits for it.
+	h.dialerOnce.Do(func() {})
+	if closer, ok := h.dialer.(io.Closer); ok {
+		return closer.Close()
 	}
 	return nil
 }

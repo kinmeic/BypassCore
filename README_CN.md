@@ -8,10 +8,11 @@
 - **TLS/HTTP/QUIC 嗅探**：从纯 IP 连接恢复域名（TLS SNI / HTTP Host / QUIC Initial），让 TCP/UDP 域名规则对透明代理流量生效
 - **规则匹配引擎**：domain / IP(CIDR+GeoIP) / 端口 / 网络(TCP/UDP) / 协议 / inboundTag / user / process / 属性
 - **GeoData 支持**：`geosite:` / `geoip:` 规则，支持 `geoip.dat` / `geosite.dat` 加载
-- **3 种出站拨号器**：
+- **4 种出站拨号器**：
   - `freedom` — 直连，支持源 IP / 接口绑定（多 WAN）
   - `blackhole` — 丢弃
   - `proxy` — SOCKS5 client 拨到本地 naiveproxy/sing-box 的 socks 端口
+  - `wireguard` — 进程内用户态 WireGuard 客户端与用户态 TCP/IP 栈
 - **DNS 子系统**：多上游 DNS + 缓存 + 域名分流 + IP 过滤，UDP / TCP / DoT(RFC 7858) / DoH(RFC 8484)
 - **DNS 监听服务**：通过普通 UDP/TCP 端口提供 A/AAAA 解析，并将 MX/TXT/SRV/PTR/CAA 等记录类型沿相同 tagged outbound 转发
 - **原生 DNS→NFTSet**：在 Linux 上通过 netlink 把指定 DNS server tag 的 A/AAAA 结果批量写入 IPv4/IPv6 nftables set，元素超时跟随 DNS TTL
@@ -53,6 +54,10 @@ make run-resolve DOMAIN=example.com
 # 不加载配置，测量 TCP 握手延迟
 ./bin/bypasscore -tcp-probe example.com:443 -json
 
+# 不加载配置，生成 WireGuard 密钥
+./bin/bypasscore -wireguard-generate-keypair -json
+./bin/bypasscore -wireguard-generate-psk -json
+
 # Observatory 探测
 make observe
 ```
@@ -79,7 +84,8 @@ router.PickRoute → outboundTag
 outbound dialer:
   ├─ freedom:  net.Dial 直连 + 源IP/接口绑定
   ├─ blackhole: 丢弃
-  └─ proxy:    SOCKS5 client → 127.0.0.1:<naiveproxy_port>
+  ├─ proxy:    SOCKS5 client → 127.0.0.1:<naiveproxy_port>
+  └─ wireguard: 用户态 WireGuard 设备 + 用户态 TCP/IP 栈
   ↓
 transport.Bridge (双向拷贝)
 ```
@@ -94,11 +100,19 @@ transport.Bridge (双向拷贝)
 | `freedom` | ✅ interface + localIP | — | 多 WAN 分流（wan1/wan2） |
 | `blackhole` | — | — | 丢弃 |
 | `proxy` | — | ✅ socks server | SOCKS5 → 本地 naiveproxy |
+| `wireguard` | — | ✅ WireGuard 配置 | 仅客户端的用户态 WireGuard 隧道 |
 
 ```json
 {"tag": "wan1", "mode": "freedom", "bind": {"interface": "en0", "localIP": "192.168.1.2"}}
 {"tag": "proxy", "mode": "proxy", "upstream": {"protocol": "socks", "server": "127.0.0.1:1080", "settings": {"udpMaxPacketBytes": 8192}}}
+{"tag": "wg", "mode": "wireguard", "wireguard": {"secretKey": "<base64>", "publicKey": "<base64>", "address": ["10.0.0.2/32"], "peers": [{"publicKey": "<base64>", "endpoint": "vpn.example.com:51820", "allowedIPs": ["0.0.0.0/0", "::/0"], "preSharedKey": "<base64>", "keepAlive": 25}], "mtu": 1420}}
 ```
+
+WireGuard 仅作为出站客户端：BypassCore 不开放 WireGuard 服务端，也不创建内核网络
+接口。WireGuard 设备和 TCP/IP 栈都在进程内运行，可承载 TCP 与 connected UDP；
+配置热重载时通过运行时快照事务式替换。`allowedIPs` 留空时默认为 IPv4/IPv6 全流量，
+MTU 默认 1420；`publicKey` 必填且必须与 `secretKey` 匹配，endpoint 域名会在设备启动前
+解析。本地隧道地址通常应填写服务提供方分配的地址。
 
 ## DNS 子系统
 

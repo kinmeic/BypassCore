@@ -15,7 +15,7 @@ domain through sniffing, match routing rules, and forward through an outbound.
 - GeoData rules with `geosite:` and `geoip:`, loading `geoip.dat` and
   `geosite.dat`
 - Outbounds: `freedom` direct connections with source-IP/interface binding,
-  `blackhole`, and a SOCKS5 `proxy` for naiveproxy or sing-box
+  `blackhole`, a SOCKS5 `proxy`, and an in-process userspace WireGuard client
 - DNS subsystem with multiple upstreams, caching, domain routing, IP filtering,
   UDP, TCP, DoT (RFC 7858), and DoH (RFC 8484)
 - A local UDP/TCP DNS listening service with routed A/AAAA and raw
@@ -64,6 +64,10 @@ make run-resolve DOMAIN=example.com
 # Measure TCP handshake latency without loading a configuration
 ./bin/bypasscore -tcp-probe example.com:443 -json
 
+# Generate WireGuard key material without loading a configuration
+./bin/bypasscore -wireguard-generate-keypair -json
+./bin/bypasscore -wireguard-generate-psk -json
+
 # Run Observatory probes
 make observe
 ```
@@ -88,7 +92,8 @@ router.PickRoute → outboundTag
 outbound dialer:
   ├─ freedom:  direct net.Dial with source-IP/interface binding
   ├─ blackhole: drop
-  └─ proxy:    SOCKS5 client → 127.0.0.1:<naiveproxy_port>
+  ├─ proxy:    SOCKS5 client → 127.0.0.1:<naiveproxy_port>
+  └─ wireguard: userspace WireGuard device + userspace TCP/IP stack
   ↓
 transport.Bridge (bidirectional copy)
 ```
@@ -103,11 +108,21 @@ Each outbound is a descriptor with optional binding metadata:
 | `freedom` | interface + localIP | — | Multi-WAN routing (wan1/wan2) |
 | `blackhole` | — | — | Drop the connection |
 | `proxy` | — | SOCKS server | SOCKS5 → local naiveproxy |
+| `wireguard` | — | WireGuard settings | Client-only userspace WireGuard tunnel |
 
 ```json
 {"tag":"wan1","mode":"freedom","bind":{"interface":"en0","localIP":"192.168.1.2"}}
 {"tag":"proxy","mode":"proxy","upstream":{"protocol":"socks","server":"127.0.0.1:1080","settings":{"udpMaxPacketBytes":8192}}}
+{"tag":"wg","mode":"wireguard","wireguard":{"secretKey":"<base64>","publicKey":"<base64>","address":["10.0.0.2/32"],"peers":[{"publicKey":"<base64>","endpoint":"vpn.example.com:51820","allowedIPs":["0.0.0.0/0","::/0"],"preSharedKey":"<base64>","keepAlive":25}],"mtu":1420}}
 ```
+
+WireGuard is outbound-only: BypassCore does not expose a WireGuard server or
+create a kernel interface. The device and TCP/IP stack live in-process, support
+both TCP and connected UDP flows, and are replaced transactionally during a
+configuration reload. `allowedIPs` defaults to full IPv4/IPv6 routing and MTU
+defaults to 1420. `publicKey` is required and must match `secretKey`; endpoint
+hostnames are resolved before the device is brought up. Local tunnel addresses
+should normally be supplied by the WireGuard provider.
 
 ## DNS subsystem
 

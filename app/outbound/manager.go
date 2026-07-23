@@ -4,12 +4,15 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/eugene/bypasscore/app/dialer"
 	"github.com/eugene/bypasscore/common/errors"
+	"github.com/eugene/bypasscore/common/wgkey"
 	featoutbound "github.com/eugene/bypasscore/features/outbound"
 )
 
@@ -230,8 +233,88 @@ func (m *Manager) Validate() error {
 				}
 			}
 		}
+		if h.ob.Mode == ModeWireGuard {
+			if err := validateWireGuard(tag, h.ob.WireGuard); err != nil {
+				return err
+			}
+		}
 		if h.ob.Bind != nil && h.ob.Bind.LocalIP != "" && net.ParseIP(h.ob.Bind.LocalIP) == nil {
 			return errors.New("outbound ", tag, " has invalid bind.localIP")
+		}
+	}
+	return nil
+}
+
+func validateWireGuard(tag string, config *WireGuardConfig) error {
+	prefix := "wireguard outbound " + tag + " "
+	if config == nil {
+		return errors.New(prefix, "requires wireguard settings")
+	}
+	private, err := wgkey.Parse(config.SecretKey)
+	if err != nil {
+		return errors.New(prefix, "has invalid secretKey").Base(err)
+	}
+	if wgkey.IsZero(private) {
+		return errors.New(prefix, "secretKey must not be all zero")
+	}
+	if strings.TrimSpace(config.PublicKey) == "" {
+		return errors.New(prefix, "requires publicKey")
+	}
+	configured, err := wgkey.Parse(config.PublicKey)
+	if err != nil {
+		return errors.New(prefix, "has invalid publicKey").Base(err)
+	}
+	derived, err := wgkey.Public(private)
+	if err != nil || configured != derived {
+		return errors.New(prefix, "publicKey does not match secretKey")
+	}
+	if config.MTU != 0 && (config.MTU < 576 || config.MTU > 65535) {
+		return errors.New(prefix, "mtu must be between 576 and 65535")
+	}
+	for index, address := range config.Address {
+		if _, err := netip.ParsePrefix(strings.TrimSpace(address)); err != nil {
+			return errors.New(prefix, "has invalid address[", index, "]").Base(err)
+		}
+	}
+	if len(config.Peers) == 0 {
+		return errors.New(prefix, "requires at least one peer")
+	}
+	for index, peer := range config.Peers {
+		peerPrefix := prefix + fmt.Sprintf("peer[%d] ", index)
+		if peer == nil {
+			return errors.New(peerPrefix, "is null")
+		}
+		peerPublic, err := wgkey.Parse(peer.PublicKey)
+		if err != nil {
+			return errors.New(peerPrefix, "has invalid publicKey").Base(err)
+		}
+		if wgkey.IsZero(peerPublic) {
+			return errors.New(peerPrefix, "publicKey must not be all zero")
+		}
+		host, port, err := net.SplitHostPort(strings.TrimSpace(peer.Endpoint))
+		if err != nil {
+			return errors.New(peerPrefix, "has invalid endpoint").Base(err)
+		}
+		if strings.TrimSpace(host) == "" {
+			return errors.New(peerPrefix, "endpoint host must not be empty")
+		}
+		portNumber, err := strconv.ParseUint(port, 10, 16)
+		if err != nil || portNumber == 0 {
+			return errors.New(peerPrefix, "endpoint port must be between 1 and 65535")
+		}
+		if peer.PreSharedKey != "" {
+			psk, err := wgkey.Parse(peer.PreSharedKey)
+			if err != nil {
+				return errors.New(peerPrefix, "has invalid preSharedKey").Base(err)
+			}
+			if wgkey.IsZero(psk) {
+				return errors.New(peerPrefix, "preSharedKey must not be all zero")
+			}
+		}
+		for allowedIndex, allowed := range peer.AllowedIPs {
+			if _, err := netip.ParsePrefix(strings.TrimSpace(allowed)); err != nil {
+				return errors.New(peerPrefix, "has invalid allowedIPs[", allowedIndex, "]").Base(err)
+			}
 		}
 	}
 	return nil

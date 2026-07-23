@@ -48,12 +48,13 @@ const maxConfigBytes = 16 << 20
 func capabilities() control.Capabilities {
 	return control.Capabilities{
 		Version:      version,
-		ConfigSchema: 4,
+		ConfigSchema: 5,
 		Features: []string{
 			"control-unix-http-json", "dns-inbound", "raw-dns", "metrics",
 			"routing-reload", "full-reload", "runtime-snapshot-reload", "inbound-parameter-reload", "dns-outbound-tag",
 			"routing-final-outbound", "socks5-udp", "transparent-tcp-redirect",
 			"transparent-tcp-udp-tproxy", "dns-result-unixgram", "dns-result-resync", "dns-result-nftset", "dns-result-nftset-probe", "observatory", "ready-status", "inbound-health", "reload-if-match", "tcp-connect-probe", "ipv6",
+			"wireguard-client", "wireguard-key-generation",
 		},
 	}
 }
