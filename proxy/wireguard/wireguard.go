@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/eugene/bypasscore/app/dialer"
 	appoutbound "github.com/eugene/bypasscore/app/outbound"
 	"github.com/eugene/bypasscore/common/errors"
 	bcnet "github.com/eugene/bypasscore/common/net"
@@ -76,9 +77,151 @@ func (h *Handler) Dial(ctx context.Context, dest bcnet.Destination) (net.Conn, e
 	}
 	connection, err := tnet.DialContext(dialCtx, dest.Network.SystemString(), address)
 	if err != nil {
-		return nil, errors.New("wireguard[", h.tag, "] dial ", address, " failed").Base(err)
+		return nil, errors.New("wireguard[", h.tag, "] dial ", address, " failed; ", h.handshakeSummary()).Base(err)
 	}
 	return connection, nil
+}
+
+// ProbeHandshake sends one packet through the userspace tunnel and waits for
+// the WireGuard peer handshake state to become current. It verifies the UDP
+// carrier itself and intentionally does not depend on a public TCP/HTTP target.
+func (h *Handler) ProbeHandshake(ctx context.Context) (dialer.HandshakeResult, error) {
+	probeCtx := ctx
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		probeCtx, cancel = context.WithTimeout(ctx, defaultDialTimeout)
+		defer cancel()
+	}
+	if err := h.ensureInitialized(probeCtx); err != nil {
+		return dialer.HandshakeResult{}, errors.New("wireguard[", h.tag, "] initialize failed").Base(err)
+	}
+	h.mu.RLock()
+	tnet, wgDevice, closed, hasIPv4 := h.net, h.device, h.closed, h.hasIPv4
+	h.mu.RUnlock()
+	if closed || tnet == nil || wgDevice == nil {
+		return dialer.HandshakeResult{}, errors.New("wireguard[", h.tag, "] is closed")
+	}
+
+	probeAddress, err := h.handshakeProbeAddress(hasIPv4)
+	if err != nil {
+		return dialer.HandshakeResult{}, err
+	}
+	started := time.Now()
+	connection, err := tnet.DialContext(probeCtx, "udp", probeAddress)
+	if err != nil {
+		return dialer.HandshakeResult{}, errors.New("wireguard[", h.tag, "] UDP probe failed; ", h.handshakeSummary()).Base(err)
+	}
+	// A syntactically valid DNS query is used only to make the netstack emit an
+	// inner packet. A DNS response is not required: peer handshake state is the
+	// authoritative result.
+	_ = connection.SetWriteDeadline(deadlineOr(probeCtx, started.Add(defaultDialTimeout)))
+	_, writeErr := connection.Write([]byte{
+		0x42, 0x43, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01,
+	})
+	_ = connection.Close()
+	if writeErr != nil {
+		return dialer.HandshakeResult{}, errors.New("wireguard[", h.tag, "] UDP probe write failed; ", h.handshakeSummary()).Base(writeErr)
+	}
+
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		handshake, stateErr := latestHandshake(wgDevice)
+		if stateErr != nil {
+			return dialer.HandshakeResult{}, errors.New("wireguard[", h.tag, "] read handshake state failed").Base(stateErr)
+		}
+		if !handshake.IsZero() && time.Since(handshake) <= 3*time.Minute {
+			return dialer.HandshakeResult{Latency: time.Since(started), LastHandshake: handshake}, nil
+		}
+		select {
+		case <-probeCtx.Done():
+			return dialer.HandshakeResult{}, errors.New("wireguard[", h.tag, "] UDP handshake timed out; ", h.handshakeSummary()).Base(probeCtx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func (h *Handler) handshakeProbeAddress(preferIPv4 bool) (string, error) {
+	var fallback netip.Addr
+	hasAllowedIP := false
+	for _, peer := range h.config.Peers {
+		for _, allowed := range peer.AllowedIPs {
+			prefix, err := netip.ParsePrefix(strings.TrimSpace(allowed))
+			if err != nil {
+				continue
+			}
+			hasAllowedIP = true
+			candidate := prefix.Addr().Unmap()
+			if prefix.Bits() < candidate.BitLen() {
+				candidate = candidate.Next()
+			}
+			if !candidate.IsValid() {
+				continue
+			}
+			if !fallback.IsValid() {
+				fallback = candidate
+			}
+			if candidate.Is4() == preferIPv4 {
+				return net.JoinHostPort(candidate.String(), "53"), nil
+			}
+		}
+	}
+	if !hasAllowedIP {
+		if preferIPv4 {
+			return "1.1.1.1:53", nil
+		}
+		return "[2606:4700:4700::1111]:53", nil
+	}
+	if fallback.IsValid() {
+		return net.JoinHostPort(fallback.String(), "53"), nil
+	}
+	return "", errors.New("wireguard[", h.tag, "] has no allowed IP for UDP handshake probe")
+}
+
+func deadlineOr(ctx context.Context, fallback time.Time) time.Time {
+	if deadline, ok := ctx.Deadline(); ok {
+		return deadline
+	}
+	return fallback
+}
+
+func latestHandshake(wgDevice *device.Device) (time.Time, error) {
+	state, err := wgDevice.IpcGet()
+	if err != nil {
+		return time.Time{}, err
+	}
+	var latest time.Time
+	for _, line := range strings.Split(state, "\n") {
+		if !strings.HasPrefix(line, "last_handshake_time_sec=") {
+			continue
+		}
+		seconds, parseErr := strconv.ParseInt(strings.TrimPrefix(line, "last_handshake_time_sec="), 10, 64)
+		if parseErr == nil && seconds > 0 {
+			value := time.Unix(seconds, 0)
+			if value.After(latest) {
+				latest = value
+			}
+		}
+	}
+	return latest, nil
+}
+
+func (h *Handler) handshakeSummary() string {
+	h.mu.RLock()
+	wgDevice := h.device
+	h.mu.RUnlock()
+	if wgDevice == nil {
+		return "WireGuard device is not initialized"
+	}
+	handshake, err := latestHandshake(wgDevice)
+	if err != nil {
+		return "WireGuard handshake state is unavailable"
+	}
+	if handshake.IsZero() {
+		return "WireGuard handshake has never completed (check endpoint UDP reachability, endpoint public key, pre-shared key, local address, and server peer configuration)"
+	}
+	return fmt.Sprintf("last WireGuard handshake was %s ago", time.Since(handshake).Round(time.Second))
 }
 
 func numericDestination(ctx context.Context, dest bcnet.Destination, hasIPv4, hasIPv6 bool) (string, error) {

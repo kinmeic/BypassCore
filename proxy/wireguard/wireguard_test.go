@@ -113,6 +113,13 @@ func TestHandlerCarriesTCPAndUDP(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	handshake, err := handler.ProbeHandshake(ctx)
+	if err != nil {
+		t.Fatalf("UDP handshake probe: %v", err)
+	}
+	if handshake.LastHandshake.IsZero() || handshake.Latency < 0 {
+		t.Fatalf("invalid handshake result: %#v", handshake)
+	}
 	tcpConnection, err := handler.Dial(ctx,
 		bcnet.TCPDestination(bcnet.ParseAddress("10.77.0.1"), 18080))
 	if err != nil {

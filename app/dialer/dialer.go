@@ -11,6 +11,7 @@ package dialer
 import (
 	"context"
 	"net"
+	"time"
 
 	bcnet "github.com/eugene/bypasscore/common/net"
 )
@@ -21,4 +22,17 @@ type Dialer interface {
 	Dial(ctx context.Context, dest bcnet.Destination) (net.Conn, error)
 	// Tag returns the outbound tag.
 	Tag() string
+}
+
+// HandshakeResult describes a transport-level handshake completed by an
+// outbound whose carrier is connectionless (currently WireGuard over UDP).
+type HandshakeResult struct {
+	Latency       time.Duration
+	LastHandshake time.Time
+}
+
+// HandshakeProber is implemented by UDP-carried outbounds that can verify
+// their own transport handshake without depending on an arbitrary TCP target.
+type HandshakeProber interface {
+	ProbeHandshake(ctx context.Context) (HandshakeResult, error)
 }

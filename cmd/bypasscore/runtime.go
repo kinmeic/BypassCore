@@ -55,7 +55,7 @@ func capabilities() control.Capabilities {
 			"routing-reload", "full-reload", "runtime-snapshot-reload", "inbound-parameter-reload", "dns-outbound-tag",
 			"routing-final-outbound", "socks5-udp", "transparent-tcp-redirect",
 			"transparent-tcp-udp-tproxy", "dns-result-unixgram", "dns-result-resync", "dns-result-nftset", "dns-result-nftset-probe", "observatory", "ready-status", "inbound-health", "reload-if-match", "tcp-connect-probe", "outbound-probe", "ipv6",
-			"wireguard-client", "wireguard-key-generation",
+			"wireguard-client", "wireguard-key-generation", "wireguard-handshake-probe",
 		},
 	}
 }
@@ -1025,9 +1025,17 @@ func (s *runtimeService) TCPProbe(ctx context.Context, request control.TCPProbeR
 		if outboundDialer == nil {
 			return nil, &control.APIError{Code: "invalid_outbound", Message: "outbound not found", Status: http.StatusBadRequest}
 		}
+		probeHost := request.Host
+		if _, needsCoreDNS := outboundDialer.(dialer.HandshakeProber); needsCoreDNS {
+			var resolveErr error
+			probeHost, resolveErr = s.resolveProbeHost(ctx, request.Host)
+			if resolveErr != nil {
+				return nil, &control.APIError{Code: "probe_dns_error", Message: resolveErr.Error(), Status: http.StatusBadGateway}
+			}
+		}
 		result, err = tcpprobe.ConnectWithDialer(ctx, request.Host, request.Port, time.Duration(request.TimeoutMs)*time.Millisecond,
-			func(dialCtx context.Context, host string, port int) (net.Conn, error) {
-				return outboundDialer.Dial(dialCtx, bcnet.TCPDestination(bcnet.ParseAddress(host), bcnet.Port(port)))
+			func(dialCtx context.Context, _ string, port int) (net.Conn, error) {
+				return outboundDialer.Dial(dialCtx, bcnet.TCPDestination(bcnet.ParseAddress(probeHost), bcnet.Port(port)))
 			})
 	}
 	if err == nil {
@@ -1041,6 +1049,68 @@ func (s *runtimeService) TCPProbe(ctx context.Context, request control.TCPProbeR
 	}
 	return nil, &control.APIError{Code: "tcp_probe_failed", Message: err.Error(), Status: http.StatusBadGateway}
 }
+
+func (s *runtimeService) HandshakeProbe(ctx context.Context, request control.HandshakeProbeRequest) (any, error) {
+	outboundTag := strings.TrimSpace(request.OutboundTag)
+	if outboundTag == "" {
+		return nil, &control.APIError{Code: "invalid_outbound", Message: "outboundTag is required", Status: http.StatusBadRequest}
+	}
+	timeout := time.Duration(request.TimeoutMs) * time.Millisecond
+	if timeout == 0 {
+		timeout = 6 * time.Second
+	}
+	if timeout < time.Millisecond || timeout > 15*time.Second {
+		return nil, &control.APIError{Code: "invalid_handshake_probe", Message: "timeout must be between 1ms and 15s", Status: http.StatusBadRequest}
+	}
+	snapshot, err := s.acquire()
+	if err != nil {
+		return nil, err
+	}
+	defer snapshot.release()
+	outboundDialer := snapshot.outbound.GetDialer(outboundTag)
+	if outboundDialer == nil {
+		return nil, &control.APIError{Code: "invalid_outbound", Message: "outbound not found", Status: http.StatusBadRequest}
+	}
+	prober, ok := outboundDialer.(dialer.HandshakeProber)
+	if !ok {
+		return nil, &control.APIError{Code: "unsupported_handshake_probe", Message: "outbound does not expose a transport handshake probe", Status: http.StatusBadRequest}
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	result, err := prober.ProbeHandshake(probeCtx)
+	if err != nil {
+		if stderrors.Is(err, context.DeadlineExceeded) {
+			return nil, &control.APIError{Code: "handshake_probe_timeout", Message: err.Error(), Status: http.StatusGatewayTimeout}
+		}
+		return nil, &control.APIError{Code: "handshake_probe_failed", Message: err.Error(), Status: http.StatusBadGateway}
+	}
+	return map[string]any{
+		"outboundTag": outboundTag,
+		"latencyMs":   float64(result.Latency.Microseconds()) / 1000,
+		"handshakeAt": result.LastHandshake,
+	}, nil
+}
+
+func (s *runtimeService) resolveProbeHost(ctx context.Context, host string) (string, error) {
+	host = strings.TrimSpace(host)
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.String(), nil
+	}
+	ips, _, err := s.LookupIPContext(ctx, host, featdns.IPOption{IPv4Enable: true, IPv6Enable: true})
+	if err != nil {
+		return "", errors.New("resolve probe target through BypassCore DNS").Base(err)
+	}
+	for _, ip := range ips {
+		if ip.To4() != nil {
+			return ip.String(), nil
+		}
+	}
+	if len(ips) > 0 {
+		return ips[0].String(), nil
+	}
+	return "", errors.New("resolve probe target through BypassCore DNS returned no address")
+}
+
 func (s *runtimeService) URLTest(ctx context.Context, request control.URLTestRequest) (any, error) {
 	if len(request.URL) > 2048 {
 		return nil, &control.APIError{Code: "invalid_url_test", Message: "url is too long", Status: http.StatusBadRequest}
@@ -1088,7 +1158,15 @@ func (s *runtimeService) URLTest(ctx context.Context, request control.URLTestReq
 			if portErr != nil {
 				return nil, portErr
 			}
-			return outboundDialer.Dial(dialCtx, bcnet.TCPDestination(bcnet.ParseAddress(host), port))
+			probeHost := host
+			if _, needsCoreDNS := outboundDialer.(dialer.HandshakeProber); needsCoreDNS {
+				var resolveErr error
+				probeHost, resolveErr = s.resolveProbeHost(dialCtx, host)
+				if resolveErr != nil {
+					return nil, resolveErr
+				}
+			}
+			return outboundDialer.Dial(dialCtx, bcnet.TCPDestination(bcnet.ParseAddress(probeHost), port))
 		},
 		TLSHandshakeTimeout: 5 * time.Second,
 	}
