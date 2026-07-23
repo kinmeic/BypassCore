@@ -40,6 +40,7 @@ import (
 	featdns "github.com/eugene/bypasscore/features/dns"
 	"github.com/eugene/bypasscore/features/routing"
 	routingsession "github.com/eugene/bypasscore/features/routing/session"
+	"golang.org/x/net/dns/dnsmessage"
 )
 
 const runtimeDrainTimeout = 30 * time.Second
@@ -1028,7 +1029,7 @@ func (s *runtimeService) TCPProbe(ctx context.Context, request control.TCPProbeR
 		probeHost := request.Host
 		if _, needsCoreDNS := outboundDialer.(dialer.HandshakeProber); needsCoreDNS {
 			var resolveErr error
-			probeHost, resolveErr = s.resolveProbeHost(ctx, request.Host)
+			probeHost, resolveErr = resolveProbeHost(ctx, request.Host, outboundDialer)
 			if resolveErr != nil {
 				return nil, &control.APIError{Code: "probe_dns_error", Message: resolveErr.Error(), Status: http.StatusBadGateway}
 			}
@@ -1091,24 +1092,82 @@ func (s *runtimeService) HandshakeProbe(ctx context.Context, request control.Han
 	}, nil
 }
 
-func (s *runtimeService) resolveProbeHost(ctx context.Context, host string) (string, error) {
+func resolveProbeHost(ctx context.Context, host string, outboundDialer dialer.Dialer) (string, error) {
 	host = strings.TrimSpace(host)
 	if ip := net.ParseIP(host); ip != nil {
 		return ip.String(), nil
 	}
-	ips, _, err := s.LookupIPContext(ctx, host, featdns.IPOption{IPv4Enable: true, IPv6Enable: true})
+	if outboundDialer == nil {
+		return "", errors.New("resolve probe target: outbound dialer is required")
+	}
+
+	name, err := dnsmessage.NewName(strings.TrimSuffix(host, ".") + ".")
 	if err != nil {
-		return "", errors.New("resolve probe target through BypassCore DNS").Base(err)
+		return "", errors.New("resolve probe target: invalid domain").Base(err)
 	}
-	for _, ip := range ips {
-		if ip.To4() != nil {
-			return ip.String(), nil
+	queryID := uint16(time.Now().UnixNano())
+	query, err := (&dnsmessage.Message{
+		Header: dnsmessage.Header{ID: queryID, RecursionDesired: true},
+		Questions: []dnsmessage.Question{{
+			Name: name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET,
+		}},
+	}).Pack()
+	if err != nil {
+		return "", errors.New("build outbound DNS probe").Base(err)
+	}
+
+	var lastErr error
+	for _, resolver := range []string{"1.1.1.1", "2606:4700:4700::1111"} {
+		connection, dialErr := outboundDialer.Dial(ctx,
+			bcnet.UDPDestination(bcnet.ParseAddress(resolver), 53))
+		if dialErr != nil {
+			lastErr = dialErr
+			continue
 		}
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			deadline = time.Now().Add(5 * time.Second)
+		}
+		_ = connection.SetDeadline(deadline)
+		if _, err = connection.Write(query); err != nil {
+			_ = connection.Close()
+			lastErr = err
+			continue
+		}
+		buffer := make([]byte, 4096)
+		var count int
+		count, err = connection.Read(buffer)
+		_ = connection.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		var response dnsmessage.Message
+		if err = response.Unpack(buffer[:count]); err != nil {
+			lastErr = err
+			continue
+		}
+		if !response.Response || response.ID != queryID || response.RCode != dnsmessage.RCodeSuccess {
+			lastErr = errors.New("outbound DNS returned an invalid response")
+			continue
+		}
+		for _, records := range [][]dnsmessage.Resource{response.Answers, response.Additionals} {
+			for _, answer := range records {
+				if record, ok := answer.Body.(*dnsmessage.AResource); ok {
+					return net.IP(record.A[:]).String(), nil
+				}
+			}
+		}
+		lastErr = errors.New("outbound DNS response has no IPv4 address")
 	}
-	if len(ips) > 0 {
-		return ips[0].String(), nil
+	if lastErr == nil {
+		lastErr = errors.New("no outbound DNS resolver is reachable")
 	}
-	return "", errors.New("resolve probe target through BypassCore DNS returned no address")
+	return "", errors.New(
+		"resolve probe target through WireGuard outbound DNS failed ",
+		"(a peer handshake alone does not verify tunnel addresses or server forwarding; ",
+		"check Local Address, server peer AllowedIPs, IP forwarding, and NAT)",
+	).Base(lastErr)
 }
 
 func (s *runtimeService) URLTest(ctx context.Context, request control.URLTestRequest) (any, error) {
@@ -1161,7 +1220,7 @@ func (s *runtimeService) URLTest(ctx context.Context, request control.URLTestReq
 			probeHost := host
 			if _, needsCoreDNS := outboundDialer.(dialer.HandshakeProber); needsCoreDNS {
 				var resolveErr error
-				probeHost, resolveErr = s.resolveProbeHost(dialCtx, host)
+				probeHost, resolveErr = resolveProbeHost(dialCtx, host, outboundDialer)
 				if resolveErr != nil {
 					return nil, resolveErr
 				}

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/eugene/bypasscore/app/control"
+	"github.com/eugene/bypasscore/app/dialer"
 	"github.com/eugene/bypasscore/app/dnsevent"
 	appinbound "github.com/eugene/bypasscore/app/inbound"
 	appoutbound "github.com/eugene/bypasscore/app/outbound"
@@ -24,7 +25,71 @@ import (
 	featdns "github.com/eugene/bypasscore/features/dns"
 	routingsession "github.com/eugene/bypasscore/features/routing/session"
 	"github.com/eugene/bypasscore/infra/conf"
+	"golang.org/x/net/dns/dnsmessage"
 )
+
+type probeDNSDialer struct{ address string }
+
+func (d *probeDNSDialer) Tag() string { return "probe" }
+func (d *probeDNSDialer) Dial(ctx context.Context, _ bcnet.Destination) (net.Conn, error) {
+	var netDialer net.Dialer
+	return netDialer.DialContext(ctx, "udp", d.address)
+}
+
+var _ dialer.Dialer = (*probeDNSDialer)(nil)
+
+func TestResolveProbeHostUsesOutboundDNS(t *testing.T) {
+	listener, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	done := make(chan error, 1)
+	go func() {
+		buffer := make([]byte, 4096)
+		count, peer, readErr := listener.ReadFrom(buffer)
+		if readErr != nil {
+			done <- readErr
+			return
+		}
+		var query dnsmessage.Message
+		if unpackErr := query.Unpack(buffer[:count]); unpackErr != nil {
+			done <- unpackErr
+			return
+		}
+		response := dnsmessage.Message{
+			Header: dnsmessage.Header{
+				ID: query.ID, Response: true, RecursionAvailable: true,
+			},
+			Questions: query.Questions,
+			Answers: []dnsmessage.Resource{{
+				Header: dnsmessage.ResourceHeader{
+					Name: query.Questions[0].Name, Type: dnsmessage.TypeA,
+					Class: dnsmessage.ClassINET, TTL: 60,
+				},
+				Body: &dnsmessage.AResource{A: [4]byte{203, 0, 113, 9}},
+			}},
+		}
+		payload, packErr := response.Pack()
+		if packErr == nil {
+			_, packErr = listener.WriteTo(payload, peer)
+		}
+		done <- packErr
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	address, err := resolveProbeHost(ctx, "probe.example", &probeDNSDialer{address: listener.LocalAddr().String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if address != "203.0.113.9" {
+		t.Fatalf("resolved address = %q", address)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestRuntimeReloadDrainsLeasedConnection(t *testing.T) {
 	registerDialerFactory()
