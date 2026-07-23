@@ -54,9 +54,16 @@ type DNSResolveRequest struct {
 }
 
 type TCPProbeRequest struct {
-	Host      string `json:"host"`
-	Port      int    `json:"port"`
-	TimeoutMs int    `json:"timeoutMs,omitempty"`
+	Host        string `json:"host"`
+	Port        int    `json:"port"`
+	TimeoutMs   int    `json:"timeoutMs,omitempty"`
+	OutboundTag string `json:"outboundTag,omitempty"`
+}
+
+type URLTestRequest struct {
+	URL         string `json:"url"`
+	TimeoutMs   int    `json:"timeoutMs,omitempty"`
+	OutboundTag string `json:"outboundTag"`
 }
 
 type Backend interface {
@@ -72,6 +79,7 @@ type Backend interface {
 	DNSNFTSets(context.Context) (any, error)
 	ProbeDNSNFTSets(context.Context) (any, error)
 	TCPProbe(context.Context, TCPProbeRequest) (any, error)
+	URLTest(context.Context, URLTestRequest) (any, error)
 }
 
 // APIError is returned as a stable machine-readable control-plane error.
@@ -293,6 +301,9 @@ func (s *Server) handler() http.Handler {
 	}))
 	mux.HandleFunc("POST /v1/network/tcp-probe", decodeBody(s, func(ctx context.Context, request TCPProbeRequest) (any, error) {
 		return s.backend.TCPProbe(ctx, request)
+	}))
+	mux.HandleFunc("POST /v1/network/url-test", decodeBody(s, func(ctx context.Context, request URLTestRequest) (any, error) {
+		return s.backend.URLTest(ctx, request)
 	}))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		select {

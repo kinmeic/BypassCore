@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"reflect"
 	"sort"
@@ -53,7 +54,7 @@ func capabilities() control.Capabilities {
 			"control-unix-http-json", "dns-inbound", "raw-dns", "metrics",
 			"routing-reload", "full-reload", "runtime-snapshot-reload", "inbound-parameter-reload", "dns-outbound-tag",
 			"routing-final-outbound", "socks5-udp", "transparent-tcp-redirect",
-			"transparent-tcp-udp-tproxy", "dns-result-unixgram", "dns-result-resync", "dns-result-nftset", "dns-result-nftset-probe", "observatory", "ready-status", "inbound-health", "reload-if-match", "tcp-connect-probe", "ipv6",
+			"transparent-tcp-udp-tproxy", "dns-result-unixgram", "dns-result-resync", "dns-result-nftset", "dns-result-nftset-probe", "observatory", "ready-status", "inbound-health", "reload-if-match", "tcp-connect-probe", "outbound-probe", "ipv6",
 			"wireguard-client", "wireguard-key-generation",
 		},
 	}
@@ -1010,7 +1011,25 @@ func (s *runtimeService) Resolve(ctx context.Context, request control.DNSResolve
 	return map[string]any{"domain": request.Domain, "ips": values, "ttl": ttl, "latencyMs": time.Since(start).Milliseconds()}, nil
 }
 func (s *runtimeService) TCPProbe(ctx context.Context, request control.TCPProbeRequest) (any, error) {
-	result, err := tcpprobe.Connect(ctx, request.Host, request.Port, time.Duration(request.TimeoutMs)*time.Millisecond)
+	var result tcpprobe.Result
+	var err error
+	if strings.TrimSpace(request.OutboundTag) == "" {
+		result, err = tcpprobe.Connect(ctx, request.Host, request.Port, time.Duration(request.TimeoutMs)*time.Millisecond)
+	} else {
+		snapshot, acquireErr := s.acquire()
+		if acquireErr != nil {
+			return nil, acquireErr
+		}
+		defer snapshot.release()
+		outboundDialer := snapshot.outbound.GetDialer(request.OutboundTag)
+		if outboundDialer == nil {
+			return nil, &control.APIError{Code: "invalid_outbound", Message: "outbound not found", Status: http.StatusBadRequest}
+		}
+		result, err = tcpprobe.ConnectWithDialer(ctx, request.Host, request.Port, time.Duration(request.TimeoutMs)*time.Millisecond,
+			func(dialCtx context.Context, host string, port int) (net.Conn, error) {
+				return outboundDialer.Dial(dialCtx, bcnet.TCPDestination(bcnet.ParseAddress(host), bcnet.Port(port)))
+			})
+	}
 	if err == nil {
 		return result, nil
 	}
@@ -1021,6 +1040,86 @@ func (s *runtimeService) TCPProbe(ctx context.Context, request control.TCPProbeR
 		return nil, &control.APIError{Code: "tcp_probe_timeout", Message: err.Error(), Status: http.StatusGatewayTimeout}
 	}
 	return nil, &control.APIError{Code: "tcp_probe_failed", Message: err.Error(), Status: http.StatusBadGateway}
+}
+func (s *runtimeService) URLTest(ctx context.Context, request control.URLTestRequest) (any, error) {
+	if len(request.URL) > 2048 {
+		return nil, &control.APIError{Code: "invalid_url_test", Message: "url is too long", Status: http.StatusBadRequest}
+	}
+	target, err := url.ParseRequestURI(strings.TrimSpace(request.URL))
+	if err != nil || target.Hostname() == "" || target.User != nil || (target.Scheme != "http" && target.Scheme != "https") {
+		return nil, &control.APIError{Code: "invalid_url_test", Message: "a valid HTTP(S) URL without credentials is required", Status: http.StatusBadRequest}
+	}
+	outboundTag := strings.TrimSpace(request.OutboundTag)
+	if outboundTag == "" {
+		return nil, &control.APIError{Code: "invalid_outbound", Message: "outboundTag is required", Status: http.StatusBadRequest}
+	}
+	timeout := time.Duration(request.TimeoutMs) * time.Millisecond
+	if timeout == 0 {
+		timeout = 6 * time.Second
+	}
+	if timeout < time.Millisecond || timeout > 15*time.Second {
+		return nil, &control.APIError{Code: "invalid_url_test", Message: "timeout must be between 1ms and 15s", Status: http.StatusBadRequest}
+	}
+	snapshot, err := s.acquire()
+	if err != nil {
+		return nil, err
+	}
+	defer snapshot.release()
+	outboundDialer := snapshot.outbound.GetDialer(outboundTag)
+	if outboundDialer == nil {
+		return nil, &control.APIError{Code: "invalid_outbound", Message: "outbound not found", Status: http.StatusBadRequest}
+	}
+	testCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	transport := &http.Transport{
+		Proxy:                  nil,
+		DisableKeepAlives:      true,
+		MaxResponseHeaderBytes: 64 << 10,
+		ResponseHeaderTimeout:  timeout,
+		DialContext: func(dialCtx context.Context, network, address string) (net.Conn, error) {
+			if network != "tcp" && network != "tcp4" && network != "tcp6" {
+				return nil, stderrors.New("unsupported URL test network")
+			}
+			host, portText, splitErr := net.SplitHostPort(address)
+			if splitErr != nil {
+				return nil, splitErr
+			}
+			port, portErr := bcnet.PortFromString(portText)
+			if portErr != nil {
+				return nil, portErr
+			}
+			return outboundDialer.Dial(dialCtx, bcnet.TCPDestination(bcnet.ParseAddress(host), port))
+		},
+		TLSHandshakeTimeout: 5 * time.Second,
+	}
+	defer transport.CloseIdleConnections()
+	httpRequest, err := http.NewRequestWithContext(testCtx, http.MethodGet, target.String(), nil)
+	if err != nil {
+		return nil, &control.APIError{Code: "invalid_url_test", Message: err.Error(), Status: http.StatusBadRequest}
+	}
+	httpRequest.Header.Set("User-Agent", "BypassCore-URLTest")
+	started := time.Now()
+	response, err := (&http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}).Do(httpRequest)
+	if err != nil {
+		if stderrors.Is(err, context.DeadlineExceeded) {
+			return nil, &control.APIError{Code: "url_test_timeout", Message: err.Error(), Status: http.StatusGatewayTimeout}
+		}
+		return nil, &control.APIError{Code: "url_test_failed", Message: err.Error(), Status: http.StatusBadGateway}
+	}
+	if response.Body != nil {
+		_ = response.Body.Close()
+	}
+	return map[string]any{
+		"outboundTag": outboundTag,
+		"statusCode":  response.StatusCode,
+		"latencyMs":   float64(time.Since(started).Microseconds()) / 1000,
+	}, nil
 }
 func (s *runtimeService) Observatory(context.Context) (any, error) {
 	snapshot, err := s.acquire()

@@ -29,7 +29,8 @@ domain through sniffing, match routing rules, and forward through an outbound.
 - Unix-socket HTTP/JSON control plane for live status, readiness, validation,
   reload, route explanation, DNS resolution, Observatory, and metrics
 - Native TCP connect latency probes through the control plane or a config-free
-  one-shot CLI, without an external `tcping` process
+  one-shot CLI, plus outbound-aware TCP and URL probes for live tunnels,
+  without an external `tcping` process
 - Transactional runtime snapshots: routing, outbounds, DNS, Observatory, and
   non-binding inbound/metrics parameters reload without dropping old flows
 
@@ -324,7 +325,8 @@ It speaks HTTP/JSON over the Unix socket:
 | `POST /v1/config/reload` | Transactionally activate a JSON config; empty body reloads `-config` |
 | `POST /v1/route/explain` | Explain a route for `{"destination":"tcp:example.com:443"}` |
 | `POST /v1/dns/resolve` | Resolve with the running DNS state |
-| `POST /v1/network/tcp-probe` | Measure a TCP handshake for `{"host":"example.com","port":443,"timeoutMs":3000}` |
+| `POST /v1/network/tcp-probe` | Measure a direct TCP handshake, or use a configured outbound with `{"host":"example.com","port":443,"timeoutMs":3000,"outboundTag":"proxy"}` |
+| `POST /v1/network/url-test` | Fetch an HTTP(S) URL through a configured outbound with `{"url":"https://example.com/","timeoutMs":6000,"outboundTag":"proxy"}` |
 | `GET /v1/observatory` | Current probe results |
 | `GET /v1/metrics` | Metrics as JSON |
 | `GET /v1/dns/results` | Bounded unexpired DNS-result snapshot for event consumer resync |

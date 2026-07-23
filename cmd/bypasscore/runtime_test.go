@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -124,6 +125,71 @@ func TestRuntimeTCPProbe(t *testing.T) {
 	var apiErr *control.APIError
 	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusBadRequest || apiErr.Code != "invalid_tcp_probe" {
 		t.Fatalf("invalid request error=%v", err)
+	}
+}
+
+func TestRuntimeOutboundNetworkProbes(t *testing.T) {
+	registerDialerFactory()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	final := "direct"
+	cfg := &Config{
+		Outbounds: []*appoutbound.Outbound{{Tag: "direct", Mode: appoutbound.ModeFreedom}},
+		Routing:   conf.RouterConfig{FinalOutboundTag: final},
+	}
+	service, err := newRuntimeService(context.Background(), "", cfg, "probe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+
+	address := strings.TrimPrefix(server.URL, "http://")
+	host, portText, err := net.SplitHostPort(address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := bcnet.PortFromString(portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, err := service.TCPProbe(context.Background(), control.TCPProbeRequest{
+		Host: host, Port: int(port), TimeoutMs: 1000, OutboundTag: "direct",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, ok := value.(tcpprobe.Result)
+	if !ok || result.LatencyMs < 0 {
+		t.Fatalf("invalid TCP result: %v", value)
+	}
+
+	value, err = service.URLTest(context.Background(), control.URLTestRequest{
+		URL: server.URL, TimeoutMs: 1000, OutboundTag: "direct",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	urlResult, ok := value.(map[string]any)
+	if !ok || urlResult["statusCode"] != http.StatusNoContent {
+		t.Fatalf("invalid URL result: %#v", value)
+	}
+
+	_, err = service.URLTest(context.Background(), control.URLTestRequest{
+		URL: server.URL, TimeoutMs: 1000, OutboundTag: "missing",
+	})
+	var apiErr *control.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "invalid_outbound" {
+		t.Fatalf("invalid outbound error=%v", err)
+	}
+
+	_, err = service.URLTest(context.Background(), control.URLTestRequest{
+		URL: "file:///etc/passwd", TimeoutMs: 1000, OutboundTag: "direct",
+	})
+	if !errors.As(err, &apiErr) || apiErr.Code != "invalid_url_test" {
+		t.Fatalf("invalid URL error=%v", err)
 	}
 }
 

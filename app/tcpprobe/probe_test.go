@@ -55,6 +55,33 @@ func TestConnectValidatesRequest(t *testing.T) {
 	}
 }
 
+func TestConnectWithDialerUsesProvidedOutbound(t *testing.T) {
+	called := false
+	result, err := ConnectWithDialer(context.Background(), "probe.example", 443, time.Second,
+		func(_ context.Context, host string, port int) (net.Conn, error) {
+			called = true
+			if host != "probe.example" || port != 443 {
+				t.Fatalf("dial target=%s:%d", host, port)
+			}
+			client, server := net.Pipe()
+			_ = server.Close()
+			return client, nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !called || result.Host != "probe.example" || result.Port != 443 || result.LatencyMs < 0 {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+}
+
+func TestConnectWithDialerRequiresDialer(t *testing.T) {
+	_, err := ConnectWithDialer(context.Background(), "example.com", 443, time.Second, nil)
+	if !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("error=%v", err)
+	}
+}
+
 func TestConnectHonorsCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

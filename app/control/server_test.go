@@ -32,6 +32,9 @@ func (testBackend) Resolve(_ context.Context, request DNSResolveRequest) (any, e
 func (testBackend) TCPProbe(_ context.Context, request TCPProbeRequest) (any, error) {
 	return request, nil
 }
+func (testBackend) URLTest(_ context.Context, request URLTestRequest) (any, error) {
+	return request, nil
+}
 func (testBackend) Observatory(context.Context) (any, error)     { return []any{}, nil }
 func (testBackend) Metrics(context.Context) (any, error)         { return []any{}, nil }
 func (testBackend) DNSResults(context.Context) (any, error)      { return []any{}, nil }
@@ -104,6 +107,17 @@ func TestUnixControlServer(t *testing.T) {
 	_ = response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("TCP probe status=%d", response.StatusCode)
+	}
+
+	request, _ = http.NewRequest(http.MethodPost, "http://unix/v1/network/url-test", bytes.NewBufferString(`{"url":"https://example.com/","outboundTag":"proxy"}`))
+	response, err = client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("URL test status=%d", response.StatusCode)
 	}
 }
 

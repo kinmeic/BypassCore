@@ -25,30 +25,41 @@ type Result struct {
 	LatencyMs     float64 `json:"latencyMs"`
 }
 
-// Connect completes one TCP handshake and closes the connection immediately.
-// The context and timeout bound DNS resolution and connection establishment.
-func Connect(ctx context.Context, host string, port int, timeout time.Duration) (Result, error) {
+type DialFunc func(context.Context, string, int) (net.Conn, error)
+
+func validate(host string, port int, timeout time.Duration) (string, time.Duration, error) {
 	host = strings.TrimSpace(host)
 	if len(host) >= 2 && host[0] == '[' && host[len(host)-1] == ']' {
 		host = host[1 : len(host)-1]
 	}
 	if host == "" {
-		return Result{}, fmt.Errorf("%w: host is required", ErrInvalidRequest)
+		return "", 0, fmt.Errorf("%w: host is required", ErrInvalidRequest)
 	}
 	if len(host) > 255 {
-		return Result{}, fmt.Errorf("%w: host is too long", ErrInvalidRequest)
+		return "", 0, fmt.Errorf("%w: host is too long", ErrInvalidRequest)
 	}
 	if strings.ContainsAny(host, "\x00\r\n") {
-		return Result{}, fmt.Errorf("%w: host contains control characters", ErrInvalidRequest)
+		return "", 0, fmt.Errorf("%w: host contains control characters", ErrInvalidRequest)
 	}
 	if port < 1 || port > 65535 {
-		return Result{}, fmt.Errorf("%w: port must be between 1 and 65535", ErrInvalidRequest)
+		return "", 0, fmt.Errorf("%w: port must be between 1 and 65535", ErrInvalidRequest)
 	}
 	if timeout == 0 {
 		timeout = DefaultTimeout
 	}
 	if timeout < time.Millisecond || timeout > MaxTimeout {
-		return Result{}, fmt.Errorf("%w: timeout must be between 1ms and %s", ErrInvalidRequest, MaxTimeout)
+		return "", 0, fmt.Errorf("%w: timeout must be between 1ms and %s", ErrInvalidRequest, MaxTimeout)
+	}
+	return host, timeout, nil
+}
+
+// Connect completes one TCP handshake and closes the connection immediately.
+// The context and timeout bound DNS resolution and connection establishment.
+func Connect(ctx context.Context, host string, port int, timeout time.Duration) (Result, error) {
+	var err error
+	host, timeout, err = validate(host, port, timeout)
+	if err != nil {
+		return Result{}, err
 	}
 
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -91,4 +102,37 @@ func Connect(ctx context.Context, host string, port int, timeout time.Duration) 
 		}, nil
 	}
 	return Result{}, fmt.Errorf("connect to %s:%d: %w", host, port, lastErr)
+}
+
+// ConnectWithDialer measures a TCP handshake through a caller-provided
+// outbound dialer. Unlike Connect, hostname resolution is owned by the
+// outbound so userspace tunnels and proxy transports retain their DNS model.
+func ConnectWithDialer(ctx context.Context, host string, port int, timeout time.Duration, dial DialFunc) (Result, error) {
+	var err error
+	host, timeout, err = validate(host, port, timeout)
+	if err != nil {
+		return Result{}, err
+	}
+	if dial == nil {
+		return Result{}, fmt.Errorf("%w: dialer is required", ErrInvalidRequest)
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	start := time.Now()
+	connection, err := dial(probeCtx, host, port)
+	if err != nil {
+		return Result{}, fmt.Errorf("connect to %s:%d: %w", host, port, err)
+	}
+	latency := time.Since(start)
+	remoteAddress := ""
+	if connection.RemoteAddr() != nil {
+		remoteAddress = connection.RemoteAddr().String()
+	}
+	_ = connection.Close()
+	return Result{
+		Host:          host,
+		Port:          port,
+		RemoteAddress: remoteAddress,
+		LatencyMs:     float64(latency.Microseconds()) / 1000,
+	}, nil
 }
