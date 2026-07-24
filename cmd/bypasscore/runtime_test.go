@@ -116,7 +116,7 @@ func TestResolveProbeHostFallsBackToCoreDNS(t *testing.T) {
 	defer service.Close()
 
 	address, err := service.resolveProbeHost(
-		context.Background(), "probe-fallback.test", &unavailableProbeDNSDialer{},
+		context.Background(), "probe-fallback.test", &unavailableProbeDNSDialer{}, "",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -225,6 +225,55 @@ func TestRuntimeTCPProbe(t *testing.T) {
 	var apiErr *control.APIError
 	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusBadRequest || apiErr.Code != "invalid_tcp_probe" {
 		t.Fatalf("invalid request error=%v", err)
+	}
+}
+
+func TestRuntimeTCPProbeResolvesThroughCoreDNS(t *testing.T) {
+	registerDialerFactory()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	accepted := make(chan struct{})
+	go func() {
+		connection, acceptErr := listener.Accept()
+		if acceptErr == nil {
+			_ = connection.Close()
+		}
+		close(accepted)
+	}()
+
+	cfg, _, err := decodeConfig([]byte(`{
+		"outbounds":[{"tag":"direct","mode":"freedom"}],
+		"dns":{"servers":["localhost"],"hosts":{"node-probe.test":"127.0.0.1"}},
+		"routing":{"finalOutboundTag":"direct"}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := newRuntimeService(context.Background(), "", cfg, "tcp-probe-dns")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+
+	value, err := service.TCPProbe(context.Background(), control.TCPProbeRequest{
+		Host:      "node-probe.test",
+		Port:      listener.Addr().(*net.TCPAddr).Port,
+		TimeoutMs: 1000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, ok := value.(tcpprobe.Result)
+	if !ok || result.RemoteAddress == "" {
+		t.Fatalf("invalid TCP result: %v", value)
+	}
+	select {
+	case <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("server did not accept DNS-resolved runtime probe")
 	}
 }
 

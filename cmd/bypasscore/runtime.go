@@ -56,7 +56,7 @@ func capabilities() control.Capabilities {
 			"routing-reload", "full-reload", "runtime-snapshot-reload", "inbound-parameter-reload", "dns-outbound-tag",
 			"routing-final-outbound", "socks5-udp", "transparent-tcp-redirect",
 			"transparent-tcp-udp-tproxy", "dns-result-unixgram", "dns-result-resync", "dns-result-nftset", "dns-result-nftset-probe", "observatory", "ready-status", "inbound-health", "reload-if-match", "tcp-connect-probe", "outbound-probe", "ipv6",
-			"wireguard-client", "wireguard-key-generation", "wireguard-handshake-probe",
+			"wireguard-client", "wireguard-key-generation", "wireguard-handshake-probe", "url-test-resolver-tag",
 		},
 	}
 }
@@ -636,6 +636,18 @@ func (s *runtimeService) LookupIPContext(ctx context.Context, domain string, opt
 	}
 	return snapshot.dns.LookupIP(domain, option)
 }
+func (s *runtimeService) LookupIPByServerTagContext(ctx context.Context, serverTag, domain string, option featdns.IPOption) ([]bcnet.IP, uint32, error) {
+	snapshot, err := s.acquire()
+	if err != nil {
+		return nil, 0, err
+	}
+	defer snapshot.release()
+	client, ok := snapshot.dns.(featdns.TaggedContextClient)
+	if !ok {
+		return nil, 0, errors.New("configured DNS client does not support tagged lookup")
+	}
+	return client.LookupIPByServerTagContext(ctx, serverTag, domain, option)
+}
 func (s *runtimeService) LookupRawContext(ctx context.Context, domain string, query []byte) ([]byte, error) {
 	snapshot, err := s.acquire()
 	if err != nil {
@@ -1015,7 +1027,26 @@ func (s *runtimeService) TCPProbe(ctx context.Context, request control.TCPProbeR
 	var result tcpprobe.Result
 	var err error
 	if strings.TrimSpace(request.OutboundTag) == "" {
-		result, err = tcpprobe.Connect(ctx, request.Host, request.Port, time.Duration(request.TimeoutMs)*time.Millisecond)
+		// Control-plane probes use the running DNS snapshot. This preserves the
+		// node-domain direct DNS policies and avoids libc resolver recursion
+		// after dnsmasq has been pointed at BypassCore.
+		result, err = tcpprobe.ConnectWithDialer(ctx, request.Host, request.Port, time.Duration(request.TimeoutMs)*time.Millisecond,
+			func(dialCtx context.Context, host string, port int) (net.Conn, error) {
+				probeHost := host
+				if net.ParseIP(host) == nil {
+					ips, _, resolveErr := s.LookupIPContext(dialCtx, host, featdns.IPOption{IPv4Enable: true, IPv6Enable: true})
+					if resolveErr != nil {
+						return nil, errors.New("resolve ", host, " through BypassCore DNS").Base(resolveErr)
+					}
+					var ok bool
+					probeHost, ok = preferredProbeIP(ips)
+					if !ok {
+						return nil, errors.New("resolve ", host, " through BypassCore DNS returned no address")
+					}
+				}
+				var direct net.Dialer
+				return direct.DialContext(dialCtx, "tcp", net.JoinHostPort(probeHost, strconv.Itoa(port)))
+			})
 	} else {
 		snapshot, acquireErr := s.acquire()
 		if acquireErr != nil {
@@ -1029,7 +1060,7 @@ func (s *runtimeService) TCPProbe(ctx context.Context, request control.TCPProbeR
 		probeHost := request.Host
 		if _, needsCoreDNS := outboundDialer.(dialer.HandshakeProber); needsCoreDNS {
 			var resolveErr error
-			probeHost, resolveErr = s.resolveProbeHost(ctx, request.Host, outboundDialer)
+			probeHost, resolveErr = s.resolveProbeHost(ctx, request.Host, outboundDialer, "")
 			if resolveErr != nil {
 				return nil, &control.APIError{Code: "probe_dns_error", Message: resolveErr.Error(), Status: http.StatusBadGateway}
 			}
@@ -1170,10 +1201,34 @@ func resolveProbeHostThroughOutbound(ctx context.Context, host string, outboundD
 	).Base(lastErr)
 }
 
-func (s *runtimeService) resolveProbeHost(ctx context.Context, host string, outboundDialer dialer.Dialer) (string, error) {
+func preferredProbeIP(ips []bcnet.IP) (string, bool) {
+	for _, ip := range ips {
+		if ip.To4() != nil {
+			return ip.String(), true
+		}
+	}
+	if len(ips) > 0 {
+		return ips[0].String(), true
+	}
+	return "", false
+}
+
+func (s *runtimeService) resolveProbeHost(ctx context.Context, host string, outboundDialer dialer.Dialer, resolverTag string) (string, error) {
 	host = strings.TrimSpace(host)
 	if ip := net.ParseIP(host); ip != nil {
 		return ip.String(), nil
+	}
+
+	if resolverTag = strings.TrimSpace(resolverTag); resolverTag != "" {
+		ips, _, err := s.LookupIPByServerTagContext(ctx, resolverTag, host,
+			featdns.IPOption{IPv4Enable: true, IPv6Enable: true})
+		if err != nil {
+			return "", errors.New("resolve probe target through DNS server [", resolverTag, "]").Base(err)
+		}
+		if resolved, ok := preferredProbeIP(ips); ok {
+			return resolved, nil
+		}
+		return "", errors.New("resolve probe target through DNS server [", resolverTag, "] returned no address")
 	}
 
 	// Prefer resolving through the tested WireGuard outbound, but do not let a
@@ -1199,13 +1254,8 @@ func (s *runtimeService) resolveProbeHost(ctx context.Context, host string, outb
 
 	ips, _, localErr := s.LookupIPContext(ctx, host, featdns.IPOption{IPv4Enable: true, IPv6Enable: true})
 	if localErr == nil {
-		for _, ip := range ips {
-			if ip.To4() != nil {
-				return ip.String(), nil
-			}
-		}
-		if len(ips) > 0 {
-			return ips[0].String(), nil
+		if resolved, ok := preferredProbeIP(ips); ok {
+			return resolved, nil
 		}
 		localErr = errors.New("BypassCore DNS returned no address")
 	}
@@ -1264,7 +1314,7 @@ func (s *runtimeService) URLTest(ctx context.Context, request control.URLTestReq
 			probeHost := host
 			if _, needsCoreDNS := outboundDialer.(dialer.HandshakeProber); needsCoreDNS {
 				var resolveErr error
-				probeHost, resolveErr = s.resolveProbeHost(dialCtx, host, outboundDialer)
+				probeHost, resolveErr = s.resolveProbeHost(dialCtx, host, outboundDialer, request.ResolverTag)
 				if resolveErr != nil {
 					return nil, resolveErr
 				}

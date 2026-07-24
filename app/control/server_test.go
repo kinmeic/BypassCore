@@ -123,15 +123,21 @@ func TestUnixControlServer(t *testing.T) {
 		t.Fatalf("handshake probe status=%d", response.StatusCode)
 	}
 
-	request, _ = http.NewRequest(http.MethodPost, "http://unix/v1/network/url-test", bytes.NewBufferString(`{"url":"https://example.com/","outboundTag":"proxy"}`))
+	request, _ = http.NewRequest(http.MethodPost, "http://unix/v1/network/url-test", bytes.NewBufferString(`{"url":"https://example.com/","outboundTag":"proxy","resolverTag":"url_test_direct"}`))
 	response, err = client.Do(request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _ = io.Copy(io.Discard, response.Body)
-	_ = response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("URL test status=%d", response.StatusCode)
+	}
+	var urlRequest URLTestRequest
+	if err := json.NewDecoder(response.Body).Decode(&urlRequest); err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if urlRequest.ResolverTag != "url_test_direct" {
+		t.Fatalf("URL test resolver tag=%q", urlRequest.ResolverTag)
 	}
 }
 

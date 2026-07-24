@@ -22,16 +22,44 @@ type ipSelectionServer struct {
 	name  string
 	ip    bcnet.IP
 	delay time.Duration
+	calls int
 }
 
 func (s *ipSelectionServer) Name() string       { return s.name }
 func (*ipSelectionServer) IsDisableCache() bool { return true }
 func (s *ipSelectionServer) QueryIP(ctx context.Context, _ string, _ dns_feature.IPOption) ([]bcnet.IP, uint32, error) {
+	s.calls++
 	select {
 	case <-time.After(s.delay):
 		return []bcnet.IP{s.ip}, 60, nil
 	case <-ctx.Done():
 		return nil, 0, ctx.Err()
+	}
+}
+
+func TestLookupIPByServerTagUsesOnlySelectedServer(t *testing.T) {
+	normalServer := &ipSelectionServer{name: "normal", ip: bcnet.ParseAddress("192.0.2.1").IP()}
+	probeServer := &ipSelectionServer{name: "probe", ip: bcnet.ParseAddress("192.0.2.9").IP()}
+	option := dns_feature.IPOption{IPv4Enable: true}
+	server := &DNS{
+		ctx: context.Background(),
+		clients: []*Client{
+			{server: normalServer, metricTag: "remote", timeout: time.Second, ipOption: &option},
+			{server: probeServer, metricTag: "url_test_direct", timeout: time.Second, ipOption: &option},
+		},
+	}
+
+	ips, _, err := server.LookupIPByServerTagContext(
+		context.Background(), "url_test_direct", "probe.test", option,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ips) != 1 || ips[0].String() != "192.0.2.9" {
+		t.Fatalf("unexpected tagged DNS result: %v", ips)
+	}
+	if normalServer.calls != 0 || probeServer.calls != 1 {
+		t.Fatalf("DNS calls normal=%d probe=%d, want 0/1", normalServer.calls, probeServer.calls)
 	}
 }
 

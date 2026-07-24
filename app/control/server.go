@@ -69,6 +69,7 @@ type URLTestRequest struct {
 	URL         string `json:"url"`
 	TimeoutMs   int    `json:"timeoutMs,omitempty"`
 	OutboundTag string `json:"outboundTag"`
+	ResolverTag string `json:"resolverTag,omitempty"`
 }
 
 type Backend interface {

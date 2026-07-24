@@ -35,6 +35,7 @@ type DNS struct {
 }
 
 var _ dns.ContextClient = (*DNS)(nil)
+var _ dns.TaggedContextClient = (*DNS)(nil)
 var _ dns.RawContextClient = (*DNS)(nil)
 
 // DomainMatcherInfo contains information attached to index returned by Server.domainMatcher.
@@ -304,6 +305,38 @@ func (s *DNS) LookupIPContext(ctx context.Context, domain string, option dns.IPO
 		cancel()
 	}()
 	return s.lookupIP(ctx, domain, option)
+}
+
+// LookupIPByServerTagContext resolves through exactly one configured server.
+// It is intentionally separate from normal policy selection so diagnostics
+// can avoid a circular dependency on the outbound they are testing.
+func (s *DNS) LookupIPByServerTagContext(ctx context.Context, serverTag, domain string, option dns.IPOption) ([]net.IP, uint32, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := s.ctx.Err(); err != nil {
+		return nil, 0, err
+	}
+	serverTag = strings.TrimSpace(serverTag)
+	domain = strings.TrimSuffix(strings.TrimSpace(domain), ".")
+	if serverTag == "" {
+		return nil, 0, errors.New("DNS server tag is required")
+	}
+	if domain == "" {
+		return nil, 0, errors.New("empty domain name")
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(s.ctx, cancel)
+	defer func() {
+		stop()
+		cancel()
+	}()
+	for _, client := range s.clients {
+		if client.metricTag == serverTag {
+			return client.QueryIP(ctx, domain, option)
+		}
+	}
+	return nil, 0, errors.New("DNS server tag not found: ", serverTag)
 }
 
 // LookupRawContext forwards an arbitrary DNS wire query through the same
