@@ -51,3 +51,17 @@ func TestNormalizeConfigBoundsTotalQueueBytes(t *testing.T) {
 		t.Fatalf("unexpected defaults: %#v", config)
 	}
 }
+
+func TestEmitAfterCloseCountsDrop(t *testing.T) {
+	sink, err := New(&Config{Socket: filepath.Join(t.TempDir(), "missing.sock"), QueueSize: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sink.EmitEvent(Event{Domain: "example.com"})
+	if got := sink.Stats().Dropped; got != 1 {
+		t.Fatalf("dropped = %d, want 1", got)
+	}
+}

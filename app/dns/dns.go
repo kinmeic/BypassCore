@@ -32,6 +32,8 @@ type DNS struct {
 	domainMatcher          geodata.DomainMatcher
 	matcherInfos           []*DomainMatcherInfo
 	checkSystem            bool
+	backgroundQuerySlots   chan struct{}
+	clientUsedPool         sync.Pool
 }
 
 var _ dns.ContextClient = (*DNS)(nil)
@@ -165,6 +167,10 @@ func New(ctx context.Context, config *Config) (*DNS, error) {
 		if err != nil {
 			return nil, errors.New("failed to create client").Base(err)
 		}
+		if strings.TrimSpace(ns.Tag) == "" {
+			client.metricTag = fmt.Sprintf("_default_%d", clientIdx+1)
+			client.status.ServerTag = client.metricTag
+		}
 		clients = append(clients, client)
 	}
 
@@ -193,6 +199,7 @@ func New(ctx context.Context, config *Config) (*DNS, error) {
 		disableFallbackIfMatch: config.DisableFallbackIfMatch,
 		enableParallelQuery:    config.EnableParallelQuery,
 		checkSystem:            checkSystem,
+		backgroundQuerySlots:   make(chan struct{}, 64),
 	}
 	success = true
 	return server, nil
@@ -436,9 +443,21 @@ func (s *DNS) lookupIP(ctx context.Context, domain string, option dns.IPOption) 
 
 func (s *DNS) sortClients(domain string) []*Client {
 	clients := make([]*Client, 0, len(s.clients))
-	clientUsed := make([]bool, len(s.clients))
-	clientNames := make([]string, 0, len(s.clients))
-	domainRules := []string{}
+	clientUsed, _ := s.clientUsedPool.Get().([]bool)
+	if cap(clientUsed) < len(s.clients) {
+		clientUsed = make([]bool, len(s.clients))
+	} else {
+		clientUsed = clientUsed[:len(s.clients)]
+		clear(clientUsed)
+	}
+	if clientUsed != nil {
+		defer s.clientUsedPool.Put(clientUsed)
+	}
+	debug := errors.LogEnabled(errors.Severity_Debug)
+	var clientNames, domainRules []string
+	if debug {
+		clientNames = make([]string, 0, len(s.clients))
+	}
 
 	// Priority domain matching
 	hasMatch := false
@@ -451,13 +470,17 @@ func (s *DNS) sortClients(domain string) []*Client {
 			info := s.matcherInfos[match]
 			client := s.clients[info.clientIdx]
 			domainRule := info.domainRule
-			domainRules = append(domainRules, fmt.Sprintf("%s(DNS idx:%d)", domainRule, info.clientIdx))
+			if debug {
+				domainRules = append(domainRules, fmt.Sprintf("%s(DNS idx:%d)", domainRule, info.clientIdx))
+			}
 			if clientUsed[info.clientIdx] {
 				continue
 			}
 			clientUsed[info.clientIdx] = true
 			clients = append(clients, client)
-			clientNames = append(clientNames, client.Name())
+			if debug {
+				clientNames = append(clientNames, client.Name())
+			}
 			hasMatch = true
 			if client.finalQuery {
 				logDecision(s.ctx, domain, domainRules, clientNames)
@@ -474,7 +497,9 @@ func (s *DNS) sortClients(domain string) []*Client {
 			}
 			clientUsed[idx] = true
 			clients = append(clients, client)
-			clientNames = append(clientNames, client.Name())
+			if debug {
+				clientNames = append(clientNames, client.Name())
+			}
 			if client.finalQuery {
 				logDecision(s.ctx, domain, domainRules, clientNames)
 				return clients
@@ -487,8 +512,7 @@ func (s *DNS) sortClients(domain string) []*Client {
 	if len(clients) == 0 {
 		if len(s.clients) > 0 {
 			clients = append(clients, s.clients[0])
-			clientNames = append(clientNames, s.clients[0].Name())
-			errors.LogWarning(s.ctx, "domain ", domain, " will use the first DNS: ", clientNames)
+			errors.LogWarning(s.ctx, "domain ", domain, " will use the first DNS: ", s.clients[0].Name())
 		} else {
 			errors.LogError(s.ctx, "no DNS clients available for domain ", domain, " and no default clients configured")
 		}
@@ -561,7 +585,7 @@ func (s *DNS) parallelQuery(ctx context.Context, domain string, option dns.IPOpt
 	var errs []error
 	clients := s.sortClients(domain)
 
-	resultsChan := asyncQueryAll(domain, option, clients, ctx)
+	resultsChan := asyncQueryAll(domain, option, clients, ctx, s.backgroundQuerySlots)
 
 	groups, groupOf := makeGroups( /*s.ctx,*/ clients)
 	results := make([]*queryResult, len(clients))
@@ -624,7 +648,7 @@ type queryResult struct {
 	index int
 }
 
-func asyncQueryAll(domain string, option dns.IPOption, clients []*Client, ctx context.Context) chan queryResult {
+func asyncQueryAll(domain string, option dns.IPOption, clients []*Client, ctx context.Context, backgroundSlots chan struct{}) chan queryResult {
 	if len(clients) == 0 {
 		ch := make(chan queryResult)
 		close(ch)
@@ -641,10 +665,23 @@ func asyncQueryAll(domain string, option dns.IPOption, clients []*Client, ctx co
 
 		go func(i int, c *Client) {
 			qctx := ctx
+			var release func()
 			if !c.server.IsDisableCache() {
-				nctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.timeout*2)
-				qctx = nctx
-				defer cancel()
+				select {
+				case backgroundSlots <- struct{}{}:
+					nctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.timeout*2)
+					qctx = nctx
+					release = func() {
+						cancel()
+						<-backgroundSlots
+					}
+				default:
+					// Under sustained upstream failure, honor the request
+					// context instead of accumulating detached cache fills.
+				}
+			}
+			if release != nil {
+				defer release()
 			}
 			ips, ttl, err := c.QueryIP(qctx, domain, option)
 			ch <- queryResult{ips: ips, ttl: ttl, err: err, index: i}

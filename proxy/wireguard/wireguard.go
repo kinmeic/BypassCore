@@ -23,8 +23,9 @@ import (
 )
 
 const (
-	defaultMTU         = 1420
-	defaultDialTimeout = 10 * time.Second
+	defaultMTU              = 1420
+	defaultDialTimeout      = 10 * time.Second
+	endpointRefreshInterval = 5 * time.Minute
 )
 
 var defaultAddresses = []string{"172.16.0.2/32", "fd59:7153:2388:b5fd:0000:0000:0000:0002/128"}
@@ -41,9 +42,11 @@ type Handler struct {
 	hasIPv4 bool
 	hasIPv6 bool
 
-	closeOnce sync.Once
-	closed    bool
-	mu        sync.RWMutex
+	closeOnce      sync.Once
+	closed         bool
+	mu             sync.RWMutex
+	resolverCancel context.CancelFunc
+	resolverWG     sync.WaitGroup
 }
 
 // New creates a lazily initialized WireGuard outbound.
@@ -381,8 +384,71 @@ func (h *Handler) initialize(ctx context.Context) error {
 	}
 	h.tun, h.net, h.device = tunDevice, virtualNet, wgDevice
 	h.hasIPv4, h.hasIPv6 = hasIPv4, hasIPv6
+	if hasDynamicEndpoint(h.config.Peers) {
+		refreshCtx, cancel := context.WithCancel(context.Background())
+		h.resolverCancel = cancel
+		h.resolverWG.Add(1)
+		// Launch before publishing the unlocked initialized state so Close
+		// cannot Wait between Add and the goroutine start.
+		go h.refreshEndpoints(refreshCtx, wgDevice)
+	}
 	h.mu.Unlock()
 	return nil
+}
+
+func hasDynamicEndpoint(peers []*appoutbound.WireGuardPeerConfig) bool {
+	for _, peer := range peers {
+		if peer == nil {
+			continue
+		}
+		host, _, err := net.SplitHostPort(strings.TrimSpace(peer.Endpoint))
+		if err == nil {
+			if _, parseErr := netip.ParseAddr(host); parseErr != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (h *Handler) refreshEndpoints(ctx context.Context, wgDevice *device.Device) {
+	defer h.resolverWG.Done()
+	ticker := time.NewTicker(endpointRefreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		for index, peer := range h.config.Peers {
+			if peer == nil {
+				continue
+			}
+			host, _, splitErr := net.SplitHostPort(strings.TrimSpace(peer.Endpoint))
+			if splitErr != nil {
+				continue
+			}
+			if _, parseErr := netip.ParseAddr(host); parseErr == nil {
+				continue
+			}
+			resolveCtx, cancel := context.WithTimeout(ctx, defaultDialTimeout)
+			endpoint, resolveErr := resolveEndpoint(resolveCtx, peer.Endpoint)
+			cancel()
+			if resolveErr != nil {
+				errors.LogWarning(context.Background(), "wireguard[", h.tag, "] peer[", index, "] endpoint refresh failed: ", resolveErr)
+				continue
+			}
+			public, keyErr := wgkey.Parse(peer.PublicKey)
+			if keyErr != nil {
+				continue // validated during initialization
+			}
+			update := "public_key=" + wgkey.Hex(public) + "\nendpoint=" + endpoint + "\n"
+			if err := wgDevice.IpcSet(update); err != nil {
+				errors.LogWarning(context.Background(), "wireguard[", h.tag, "] peer[", index, "] endpoint update failed: ", err)
+			}
+		}
+	}
 }
 
 func resolveEndpoint(ctx context.Context, endpoint string) (string, error) {
@@ -432,9 +498,15 @@ func (h *Handler) Close() error {
 		h.mu.Lock()
 		h.closed = true
 		wgDevice, tunDevice := h.device, h.tun
+		cancelResolver := h.resolverCancel
+		h.resolverCancel = nil
 		h.device, h.tun, h.net = nil, nil, nil
 		h.hasIPv4, h.hasIPv6 = false, false
 		h.mu.Unlock()
+		if cancelResolver != nil {
+			cancelResolver()
+			h.resolverWG.Wait()
+		}
 		if wgDevice != nil {
 			wgDevice.Close()
 		} else if tunDevice != nil {

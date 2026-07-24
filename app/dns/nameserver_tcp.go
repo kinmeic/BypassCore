@@ -138,9 +138,11 @@ func (s *TCPNameServer) sendOneTCPQuery(ctx context.Context, noResponseErrCh cha
 		return
 	}
 
-	respBuf, err := s.exchangeTCP(dialCtx, b, func(response []byte) error {
-		_, err := parseResponseForRequest(response, req)
-		return err
+	var rec *IPRecord
+	_, err = s.exchangeTCP(dialCtx, b, func(response []byte) error {
+		var parseErr error
+		rec, parseErr = parseResponseForRequest(response, req)
+		return parseErr
 	})
 	if err != nil {
 		errors.LogErrorInner(ctx, err, "DNS over TCP exchange failed")
@@ -150,9 +152,8 @@ func (s *TCPNameServer) sendOneTCPQuery(ctx context.Context, noResponseErrCh cha
 		return
 	}
 
-	rec, err := parseResponseForRequest(respBuf, req)
-	if err != nil {
-		errors.LogErrorInner(ctx, err, "failed to parse DNS over TCP response")
+	if rec == nil {
+		err := errors.New("DNS over TCP response validation produced no record")
 		if noResponseErrCh != nil {
 			noResponseErrCh <- err
 		}

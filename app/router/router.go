@@ -347,7 +347,7 @@ func (r *Router) pickRouteInternal(ctx routing.Context) (*Rule, routing.Context,
 	// evaluated without the lock, allowing rule.Apply to block on DNS without
 	// holding off rule mutations.
 	r.mu.RLock()
-	rules := append([]*Rule(nil), r.rules...)
+	rules := r.rules
 	strategy := r.domainStrategy
 	dnsClient := r.dns
 	r.mu.RUnlock()

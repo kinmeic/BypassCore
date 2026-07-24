@@ -21,9 +21,12 @@ func Parse(value string) ([Size]byte, error) {
 	if value == "" {
 		return key, errors.New("empty WireGuard key")
 	}
-	raw, err := base64.StdEncoding.DecodeString(value)
-	if err != nil {
+	var raw []byte
+	var err error
+	if len(value) == hex.EncodedLen(Size) {
 		raw, err = hex.DecodeString(value)
+	} else {
+		raw, err = base64.StdEncoding.DecodeString(value)
 	}
 	if err != nil || len(raw) != Size {
 		return key, fmt.Errorf("WireGuard key must be %d bytes in base64 or hexadecimal form", Size)

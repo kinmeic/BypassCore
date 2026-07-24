@@ -29,8 +29,8 @@ func (h *Handler) Tag() string { return h.tag }
 // The returned net.Conn accepts writes (discarding them) and returns EOF
 // on read, so transport.Bridge cleanly closes the inbound side without
 // logging spurious errors.
-func (h *Handler) Dial(_ context.Context, dest bcnet.Destination) (net.Conn, error) {
-	errors.LogInfo(context.Background(), "blackhole[", h.tag, "] dropping ", dest.String())
+func (h *Handler) Dial(ctx context.Context, dest bcnet.Destination) (net.Conn, error) {
+	errors.LogDebug(ctx, "blackhole[", h.tag, "] dropping ", dest.String())
 	return &discardConn{}, nil
 }
 

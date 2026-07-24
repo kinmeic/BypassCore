@@ -65,12 +65,24 @@ func fetch(ctx context.Context, s CachedNameserver, fqdn string, option dns.IPOp
 		key = key + "6"
 	}
 
-	v, _, _ := s.getCacheController().requestGroup.Do(key, func() (any, error) {
-		return doFetch(ctx, s, fqdn, option), nil
+	resultCh := s.getCacheController().requestGroup.DoChan(key, func() (any, error) {
+		// A shared lookup must not inherit the first waiter's cancellation or
+		// deadline. Bound the actual exchange independently; every waiter still
+		// observes its own context below.
+		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 8*time.Second)
+		defer cancel()
+		return doFetch(fetchCtx, s, fqdn, option), nil
 	})
-	ret := v.(result)
-
-	return ret.ips, ret.ttl, ret.error
+	select {
+	case <-ctx.Done():
+		return nil, 0, ctx.Err()
+	case flightResult := <-resultCh:
+		if flightResult.Err != nil {
+			return nil, 0, flightResult.Err
+		}
+		ret := flightResult.Val.(result)
+		return ret.ips, ret.ttl, ret.error
+	}
 }
 
 type result struct {

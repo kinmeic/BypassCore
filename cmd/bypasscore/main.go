@@ -575,7 +575,7 @@ func runDaemon(r *router.Router, ohm *appoutbound.Manager, dnsClient featdns.Cli
 	return runDaemonWithReload(r, ohm, dnsClient, inbounds, baseCtx, nil)
 }
 
-func runDaemonWithReload(r featrouting.Router, ohm dispatcher.DialerManager, dnsClient featdns.Client, inbounds []*appinbound.Config, baseCtx context.Context, reload func() error) error {
+func runDaemonWithReload(r featrouting.Router, ohm dispatcher.DialerManager, dnsClient featdns.Client, inbounds []*appinbound.Config, baseCtx context.Context, reload func() error, externalFailures ...<-chan error) error {
 	// Start all inbound listeners.
 	type listener interface {
 		Start() error
@@ -651,11 +651,21 @@ func runDaemonWithReload(r featrouting.Router, ohm dispatcher.DialerManager, dns
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(sigCh)
+	var externalFailure <-chan error
+	if len(externalFailures) > 0 {
+		externalFailure = externalFailures[0]
+	}
 	for {
+		forceOnSecondSignal := false
 		select {
 		case failure := <-failureCh:
 			closeListeners()
 			return errors.New("inbound ", failure.tag, " failed; daemon must restart: ").Base(failure.err)
+		case err := <-externalFailure:
+			if err != nil {
+				closeListeners()
+				return errors.New("runtime listener failed; daemon must restart: ").Base(err)
+			}
 		case received := <-sigCh:
 			if received == syscall.SIGHUP {
 				if reload == nil {
@@ -668,7 +678,15 @@ func runDaemonWithReload(r featrouting.Router, ohm dispatcher.DialerManager, dns
 				}
 				continue
 			}
+			forceOnSecondSignal = true
 		case <-baseCtx.Done():
+		}
+		if forceOnSecondSignal {
+			go func() {
+				<-sigCh
+				fmt.Fprintln(os.Stderr, "\nSecond termination signal received; forcing exit.")
+				os.Exit(1)
+			}()
 		}
 		break
 	}

@@ -89,8 +89,12 @@ func parseDNSQType(value string) (dnsmessage.Type, error) {
 }
 
 func (l *DNSListener) dnsAction(question dnsmessage.Question) (dnsRuleAction, dnsmessage.RCode) {
+	return dnsActionForRules(l.currentPolicy().dnsRules, question)
+}
+
+func dnsActionForRules(rules []compiledDNSRule, question dnsmessage.Question) (dnsRuleAction, dnsmessage.RCode) {
 	domain := strings.ToLower(strings.TrimSuffix(question.Name.String(), "."))
-	for _, rule := range l.currentPolicy().dnsRules {
+	for _, rule := range rules {
 		if len(rule.qtypes) > 0 {
 			if _, ok := rule.qtypes[question.Type]; !ok {
 				continue

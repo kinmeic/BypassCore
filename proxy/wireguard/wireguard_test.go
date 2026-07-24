@@ -55,6 +55,15 @@ func TestPreferredAddress(t *testing.T) {
 	}
 }
 
+func TestHasDynamicEndpoint(t *testing.T) {
+	if hasDynamicEndpoint([]*appoutbound.WireGuardPeerConfig{{Endpoint: "198.51.100.1:51820"}}) {
+		t.Fatal("literal endpoint was marked dynamic")
+	}
+	if !hasDynamicEndpoint([]*appoutbound.WireGuardPeerConfig{{Endpoint: "vpn.example.com:51820"}}) {
+		t.Fatal("hostname endpoint was not marked dynamic")
+	}
+}
+
 func TestHandlerCarriesTCPAndUDP(t *testing.T) {
 	localPrivate, localPublic := testKeypair(t)
 	peerPrivate, peerPublic := testKeypair(t)

@@ -41,6 +41,20 @@ func SniffSNIWithStatus(data []byte) (host string, needMore bool) {
 	if data[0] != 0x16 {
 		return "", false
 	}
+	if len(data) >= 5 {
+		recordLen := int(binary.BigEndian.Uint16(data[3:5]))
+		if recordLen > 0 && recordLen <= 18432 && len(data) >= 5+recordLen {
+			payload := data[5 : 5+recordLen]
+			if len(payload) >= 4 {
+				handshakeLen := int(payload[1])<<16 | int(payload[2])<<8 | int(payload[3])
+				if payload[0] == 0x01 && handshakeLen >= 34 && 4+handshakeLen <= len(payload) {
+					// The overwhelmingly common single-record ClientHello can
+					// be parsed directly without allocating a reassembly copy.
+					return parseClientHello(payload[4 : 4+handshakeLen]), false
+				}
+			}
+		}
+	}
 
 	handshake := make([]byte, 0, len(data))
 	for offset := 0; ; {

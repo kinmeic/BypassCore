@@ -114,9 +114,9 @@ func TestParsePort(t *testing.T) {
 	}{
 		{"1080", 1080},
 		{" 80 ", 80},
-		{"abc", 1080},   // invalid → default
-		{"-1", 1080},    // negative → default
-		{"70000", 1080}, // out of range → default
+		{"abc", 0},   // invalid
+		{"-1", 0},    // negative
+		{"70000", 0}, // out of range
 	}
 	for _, c := range cases {
 		if got := parsePort(c.in); got != c.want {
@@ -212,6 +212,25 @@ func TestUDPAssociateReadReportsShortBuffer(t *testing.T) {
 	buffer := make([]byte, 2)
 	if n, err := conn.Read(buffer); err != io.ErrShortBuffer || n != 0 {
 		t.Fatalf("Read n=%d err=%v, want io.ErrShortBuffer", n, err)
+	}
+}
+
+func TestUDPAssociateReadDropsMismatchedSource(t *testing.T) {
+	client, peer := net.Pipe()
+	defer client.Close()
+	defer peer.Close()
+	target := bcnet.UDPDestination(bcnet.ParseAddress("1.2.3.4"), bcnet.Port(53))
+	conn := &udpAssociateConn{Conn: client, target: target}
+	go func() {
+		mismatched := []byte{0, 0, 0, 1, 5, 6, 7, 8, 0, 53, 'x'}
+		expected := []byte{0, 0, 0, 1, 1, 2, 3, 4, 0, 53, 'o', 'k'}
+		_, _ = peer.Write(mismatched)
+		_, _ = peer.Write(expected)
+	}()
+	buffer := make([]byte, 8)
+	n, err := conn.Read(buffer)
+	if err != nil || string(buffer[:n]) != "ok" {
+		t.Fatalf("Read = %q, %v; want expected packet after mismatched source", buffer[:n], err)
 	}
 }
 

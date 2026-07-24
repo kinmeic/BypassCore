@@ -51,7 +51,8 @@ func (g *DomainMatcherGroup) AddDomainMatcher(matcher DomainMatcher, value uint3
 
 // Match implements MatcherGroup.Match.
 func (g *DomainMatcherGroup) Match(input string) []uint32 {
-	matches := make([][]uint32, 0, 5)
+	var storage [5][]uint32
+	matches := storage[:0]
 	node := g.root
 	for i := len(input); i > 0; {
 		for j := i - 1; ; j-- {

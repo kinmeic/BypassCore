@@ -30,6 +30,16 @@ func (s *Sniffer) SniffPacketMetadata(packets [][]byte) (domain, protocol string
 		return "", "", false
 	}
 	data := bytes.Join(packets, nil)
+	return s.SniffPacketBytes(data)
+}
+
+// SniffPacketBytes inspects an already accumulated UDP prefix. Callers that
+// collect multiple datagrams can append once per packet instead of repeatedly
+// joining the full packet slice.
+func (s *Sniffer) SniffPacketBytes(data []byte) (domain, protocol string, needMore bool) {
+	if s == nil || !s.enabled || len(data) == 0 {
+		return "", "", false
+	}
 	if len(data) > s.maxBytes {
 		data = data[:s.maxBytes]
 	}
@@ -101,6 +111,7 @@ func (s *Sniffer) SniffMetadata(conn net.Conn) (net.Conn, string, string) {
 	data := make([]byte, 0, 4096)
 	tmp := make([]byte, 4096)
 	failureResult := "failure"
+	lastTLSParsed := 0
 	for len(data) < s.maxBytes {
 		remaining := s.maxBytes - len(data)
 		if remaining < len(tmp) {
@@ -109,13 +120,23 @@ func (s *Sniffer) SniffMetadata(conn net.Conn) (net.Conn, string, string) {
 		n, err := conn.Read(tmp)
 		if n > 0 {
 			data = append(data, tmp[:n]...)
-			if domain, _ := tls.SniffSNIWithStatus(data); domain != "" {
-				commonmetrics.Inc("bypasscore_sniff_total", "network", "tcp", "result", "success", "protocol", "tls")
-				return &prependConn{Conn: conn, buf: data}, domain, "tls"
-			}
-			if domain := http.SniffHost(data); domain != "" {
-				commonmetrics.Inc("bypasscore_sniff_total", "network", "tcp", "result", "success", "protocol", "http")
-				return &prependConn{Conn: conn, buf: data}, domain, "http"
+			if data[0] == 0x16 {
+				complete := lastTLSParsed + completeTLSRecordBytes(data[lastTLSParsed:])
+				if complete > lastTLSParsed {
+					lastTLSParsed = complete
+					if domain, needMore := tls.SniffSNIWithStatus(data[:complete]); domain != "" {
+						commonmetrics.Inc("bypasscore_sniff_total", "network", "tcp", "result", "success", "protocol", "tls")
+						return &prependConn{Conn: conn, buf: data}, domain, "tls"
+					} else if !needMore {
+						break
+					}
+				}
+			} else if containsHeaderEnd(data) {
+				if domain := http.SniffHost(data); domain != "" {
+					commonmetrics.Inc("bypasscore_sniff_total", "network", "tcp", "result", "success", "protocol", "http")
+					return &prependConn{Conn: conn, buf: data}, domain, "http"
+				}
+				break
 			}
 			if !sniffNeedsMore(data, s.maxBytes) {
 				break
@@ -140,8 +161,7 @@ func sniffNeedsMore(data []byte, maxBytes int) bool {
 		return true
 	}
 	if data[0] == 0x16 { // TLS handshake record
-		_, needMore := tls.SniffSNIWithStatus(data)
-		return needMore
+		return len(data) < maxBytes
 	}
 	methods := []string{"GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "OPTIONS ", "CONNECT ", "PATCH "}
 	for _, method := range methods {
@@ -154,6 +174,19 @@ func sniffNeedsMore(data []byte, maxBytes int) bool {
 		}
 	}
 	return false
+}
+
+func completeTLSRecordBytes(data []byte) int {
+	complete := 0
+	for len(data)-complete >= 5 {
+		length := int(data[complete+3])<<8 | int(data[complete+4])
+		end := complete + 5 + length
+		if end > len(data) {
+			break
+		}
+		complete = end
+	}
+	return complete
 }
 
 func containsHeaderEnd(data []byte) bool {

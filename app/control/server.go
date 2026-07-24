@@ -107,6 +107,8 @@ type Server struct {
 	semaphore     chan struct{}
 	mutation      chan struct{}
 	inflightBytes atomic.Int64
+	serving       atomic.Bool
+	serveErrors   chan error
 	mu            sync.Mutex
 	closed        bool
 	socketInfo    os.FileInfo
@@ -120,7 +122,14 @@ func New(config *Config, backend Backend, capabilities Capabilities) (*Server, e
 	if err != nil {
 		return nil, err
 	}
-	return &Server{config: c, backend: backend, capabilities: capabilities, semaphore: make(chan struct{}, c.MaxConcurrentRequests), mutation: make(chan struct{}, 1)}, nil
+	return &Server{
+		config:       c,
+		backend:      backend,
+		capabilities: capabilities,
+		semaphore:    make(chan struct{}, c.MaxConcurrentRequests),
+		mutation:     make(chan struct{}, 1),
+		serveErrors:  make(chan error, 1),
+	}, nil
 }
 
 // Validate checks control transport settings without opening the socket.
@@ -250,14 +259,26 @@ func (s *Server) Start() error {
 		IdleTimeout:       30 * time.Second,
 		MaxHeaderBytes:    16 << 10,
 	}
+	s.serving.Store(true)
 	go func() {
-		if err := s.httpServer.Serve(listener); err != nil && err != http.ErrServerClosed {
-			// The daemon status endpoint reports listener failures; there is no
-			// logger dependency here so this leaf package stays reusable.
+		err := s.httpServer.Serve(listener)
+		s.serving.Store(false)
+		if err != nil && err != http.ErrServerClosed {
+			select {
+			case s.serveErrors <- fmt.Errorf("control: serve: %w", err):
+			default:
+			}
 		}
 	}()
 	return nil
 }
+
+// Errors reports an unexpected serving failure. The daemon treats this as a
+// fatal listener failure so its supervisor can restart a fully healthy process.
+func (s *Server) Errors() <-chan error { return s.serveErrors }
+
+// Running reports whether Serve is currently active.
+func (s *Server) Running() bool { return s.serving.Load() }
 
 func (s *Server) Close() error {
 	s.mu.Lock()
@@ -266,6 +287,7 @@ func (s *Server) Close() error {
 		return nil
 	}
 	s.closed = true
+	s.serving.Store(false)
 	server := s.httpServer
 	listener := s.listener
 	s.mu.Unlock()
@@ -375,43 +397,41 @@ func (s *Server) mutationOnly(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (s *Server) readBody(w http.ResponseWriter, r *http.Request) ([]byte, func(), error) {
-	reserved := s.config.MaxRequestBytes
-	for {
-		current := s.inflightBytes.Load()
-		if current+reserved > s.config.MaxInflightRequestBytes {
-			return nil, nil, &APIError{Code: "busy", Message: "control request byte budget exhausted", Status: http.StatusServiceUnavailable}
-		}
-		if s.inflightBytes.CompareAndSwap(current, current+reserved) {
-			break
-		}
-	}
-	release := func() { s.inflightBytes.Add(-reserved) }
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.config.MaxRequestBytes))
+	reader := &budgetReader{server: s, reader: http.MaxBytesReader(w, r.Body, s.config.MaxRequestBytes)}
+	body, err := io.ReadAll(reader)
 	if err != nil {
-		release()
-		return nil, nil, &APIError{Code: "request_too_large", Message: err.Error(), Status: http.StatusRequestEntityTooLarge}
+		reader.release()
+		var maxBytesError *http.MaxBytesError
+		switch {
+		case errors.As(err, &maxBytesError):
+			return nil, nil, &APIError{Code: "request_too_large", Message: err.Error(), Status: http.StatusRequestEntityTooLarge}
+		case errors.Is(err, errInflightBudget):
+			return nil, nil, &APIError{Code: "busy", Message: err.Error(), Status: http.StatusServiceUnavailable}
+		default:
+			return nil, nil, &APIError{Code: "invalid_request", Message: err.Error(), Status: http.StatusBadRequest}
+		}
 	}
-	return body, release, nil
+	return body, reader.release, nil
 }
 
 func decodeBody[T any](s *Server, call func(context.Context, T) (any, error)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if _, release, err := s.readBodyBudget(); err != nil {
-			writeError(w, err)
-			return
-		} else {
-			defer release()
-		}
+		reader := &budgetReader{server: s, reader: http.MaxBytesReader(w, r.Body, s.config.MaxRequestBytes)}
+		defer reader.release()
 		var request T
-		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, s.config.MaxRequestBytes))
+		decoder := json.NewDecoder(reader)
 		decoder.DisallowUnknownFields()
 		if err := decoder.Decode(&request); err != nil {
-			writeError(w, &APIError{Code: "invalid_request", Message: err.Error(), Status: http.StatusBadRequest})
+			writeError(w, bodyReadError(err))
 			return
 		}
 		var extra any
 		if err := decoder.Decode(&extra); err != io.EOF {
-			writeError(w, &APIError{Code: "invalid_request", Message: "request must contain one JSON value", Status: http.StatusBadRequest})
+			if err != nil {
+				writeError(w, bodyReadError(err))
+			} else {
+				writeError(w, &APIError{Code: "invalid_request", Message: "request must contain one JSON value", Status: http.StatusBadRequest})
+			}
 			return
 		}
 		result, err := call(r.Context(), request)
@@ -419,16 +439,48 @@ func decodeBody[T any](s *Server, call func(context.Context, T) (any, error)) ht
 	}
 }
 
-func (s *Server) readBodyBudget() (int64, func(), error) {
-	reserved := s.config.MaxRequestBytes
+var errInflightBudget = errors.New("control request byte budget exhausted")
+
+type budgetReader struct {
+	server   *Server
+	reader   io.Reader
+	reserved int64
+	once     sync.Once
+}
+
+func (r *budgetReader) Read(buffer []byte) (int, error) {
+	n, err := r.reader.Read(buffer)
+	if n == 0 {
+		return n, err
+	}
+	size := int64(n)
 	for {
-		current := s.inflightBytes.Load()
-		if current+reserved > s.config.MaxInflightRequestBytes {
-			return 0, nil, &APIError{Code: "busy", Message: "control request byte budget exhausted", Status: http.StatusServiceUnavailable}
+		current := r.server.inflightBytes.Load()
+		if current+size > r.server.config.MaxInflightRequestBytes {
+			return 0, errInflightBudget
 		}
-		if s.inflightBytes.CompareAndSwap(current, current+reserved) {
-			return reserved, func() { s.inflightBytes.Add(-reserved) }, nil
+		if r.server.inflightBytes.CompareAndSwap(current, current+size) {
+			r.reserved += size
+			return n, err
 		}
+	}
+}
+
+func (r *budgetReader) release() {
+	r.once.Do(func() {
+		r.server.inflightBytes.Add(-r.reserved)
+	})
+}
+
+func bodyReadError(err error) error {
+	var maxBytesError *http.MaxBytesError
+	switch {
+	case errors.As(err, &maxBytesError):
+		return &APIError{Code: "request_too_large", Message: err.Error(), Status: http.StatusRequestEntityTooLarge}
+	case errors.Is(err, errInflightBudget):
+		return &APIError{Code: "busy", Message: err.Error(), Status: http.StatusServiceUnavailable}
+	default:
+		return &APIError{Code: "invalid_request", Message: err.Error(), Status: http.StatusBadRequest}
 	}
 }
 

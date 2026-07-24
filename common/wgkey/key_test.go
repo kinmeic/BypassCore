@@ -1,6 +1,9 @@
 package wgkey
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestGenerateAndParse(t *testing.T) {
 	private, err := GeneratePrivate()
@@ -30,5 +33,18 @@ func TestGenerateAndParse(t *testing.T) {
 func TestParseRejectsInvalidLength(t *testing.T) {
 	if _, err := Parse("AQID"); err == nil {
 		t.Fatal("short key was accepted")
+	}
+}
+
+func TestParseHexThatIsAlsoValidBase64(t *testing.T) {
+	value := strings.Repeat("01", Size)
+	key, err := Parse(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, b := range key {
+		if b != 1 {
+			t.Fatalf("byte %d = %d, want 1", i, b)
+		}
 	}
 }

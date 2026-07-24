@@ -45,8 +45,8 @@ func (*LinearValueMatcher) Build() error {
 
 // Match implements ValueMatcher.Match.
 func (g *LinearValueMatcher) Match(input string) []uint32 {
-	// Allocate capacity to prevent matches escaping to heap
-	result := make([][]uint32, 0, 5)
+	var storage [5][]uint32
+	result := storage[:0]
 	if g.full != nil {
 		if matches := g.full.Match(input); len(matches) > 0 {
 			result = append(result, matches)

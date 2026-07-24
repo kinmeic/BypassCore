@@ -127,8 +127,9 @@ func (ac *ACAutomatonMatcherGroup) Build() error {
 
 // Match implements MatcherGroup.Match.
 func (ac *ACAutomatonMatcherGroup) Match(input string) []uint32 {
-	suffixMatches := make([][]uint32, 0, 5)
-	substrMatches := make([][]uint32, 0, 5)
+	var suffixStorage, substrStorage [5][]uint32
+	suffixMatches := suffixStorage[:0]
+	substrMatches := substrStorage[:0]
 	fullMatch := true    // fullMatch indicates no fail edge traversed so far.
 	node := &ac.nodes[0] // start from root node.
 	// 1. the match string is all through trie edge. FULL MATCH or DOMAIN

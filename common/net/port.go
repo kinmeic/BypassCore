@@ -19,7 +19,7 @@ func PortFromBytes(port []byte) Port {
 // PortFromInt converts an integer to a Port.
 // @error when the integer is not positive or larger then 65535
 func PortFromInt(val uint32) (Port, error) {
-	if val > 65535 {
+	if val == 0 || val > 65535 {
 		return Port(0), errors.New("invalid port range: ", val)
 	}
 	return Port(val), nil

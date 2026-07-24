@@ -19,6 +19,32 @@ type value struct {
 	number atomic.Int64
 }
 
+// Handle resolves and validates a metric series once, allowing hot paths to
+// update the underlying atomic value without rebuilding and sorting labels.
+type Handle struct {
+	item *value
+}
+
+// NewHandle resolves a low-cardinality metric series.
+func NewHandle(name string, labelPairs ...string) *Handle {
+	return &Handle{item: metric(name, labelPairs...)}
+}
+
+// Add atomically adjusts the resolved series. A nil/restricted series is a
+// no-op.
+func (h *Handle) Add(delta int64) {
+	if h != nil && h.item != nil {
+		h.item.number.Add(delta)
+	}
+}
+
+// Set atomically stores the value of the resolved series.
+func (h *Handle) Set(current int64) {
+	if h != nil && h.item != nil {
+		h.item.number.Store(current)
+	}
+}
+
 var registry sync.Map // canonical key -> *value
 var restrictions atomic.Pointer[labelRestrictions]
 

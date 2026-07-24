@@ -85,7 +85,7 @@ func (c *CacheController) collectExpiredKeys() ([]string, error) {
 	defer c.RUnlock()
 
 	if len(c.ips) == 0 {
-		return nil, errors.New("nothing to do. stopping...")
+		return nil, nil
 	}
 
 	// skip collection if a migration is in progress
@@ -326,7 +326,12 @@ func (c *CacheController) findRecords(domain string) *record {
 	if rec == nil && c.dirtyips != nil {
 		rec = c.dirtyips[domain]
 	}
-	return rec
+	if rec == nil {
+		return nil
+	}
+	// Cache cleanup replaces fields while holding c.Lock. Return an immutable
+	// snapshot so callers never observe those field writes after RUnlock.
+	return &record{A: rec.A, AAAA: rec.AAAA}
 }
 
 func (c *CacheController) registerSubscribers(domain string, option dns_feature.IPOption) (sub4 *pubsub.Subscriber, sub6 *pubsub.Subscriber) {

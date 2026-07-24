@@ -39,7 +39,12 @@ var socksUDPPacketPool = sync.Pool{New: func() any {
 	return &buf
 }}
 
-const maxSOCKSUDPDatagram = 65507
+const (
+	maxSOCKSUDPDatagram = 65507
+	// RSV + FRAG + ATYP + max domain length + PORT.
+	maxSOCKSUDPHeader  = 3 + 1 + 1 + 255 + 2
+	maxSOCKSUDPPayload = maxSOCKSUDPDatagram - maxSOCKSUDPHeader
+)
 
 func writeAll(conn net.Conn, data []byte) error {
 	for len(data) > 0 {
@@ -67,7 +72,7 @@ func New(tag, server, username, password string) *Handler {
 		username:      username,
 		password:      password,
 		timeout:       10 * time.Second,
-		maxUDPPayload: maxSOCKSUDPDatagram,
+		maxUDPPayload: maxSOCKSUDPPayload,
 	}
 }
 
@@ -84,7 +89,7 @@ func NewFromSettings(tag, server string, settings map[string]any) *Handler {
 		}
 	}
 	handler := New(tag, server, user, pass)
-	if value, ok := numericSetting(settings, "udpMaxPacketBytes"); ok && value >= 512 && value <= maxSOCKSUDPDatagram {
+	if value, ok := numericSetting(settings, "udpMaxPacketBytes"); ok && value >= 512 && value <= maxSOCKSUDPPayload {
 		handler.maxUDPPayload = value
 	}
 	return handler
@@ -364,7 +369,13 @@ func (h *Handler) udpAssociate(ctx context.Context, control net.Conn, dest bcnet
 	if err != nil {
 		return nil, errors.New("socks5 UDP relay dial failed").Base(err)
 	}
-	return &udpAssociateConn{Conn: packetConn, control: control, target: dest, maxPayload: h.maxUDPPayload}, nil
+	targetRequest, err := buildCommandRequest(0, dest)
+	if err != nil {
+		_ = packetConn.Close()
+		return nil, err
+	}
+	header := append([]byte{0, 0, 0}, targetRequest[3:]...)
+	return &udpAssociateConn{Conn: packetConn, control: control, target: dest, maxPayload: h.maxUDPPayload, header: header}, nil
 }
 
 type udpAssociateConn struct {
@@ -372,31 +383,34 @@ type udpAssociateConn struct {
 	control    net.Conn
 	target     bcnet.Destination
 	maxPayload int
+	header     []byte
 }
 
 func (c *udpAssociateConn) Write(payload []byte) (int, error) {
 	maxPayload := c.maxPayload
 	if maxPayload == 0 {
-		maxPayload = maxSOCKSUDPDatagram
+		maxPayload = maxSOCKSUDPPayload
 	}
 	if len(payload) > maxPayload {
 		return 0, errors.New("socks5: UDP payload exceeds configured udpMaxPacketBytes")
 	}
-	request, err := buildCommandRequest(0, c.target)
-	if err != nil {
-		return 0, err
+	header := c.header
+	if len(header) == 0 {
+		request, err := buildCommandRequest(0, c.target)
+		if err != nil {
+			return 0, err
+		}
+		header = append([]byte{0, 0, 0}, request[3:]...)
 	}
-	// SOCKS5 UDP: RSV(2), FRAG(1), ATYP+DST.ADDR+DST.PORT, DATA.
 	bufp := socksUDPPacketPool.Get().(*[]byte)
 	storage := *bufp
 	defer socksUDPPacketPool.Put(bufp)
-	required := 3 + len(request[3:]) + len(payload)
+	required := len(header) + len(payload)
 	if required > maxSOCKSUDPDatagram || required > len(storage) {
 		return 0, errors.New("socks5: UDP payload exceeds maximum datagram size")
 	}
 	packet := storage[:0]
-	packet = append(packet, 0, 0, 0)
-	packet = append(packet, request[3:]...)
+	packet = append(packet, header...)
 	packet = append(packet, payload...)
 	n, err := c.Conn.Write(packet)
 	if err != nil {
@@ -409,28 +423,38 @@ func (c *udpAssociateConn) Write(payload []byte) (int, error) {
 }
 
 func (c *udpAssociateConn) Read(payload []byte) (int, error) {
-	bufp := socksUDPPacketPool.Get().(*[]byte)
-	packet := *bufp
-	defer socksUDPPacketPool.Put(bufp)
-	n, err := c.Conn.Read(packet)
-	if err != nil {
-		return 0, err
+	for {
+		bufp := socksUDPPacketPool.Get().(*[]byte)
+		packet := *bufp
+		n, err := c.Conn.Read(packet)
+		if err != nil {
+			socksUDPPacketPool.Put(bufp)
+			return 0, err
+		}
+		offset, source, err := parseSocksUDPHeader(packet[:n])
+		if err != nil {
+			socksUDPPacketPool.Put(bufp)
+			return 0, err
+		}
+		if source.Port != c.target.Port || (!c.target.Address.Family().IsDomain() && source.Address.String() != c.target.Address.String()) {
+			// A UDP relay can carry unrelated or stale datagrams. Discard them
+			// without killing the association used by the expected target.
+			socksUDPPacketPool.Put(bufp)
+			continue
+		}
+		response := packet[offset:n]
+		if c.maxPayload > 0 && len(response) > c.maxPayload {
+			socksUDPPacketPool.Put(bufp)
+			return 0, errors.New("socks5: UDP response exceeds configured udpMaxPacketBytes")
+		}
+		if len(response) > len(payload) {
+			socksUDPPacketPool.Put(bufp)
+			return 0, io.ErrShortBuffer
+		}
+		copied := copy(payload, response)
+		socksUDPPacketPool.Put(bufp)
+		return copied, nil
 	}
-	offset, source, err := parseSocksUDPHeader(packet[:n])
-	if err != nil {
-		return 0, err
-	}
-	if source.Port != c.target.Port || (!c.target.Address.Family().IsDomain() && source.Address.String() != c.target.Address.String()) {
-		return 0, errors.New("socks5: UDP response source does not match association target")
-	}
-	response := packet[offset:n]
-	if c.maxPayload > 0 && len(response) > c.maxPayload {
-		return 0, errors.New("socks5: UDP response exceeds configured udpMaxPacketBytes")
-	}
-	if len(response) > len(payload) {
-		return 0, io.ErrShortBuffer
-	}
-	return copy(payload, response), nil
 }
 
 func (c *udpAssociateConn) Close() error {
@@ -524,8 +548,8 @@ func ParseServer(server string) (host string, port int) {
 
 func parsePort(s string) int {
 	n, err := strconv.Atoi(strings.TrimSpace(s))
-	if err != nil || n < 0 || n > 65535 {
-		return 1080
+	if err != nil || n < 1 || n > 65535 {
+		return 0
 	}
 	return n
 }

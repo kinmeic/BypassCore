@@ -30,8 +30,8 @@ func callerName(skip int) string {
 	return details
 }
 
-// Severity classifies log/error levels. Lower values are more severe
-// (Severity_Error = -2).
+// Severity classifies log/error levels. Larger values are more severe
+// (Severity_Error = -1).
 type Severity int
 
 const (
@@ -63,6 +63,11 @@ func SetLogLevel(level string) error {
 	}
 	minimumLogSeverity.Store(int32(severity))
 	return nil
+}
+
+// LogEnabled reports whether messages at severity pass the current threshold.
+func LogEnabled(severity Severity) bool {
+	return severity >= Severity_Debug && severity >= Severity(minimumLogSeverity.Load())
 }
 
 func (s Severity) String() string {
@@ -204,10 +209,7 @@ func LogErrorInner(ctx context.Context, inner error, msg ...interface{}) {
 // doLog routes the message to the standard library logger. The severity gates
 // output: Debug is suppressed by default to avoid noise.
 func doLog(_ context.Context, inner error, severity Severity, msg ...interface{}) {
-	if severity < Severity_Debug {
-		return // unknown, bail out
-	}
-	if severity < Severity(minimumLogSeverity.Load()) {
+	if !LogEnabled(severity) {
 		return
 	}
 	err := &Error{

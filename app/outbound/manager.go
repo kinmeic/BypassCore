@@ -64,16 +64,22 @@ func (m *Manager) Add(ob *Outbound) {
 		return
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.closed {
+		m.mu.Unlock()
 		return
 	}
+	var replaced *handler
 	if _, exists := m.handlers[ob.Tag]; !exists {
 		m.order = append(m.order, ob.Tag)
 	} else {
 		m.duplicateTags[ob.Tag] = struct{}{}
+		replaced = m.handlers[ob.Tag]
 	}
 	m.handlers[ob.Tag] = &handler{ob: ob}
+	m.mu.Unlock()
+	if replaced != nil {
+		_ = replaced.Close()
+	}
 }
 
 // GetHandler implements features/outbound.Manager.
@@ -228,8 +234,8 @@ func (m *Manager) Validate() error {
 			}
 			if raw, exists := h.ob.Upstream.Settings["udpMaxPacketBytes"]; exists {
 				value, ok := integerSetting(raw)
-				if !ok || value < 512 || value > 65507 {
-					return errors.New("proxy outbound ", tag, " udpMaxPacketBytes must be an integer between 512 and 65507")
+				if !ok || value < 512 || value > 65245 {
+					return errors.New("proxy outbound ", tag, " udpMaxPacketBytes must be an integer between 512 and 65245")
 				}
 			}
 		}

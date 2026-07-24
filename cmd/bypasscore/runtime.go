@@ -104,7 +104,11 @@ func runRuntimeDaemon(ctx context.Context, configPath string, cfg *Config, hash 
 		defer controlServer.Close()
 	}
 	reload := func() error { _, err := service.Reload(context.Background(), nil); return err }
-	return runDaemonWithReload(service, service, service, cfg.Inbounds, ctx, reload)
+	var controlFailures <-chan error
+	if controlServer != nil {
+		controlFailures = controlServer.Errors()
+	}
+	return runDaemonWithReload(service, service, service, cfg.Inbounds, ctx, reload, controlFailures)
 }
 
 type runtimeSnapshot struct {
@@ -435,15 +439,17 @@ func (snapshot *runtimeSnapshot) closeResources() {
 
 type leasedConn struct {
 	net.Conn
-	snapshot *runtimeSnapshot
-	tag      string
-	once     sync.Once
+	snapshot       *runtimeSnapshot
+	uploadBytes    *commonmetrics.Handle
+	downloadBytes  *commonmetrics.Handle
+	activeSessions *commonmetrics.Handle
+	once           sync.Once
 }
 
 func (c *leasedConn) Read(buffer []byte) (int, error) {
 	n, err := c.Conn.Read(buffer)
 	if n > 0 {
-		commonmetrics.Add("bypasscore_outbound_download_bytes_total", int64(n), "outbound", c.tag)
+		c.downloadBytes.Add(int64(n))
 	}
 	return n, err
 }
@@ -451,7 +457,7 @@ func (c *leasedConn) Read(buffer []byte) (int, error) {
 func (c *leasedConn) Write(buffer []byte) (int, error) {
 	n, err := c.Conn.Write(buffer)
 	if n > 0 {
-		commonmetrics.Add("bypasscore_outbound_upload_bytes_total", int64(n), "outbound", c.tag)
+		c.uploadBytes.Add(int64(n))
 	}
 	return n, err
 }
@@ -460,7 +466,9 @@ func (c *leasedConn) CloseWrite() error {
 	if conn, ok := c.Conn.(interface{ CloseWrite() error }); ok {
 		return conn.CloseWrite()
 	}
-	return c.Close()
+	// Do not turn an unsupported half-close into a full close: the reverse
+	// direction may still contain the peer's final response.
+	return errors.New("connection does not support CloseWrite")
 }
 
 func (c *leasedConn) CloseRead() error {
@@ -476,14 +484,20 @@ func (c *leasedConn) Close() error {
 		c.snapshot.connMu.Lock()
 		delete(c.snapshot.conns, c)
 		c.snapshot.connMu.Unlock()
-		commonmetrics.Add("bypasscore_outbound_active_connections", -1, "outbound", c.tag)
+		c.activeSessions.Add(-1)
 		c.snapshot.release()
 	})
 	return err
 }
 
 func (snapshot *runtimeSnapshot) track(conn net.Conn, tag string) (net.Conn, error) {
-	leased := &leasedConn{Conn: conn, snapshot: snapshot, tag: tag}
+	leased := &leasedConn{
+		Conn:           conn,
+		snapshot:       snapshot,
+		uploadBytes:    commonmetrics.NewHandle("bypasscore_outbound_upload_bytes_total", "outbound", tag),
+		downloadBytes:  commonmetrics.NewHandle("bypasscore_outbound_download_bytes_total", "outbound", tag),
+		activeSessions: commonmetrics.NewHandle("bypasscore_outbound_active_connections", "outbound", tag),
+	}
 	snapshot.connMu.Lock()
 	if snapshot.forced.Load() {
 		snapshot.connMu.Unlock()
@@ -493,7 +507,7 @@ func (snapshot *runtimeSnapshot) track(conn net.Conn, tag string) (net.Conn, err
 	}
 	snapshot.conns[leased] = struct{}{}
 	snapshot.connMu.Unlock()
-	commonmetrics.Inc("bypasscore_outbound_active_connections", "outbound", tag)
+	leased.activeSessions.Add(1)
 	return leased, nil
 }
 

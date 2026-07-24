@@ -216,13 +216,13 @@ func parseDomain(d *Domain) (strmatcher.Matcher, error) {
 	}
 	switch d.Type {
 	case Domain_Substr:
-		return strmatcher.Substr.New(strings.ToLower(d.Value))
+		return strmatcher.Substr.NewDomainPattern(d.Value)
 	case Domain_Regex:
 		return strmatcher.Regex.New(d.Value)
 	case Domain_Domain:
-		return strmatcher.Domain.New(strings.ToLower(d.Value))
+		return strmatcher.Domain.NewDomainPattern(d.Value)
 	case Domain_Full:
-		return strmatcher.Full.New(strings.ToLower(d.Value))
+		return strmatcher.Full.NewDomainPattern(d.Value)
 	default:
 		return nil, errors.New("unknown domain type: ", d.Type)
 	}

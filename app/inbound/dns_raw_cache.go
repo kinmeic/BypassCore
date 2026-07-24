@@ -69,9 +69,9 @@ func rawCacheKey(query []byte) (string, bool) {
 	if len(query) < 12 {
 		return "", false
 	}
-	key := append([]byte(nil), query...)
-	key[0], key[1] = 0, 0
-	return string(key), true
+	// The transaction ID is the only request field excluded from cache
+	// identity. Slicing it away avoids the temporary full-message copy.
+	return string(query[2:]), true
 }
 
 func (c *dnsRawCache) get(query []byte, now time.Time) ([]byte, bool) {

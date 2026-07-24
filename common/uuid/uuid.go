@@ -100,6 +100,9 @@ func ParseString(str string) (UUID, error) {
 		text = text[byteGroup:]
 		b = b[byteGroup/2:]
 	}
+	if len(text) != 0 {
+		return uuid, errors.New("invalid UUID: ", str)
+	}
 
 	return uuid, nil
 }

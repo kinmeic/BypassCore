@@ -9,9 +9,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"math"
+	"sort"
 
 	tlsproto "github.com/eugene/bypasscore/common/protocol/tls"
 )
+
+const maxCryptoDataSize = 32768
 
 var (
 	saltDraft29 = []byte{0xaf, 0xbf, 0xec, 0x28, 0x99, 0x93, 0xd2, 0x4c, 0x9e, 0x97, 0x86, 0xf1, 0x9c, 0x61, 0x11, 0xe0, 0x43, 0x90, 0xa8, 0x99}
@@ -25,7 +29,7 @@ func SniffSNI(data []byte) (string, bool) {
 	if len(data) == 0 {
 		return "", true
 	}
-	cryptoData := make([]byte, 0, 32768)
+	var allFragments []cryptoFragment
 	for len(data) > 0 {
 		consumed, fragments, initial, err := decryptInitial(data)
 		if err != nil || consumed <= 0 {
@@ -35,21 +39,34 @@ func SniffSNI(data []byte) (string, bool) {
 		if !initial {
 			continue
 		}
-		for _, fragment := range fragments {
-			end := fragment.offset + len(fragment.data)
-			if end > 32768 {
-				return "", false
-			}
-			if end > len(cryptoData) {
-				cryptoData = append(cryptoData, make([]byte, end-len(cryptoData))...)
-			}
-			copy(cryptoData[fragment.offset:end], fragment.data)
+		allFragments = append(allFragments, fragments...)
+		cryptoData := contiguousCryptoData(allFragments)
+		if len(cryptoData) == 0 {
+			continue
 		}
 		if host, more := tlsproto.SniffClientHelloHandshake(cryptoData); host != "" || !more {
 			return host, false
 		}
 	}
 	return "", true
+}
+
+func contiguousCryptoData(fragments []cryptoFragment) []byte {
+	sort.Slice(fragments, func(i, j int) bool { return fragments[i].offset < fragments[j].offset })
+	data := make([]byte, 0, 4096)
+	for _, fragment := range fragments {
+		if fragment.offset > len(data) {
+			break
+		}
+		start := len(data) - fragment.offset
+		if start < len(fragment.data) {
+			data = append(data, fragment.data[start:]...)
+		}
+		if len(data) >= maxCryptoDataSize {
+			return data[:maxCryptoDataSize]
+		}
+	}
+	return data
 }
 
 type cryptoFragment struct {
@@ -61,11 +78,11 @@ func decryptInitial(packet []byte) (int, []cryptoFragment, bool, error) {
 	if len(packet) < 7 || packet[0]&0xc0 != 0xc0 {
 		return 0, nil, false, errNotQUIC
 	}
-	work := append([]byte(nil), packet...)
-	version := binary.BigEndian.Uint32(work[1:5])
+	version := binary.BigEndian.Uint32(packet[1:5])
 	if version != 1 && version != 0xff00001d {
 		return 0, nil, false, errNotQUIC
 	}
+	work := append([]byte(nil), packet...)
 	initial := (work[0]&0x30)>>4 == 0
 	pos := 5
 	dcid, next, ok := readLengthPrefixed(work, pos)
@@ -207,6 +224,10 @@ func parseInitialFrames(data []byte) ([]cryptoFragment, error) {
 				return nil, io.ErrUnexpectedEOF
 			}
 			data = data[used:]
+			if offset > math.MaxInt || offset > maxCryptoDataSize ||
+				length > maxCryptoDataSize-offset {
+				return nil, errNotQUIC
+			}
 			fragments = append(fragments, cryptoFragment{offset: int(offset), data: append([]byte(nil), data[:length]...)})
 			data = data[length:]
 		case 0x1c: // CONNECTION_CLOSE

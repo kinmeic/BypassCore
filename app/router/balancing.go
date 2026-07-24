@@ -47,24 +47,8 @@ func (s *RoundRobinStrategy) PickOutbound(tags []string) string {
 	if s.observatory != nil {
 		observeReport, err := s.observatory.GetObservation(s.ctx)
 		if err == nil {
-			aliveTags := make([]string, 0)
 			if result, ok := observeReport.(*observatory.ObservationResult); ok {
-				status := result.Status
-				statusMap := make(map[string]*observatory.OutboundStatus)
-				for _, outboundStatus := range status {
-					statusMap[outboundStatus.OutboundTag] = outboundStatus
-				}
-				for _, candidate := range tags {
-					if outboundStatus, found := statusMap[candidate]; found {
-						if outboundStatus.Alive {
-							aliveTags = append(aliveTags, candidate)
-						}
-					} else {
-						// unfound candidate is considered alive
-						aliveTags = append(aliveTags, candidate)
-					}
-				}
-				tags = aliveTags
+				tags = filterAliveCandidates(tags, result.Status)
 			}
 		}
 	}
@@ -80,6 +64,29 @@ func (s *RoundRobinStrategy) PickOutbound(tags []string) string {
 	tag := tags[s.index%n]
 	s.index = (s.index + 1) % n
 	return tag
+}
+
+func filterAliveCandidates(candidates []string, statuses []*observatory.OutboundStatus) []string {
+	var alive []string
+	for index, candidate := range candidates {
+		isAlive := true // an unobserved candidate is considered alive
+		for _, status := range statuses {
+			if status.OutboundTag == candidate {
+				isAlive = status.Alive
+				break
+			}
+		}
+		if !isAlive && alive == nil {
+			alive = make([]string, index, len(candidates)-1)
+			copy(alive, candidates[:index])
+		} else if isAlive && alive != nil {
+			alive = append(alive, candidate)
+		}
+	}
+	if alive == nil {
+		return candidates
+	}
+	return alive
 }
 
 type Balancer struct {

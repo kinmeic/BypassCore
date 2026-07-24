@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 type testBackend struct{}
@@ -247,5 +248,68 @@ func TestControlResourceLimits(t *testing.T) {
 	tooConcurrent.MaxConcurrentRequests = 65
 	if err := Validate(&tooConcurrent); err == nil {
 		t.Fatal("oversized concurrency accepted")
+	}
+}
+
+func TestInflightBudgetChargesActualBytes(t *testing.T) {
+	server, err := New(&Config{
+		Enabled:                 true,
+		Socket:                  filepath.Join(t.TempDir(), "control.sock"),
+		MaxRequestBytes:         512,
+		MaxInflightRequestBytes: 512,
+	}, testBackend{}, Capabilities{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	readers := make([]*budgetReader, 0, 5)
+	for range 5 {
+		reader := &budgetReader{server: server, reader: bytes.NewReader(make([]byte, 100))}
+		if _, err := io.ReadAll(reader); err != nil {
+			t.Fatalf("small concurrent body rejected: %v", err)
+		}
+		readers = append(readers, reader)
+	}
+	overflow := &budgetReader{server: server, reader: bytes.NewReader(make([]byte, 100))}
+	if _, err := io.ReadAll(overflow); err == nil {
+		t.Fatal("request exceeding total actual-byte budget was accepted")
+	}
+	for _, reader := range readers {
+		reader.release()
+	}
+	if got := server.inflightBytes.Load(); got != 0 {
+		t.Fatalf("inflight bytes = %d after release", got)
+	}
+}
+
+func TestServerReportsUnexpectedServeFailure(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "bypasscore-control-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	server, err := New(&Config{Enabled: true, Socket: filepath.Join(dir, "control.sock")}, testBackend{}, Capabilities{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	server.mu.Lock()
+	listener := server.listener
+	server.mu.Unlock()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-server.Errors():
+		if err == nil {
+			t.Fatal("nil serving failure")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("unexpected control Serve failure was not reported")
+	}
+	if server.Running() {
+		t.Fatal("server still reports running after Serve failure")
 	}
 }

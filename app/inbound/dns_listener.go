@@ -417,6 +417,11 @@ func (l *DNSListener) serveUDP() {
 			}
 			l.health.setComponent(l.inboundTag(), "udp", "degraded", err, false)
 			degraded = true
+			select {
+			case <-l.ctx.Done():
+				return
+			case <-time.After(100 * time.Millisecond):
+			}
 			continue
 		}
 		if degraded {
@@ -433,7 +438,7 @@ func (l *DNSListener) serveUDP() {
 			continue
 		}
 		now := time.Now()
-		if !policy.globalLimiter.allow(now) || !policy.rateLimiter.allow(peerIP, now) {
+		if !policy.rateLimiter.allow(peerIP, now) || !policy.globalLimiter.allow(now) {
 			// Drop unauthorized/rate-limited UDP silently. Replying would let a
 			// spoofed source turn the listener into a reflection endpoint.
 			commonmetrics.Inc("bypasscore_dns_rejected_total", "inbound", l.inboundTag(), "reason", "rate", "transport", "udp")
@@ -579,7 +584,7 @@ func (l *DNSListener) serveTCP(conn net.Conn, tcpSlots chan struct{}, inboundTag
 		}
 		_ = conn.SetReadDeadline(time.Time{})
 		now := time.Now()
-		if !policy.globalLimiter.allow(now) || !policy.rateLimiter.allow(peerIP, now) {
+		if !policy.rateLimiter.allow(peerIP, now) || !policy.globalLimiter.allow(now) {
 			commonmetrics.Inc("bypasscore_dns_rejected_total", "inbound", l.inboundTag(), "reason", "rate", "transport", "tcp")
 			response := errorResponse(request, dnsmessage.RCodeRefused)
 			if len(response) == 0 || len(response) > maxDNSMessageSize {
@@ -654,7 +659,12 @@ func (l *DNSListener) handleQueryContext(ctx context.Context, raw []byte, udp bo
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if len(raw) > l.queryLimit() {
+	policy := l.currentPolicy()
+	queryLimit := policy.queryBytes
+	if queryLimit < 512 || queryLimit > maxDNSMessageSize {
+		queryLimit = defaultDNSMaxQueryBytes
+	}
+	if len(raw) > queryLimit {
 		return errorResponse(raw, dnsmessage.RCodeFormatError), nil
 	}
 	var request dnsmessage.Message
@@ -691,14 +701,14 @@ func (l *DNSListener) handleQueryContext(ctx context.Context, raw []byte, udp bo
 	if question.Class != dnsmessage.ClassINET {
 		return responseFor(&request, dnsmessage.RCodeNotImplemented, nil, udp, edns), nil
 	}
-	action, ruleRCode := l.dnsAction(question)
+	action, ruleRCode := dnsActionForRules(policy.dnsRules, question)
 	switch action {
 	case dnsActionDrop:
 		return nil, nil
 	case dnsActionReturn:
 		return responseFor(&request, ruleRCode, nil, udp, edns), nil
 	case dnsActionDirect:
-		return l.forwardRawQuery(ctx, &request, raw, udp, edns)
+		return l.forwardRawQuery(ctx, &request, raw, udp, edns, policy.rawCache)
 	case dnsActionHijack:
 		if question.Type != dnsmessage.TypeA && question.Type != dnsmessage.TypeAAAA {
 			return responseFor(&request, dnsmessage.RCodeNotImplemented, nil, udp, edns), nil
@@ -765,13 +775,12 @@ func (l *DNSListener) handleQueryContext(ctx context.Context, raw []byte, udp bo
 	return responseFor(&request, rcode, answers, udp, edns), nil
 }
 
-func (l *DNSListener) forwardRawQuery(ctx context.Context, request *dnsmessage.Message, raw []byte, udp bool, edns *ednsRequest) ([]byte, error) {
+func (l *DNSListener) forwardRawQuery(ctx context.Context, request *dnsmessage.Message, raw []byte, udp bool, edns *ednsRequest, rawCache *dnsRawCache) ([]byte, error) {
 	client, ok := l.client.(dnsfeature.RawContextClient)
 	if !ok {
 		return responseFor(request, dnsmessage.RCodeNotImplemented, nil, udp, edns), nil
 	}
 	now := time.Now()
-	rawCache := l.currentPolicy().rawCache
 	response, cached := rawCache.get(raw, now)
 	if !cached {
 		commonmetrics.Inc("bypasscore_dns_raw_cache_total", "inbound", l.inboundTag(), "result", "miss")

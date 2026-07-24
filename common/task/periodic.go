@@ -6,6 +6,8 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"github.com/eugene/bypasscore/common/errors"
 )
 
 // Periodic runs Execute at the given Interval until Close is called.
@@ -14,6 +16,9 @@ type Periodic struct {
 	Interval time.Duration
 	// Execute is the task function.
 	Execute func() error
+	// OnError observes execution failures. Failures no longer silently stop the
+	// periodic chain; the next run remains scheduled.
+	OnError func(error)
 
 	access  sync.Mutex
 	timer   *time.Timer
@@ -26,43 +31,45 @@ func (t *Periodic) hasClosed() bool {
 	return !t.running
 }
 
-func (t *Periodic) checkedExecute() error {
+func (t *Periodic) checkedExecute() {
 	if t.hasClosed() {
-		return nil
+		return
 	}
 	if err := t.Execute(); err != nil {
-		t.access.Lock()
-		t.running = false
-		t.access.Unlock()
-		return err
+		if t.OnError != nil {
+			t.OnError(err)
+		} else {
+			errors.LogWarning(context.Background(), "periodic task failed; retrying after ", t.Interval, ": ", err)
+		}
 	}
 	t.access.Lock()
 	defer t.access.Unlock()
 	if !t.running {
-		return nil
+		return
 	}
 	t.timer = time.AfterFunc(t.Interval, func() {
-		_ = t.checkedExecute()
+		t.checkedExecute()
 	})
-	return nil
 }
 
 // Start begins the periodic execution.
 func (t *Periodic) Start() error {
+	if t.Execute == nil {
+		return errors.New("periodic task has no Execute function")
+	}
+	if t.Interval <= 0 {
+		return errors.New("periodic task interval must be positive")
+	}
 	t.access.Lock()
 	if t.running {
 		t.access.Unlock()
 		return nil
 	}
 	t.running = true
+	t.timer = time.AfterFunc(0, func() {
+		t.checkedExecute()
+	})
 	t.access.Unlock()
-
-	if err := t.checkedExecute(); err != nil {
-		t.access.Lock()
-		t.running = false
-		t.access.Unlock()
-		return err
-	}
 	return nil
 }
 

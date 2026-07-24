@@ -16,12 +16,25 @@ var numberFinder = regexp.MustCompile(`\d+(\.\d+)?`)
 
 // NewWeightManager creates a new WeightManager with settings
 func NewWeightManager(s []*StrategyWeight, defaultWeight float64, scaler weightScaler) *WeightManager {
-	return &WeightManager{
+	manager := &WeightManager{
 		settings:      s,
 		cache:         make(map[string]float64),
 		scaler:        scaler,
 		defaultWeight: defaultWeight,
+		regexps:       make([]*regexp.Regexp, len(s)),
 	}
+	for index, setting := range s {
+		if setting == nil || !setting.Regexp {
+			continue
+		}
+		compiled, err := regexp.Compile(setting.Match)
+		if err != nil {
+			errors.LogError(context.Background(), "invalid regexp: ", setting.Match, " err: ", err)
+			continue
+		}
+		manager.regexps[index] = compiled
+	}
+	return manager
 }
 
 // WeightManager manages weights for specific settings
@@ -30,6 +43,7 @@ type WeightManager struct {
 	cache         map[string]float64
 	scaler        weightScaler
 	defaultWeight float64
+	regexps       []*regexp.Regexp
 	mu            sync.Mutex
 }
 
@@ -52,8 +66,11 @@ func (s *WeightManager) Apply(tag string, value float64) float64 {
 }
 
 func (s *WeightManager) findValue(tag string) float64 {
-	for _, w := range s.settings {
-		matched := s.getMatch(tag, w.Match, w.Regexp)
+	for index, w := range s.settings {
+		if w == nil {
+			continue
+		}
+		matched := s.getMatch(tag, w.Match, w.Regexp, s.regexps[index])
 		if matched == "" {
 			continue
 		}
@@ -75,7 +92,7 @@ func (s *WeightManager) findValue(tag string) float64 {
 	return s.defaultWeight
 }
 
-func (s *WeightManager) getMatch(tag, find string, isRegexp bool) string {
+func (s *WeightManager) getMatch(tag, find string, isRegexp bool, compiled *regexp.Regexp) string {
 	if !isRegexp {
 		idx := strings.Index(tag, find)
 		if idx < 0 {
@@ -83,10 +100,8 @@ func (s *WeightManager) getMatch(tag, find string, isRegexp bool) string {
 		}
 		return find
 	}
-	r, err := regexp.Compile(find)
-	if err != nil {
-		errors.LogError(context.Background(), "invalid regexp: ", find, "err: ", err)
+	if compiled == nil {
 		return ""
 	}
-	return r.FindString(tag)
+	return compiled.FindString(tag)
 }

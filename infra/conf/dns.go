@@ -184,16 +184,35 @@ type HostAddress struct {
 
 // UnmarshalJSON accepts a single address or an array of addresses.
 func (h *HostAddress) UnmarshalJSON(data []byte) error {
-	addr := new(Address)
-	var addrs []*Address
-	switch {
-	case json.Unmarshal(data, &addr) == nil:
-		h.addr = addr
-	case json.Unmarshal(data, &addrs) == nil:
-		h.addrs = addrs
-	default:
-		return errors.New("invalid address")
+	if string(bytes.TrimSpace(data)) == "null" {
+		return errors.New("DNS host address must not be null")
 	}
+	if len(bytes.TrimSpace(data)) > 0 && bytes.TrimSpace(data)[0] == '[' {
+		var addrs []*Address
+		if err := json.Unmarshal(data, &addrs); err != nil {
+			return errors.New("invalid DNS host address array").Base(err)
+		}
+		if len(addrs) == 0 {
+			return errors.New("DNS host address array must not be empty")
+		}
+		for _, addr := range addrs {
+			if addr == nil {
+				return errors.New("DNS host address array must not contain null")
+			}
+			if addr.Family().IsDomain() {
+				return errors.New("DNS host address array must contain only IP addresses")
+			}
+		}
+		h.addrs = addrs
+		h.addr = nil
+		return nil
+	}
+	addr := new(Address)
+	if err := json.Unmarshal(data, addr); err != nil {
+		return errors.New("invalid DNS host address").Base(err)
+	}
+	h.addr = addr
+	h.addrs = nil
 	return nil
 }
 
@@ -227,28 +246,37 @@ func (m *HostsWrapper) MarshalJSON() ([]byte, error) {
 	return json.Marshal(m.Hosts)
 }
 
-func newHostMapping(ha *HostAddress) *dns.Config_HostMapping {
+func newHostMapping(ha *HostAddress) (*dns.Config_HostMapping, error) {
+	if ha == nil {
+		return nil, errors.New("DNS host mapping must not be null")
+	}
 	if ha.addr != nil {
 		if ha.addr.Family().IsDomain() {
-			return &dns.Config_HostMapping{ProxiedDomain: ha.addr.Address.Domain()}
+			return &dns.Config_HostMapping{ProxiedDomain: ha.addr.Address.Domain()}, nil
 		}
-		return &dns.Config_HostMapping{Ip: [][]byte{ha.addr.Address.IP()}}
+		return &dns.Config_HostMapping{Ip: [][]byte{ha.addr.Address.IP()}}, nil
+	}
+	if len(ha.addrs) == 0 {
+		return nil, errors.New("DNS host mapping has no addresses")
 	}
 	ips := make([][]byte, 0, len(ha.addrs))
 	for _, addr := range ha.addrs {
-		if addr.Family().IsDomain() {
-			return &dns.Config_HostMapping{ProxiedDomain: addr.Address.Domain()}
+		if addr == nil || addr.Family().IsDomain() {
+			return nil, errors.New("DNS host address array must contain only IP addresses")
 		}
 		ips = append(ips, []byte(addr.Address.IP()))
 	}
-	return &dns.Config_HostMapping{Ip: ips}
+	return &dns.Config_HostMapping{Ip: ips}, nil
 }
 
 // Build converts HostsWrapper to a list of HostMapping.
 func (m *HostsWrapper) Build() ([]*dns.Config_HostMapping, error) {
 	mappings := make([]*dns.Config_HostMapping, 0, len(m.Hosts))
 	for rule, addrs := range m.Hosts {
-		mapping := newHostMapping(addrs)
+		mapping, err := newHostMapping(addrs)
+		if err != nil {
+			return nil, errors.New("invalid DNS host ", rule).Base(err)
+		}
 		dr, err := geodata.ParseDomainRule(rule, geodata.Domain_Full)
 		if err != nil {
 			return nil, err

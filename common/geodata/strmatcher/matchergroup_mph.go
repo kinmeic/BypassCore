@@ -154,7 +154,8 @@ func (g *MphMatcherGroup) Lookup(rollingHash uint32, input string) uint32 {
 
 // Match implements MatcherGroup.Match.
 func (g *MphMatcherGroup) Match(input string) []uint32 {
-	matches := make([][]uint32, 0, 5)
+	var storage [5][]uint32
+	matches := storage[:0]
 	hash := uint32(0)
 	for i := len(input) - 1; i >= 0; i-- {
 		hash = hash*PrimeRK + uint32(input[i])

@@ -33,6 +33,8 @@ func New(tag, bindIP, bindIface string) *Handler {
 	if bindIP != "" {
 		if ip := net.ParseIP(bindIP); ip != nil {
 			h.bindIP = ip
+		} else {
+			errors.LogWarning(context.Background(), "freedom[", tag, "] ignoring invalid bind IP ", bindIP)
 		}
 	}
 	return h

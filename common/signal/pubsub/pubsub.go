@@ -3,7 +3,6 @@
 package pubsub
 
 import (
-	"errors"
 	"sync"
 	"time"
 
@@ -21,6 +20,14 @@ func (s *Subscriber) push(msg interface{}) {
 	select {
 	case s.buffer <- msg:
 	default:
+		select {
+		case <-s.buffer:
+		default:
+		}
+		select {
+		case s.buffer <- msg:
+		default:
+		}
 	}
 }
 
@@ -50,16 +57,15 @@ func NewService() *Service {
 	return s
 }
 
-// Cleanup removes closed subscribers. Returns an error when there is nothing
-// to do (which stops the periodic task from spinning).
+// Cleanup removes closed subscribers.
 func (s *Service) Cleanup() error {
 	s.Lock()
 	defer s.Unlock()
 	if len(s.subs) == 0 {
-		return errors.New("nothing to do")
+		return nil
 	}
 	for name, subs := range s.subs {
-		newSub := make([]*Subscriber, 0, len(s.subs))
+		newSub := make([]*Subscriber, 0, len(subs))
 		for _, sub := range subs {
 			if !sub.IsClosed() {
 				newSub = append(newSub, sub)

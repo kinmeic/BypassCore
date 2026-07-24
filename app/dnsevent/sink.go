@@ -130,6 +130,8 @@ func (s *Sink) EmitEvent(event Event) {
 	defer s.mu.RUnlock()
 	if s.closed {
 		s.queued.Add(-size)
+		s.dropped.Add(1)
+		commonmetrics.Inc("bypasscore_dns_result_events_total", "result", "closed")
 		return
 	}
 	select {
@@ -180,6 +182,7 @@ func (s *Sink) run() {
 		result := "sent"
 		if err != nil {
 			result = "error"
+			s.dropped.Add(1)
 		}
 		commonmetrics.Inc("bypasscore_dns_result_events_total", "result", result)
 	}
@@ -193,5 +196,14 @@ func (s *Sink) Close() error {
 	}
 	s.mu.Unlock()
 	s.wg.Wait()
-	return nil
+	for {
+		select {
+		case payload := <-s.queue:
+			s.queued.Add(-int64(len(payload)))
+			s.dropped.Add(1)
+			commonmetrics.Inc("bypasscore_dns_result_events_total", "result", "closed")
+		default:
+			return nil
+		}
+	}
 }

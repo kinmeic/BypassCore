@@ -36,6 +36,8 @@ type Observer struct {
 	statusLock sync.Mutex
 	status     []*OutboundStatus
 	history    map[string]*probeHistory
+	clientMu   sync.Mutex
+	clients    map[string]*http.Client
 	startOnce  sync.Once
 	wg         sync.WaitGroup
 
@@ -127,6 +129,12 @@ func (o *Observer) Close() error {
 		o.cancel()
 	}
 	o.wg.Wait()
+	o.clientMu.Lock()
+	for tag, client := range o.clients {
+		client.CloseIdleConnections()
+		delete(o.clients, tag)
+	}
+	o.clientMu.Unlock()
 	return nil
 }
 
@@ -206,6 +214,14 @@ func (o *Observer) clearRemovedOutbounds(outbounds []string) {
 			delete(o.history, tag)
 		}
 	}
+	o.clientMu.Lock()
+	for tag, client := range o.clients {
+		if _, ok := active[tag]; !ok {
+			client.CloseIdleConnections()
+			delete(o.clients, tag)
+		}
+	}
+	o.clientMu.Unlock()
 }
 
 // probe fetches the probe URL and returns the result. If the outbound binds to
@@ -216,24 +232,9 @@ func (o *Observer) probe(outboundTag string) ProbeResult {
 		probeURL = o.config.ProbeUrl
 	}
 
-	outboundDialer := o.ohm.GetDialer(outboundTag)
-	if outboundDialer == nil {
+	client := o.probeClient(outboundTag)
+	if client == nil {
 		return ProbeResult{Alive: false, LastErrorReason: "outbound dialer not found: " + outboundTag}
-	}
-
-	transport := &http.Transport{
-		Proxy:                 nil,
-		DialContext:           outboundHTTPDialContext(outboundDialer),
-		TLSHandshakeTimeout:   5 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-	}
-	defer transport.CloseIdleConnections()
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   5 * time.Second,
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
 	}
 
 	start := time.Now()
@@ -250,15 +251,43 @@ func (o *Observer) probe(outboundTag string) ProbeResult {
 			host = u.Host
 		}
 		msg := fmt.Sprintf("outbound %s is dead: GET %s failed: %v", outboundTag, host, err)
-		errors.LogInfo(o.ctx, msg)
+		errors.LogDebug(o.ctx, msg)
 		return ProbeResult{Alive: false, LastErrorReason: msg}
 	}
 	if resp.Body != nil {
 		resp.Body.Close()
 	}
 	delay := time.Since(start)
-	errors.LogInfo(o.ctx, "outbound ", outboundTag, " is alive: ", delay.Seconds())
+	errors.LogDebug(o.ctx, "outbound ", outboundTag, " is alive: ", delay.Seconds())
 	return ProbeResult{Alive: true, Delay: delay.Milliseconds()}
+}
+
+func (o *Observer) probeClient(outboundTag string) *http.Client {
+	o.clientMu.Lock()
+	defer o.clientMu.Unlock()
+	if client := o.clients[outboundTag]; client != nil {
+		return client
+	}
+	outboundDialer := o.ohm.GetDialer(outboundTag)
+	if outboundDialer == nil {
+		return nil
+	}
+	transport := &http.Transport{
+		Proxy:                 nil,
+		DialContext:           outboundHTTPDialContext(outboundDialer),
+		TLSHandshakeTimeout:   5 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		IdleConnTimeout:       30 * time.Second,
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   5 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	o.clients[outboundTag] = client
+	return client
 }
 
 func outboundHTTPDialContext(outboundDialer dialer.Dialer) func(context.Context, string, string) (net.Conn, error) {
@@ -347,6 +376,7 @@ func New(ctx context.Context, config *Config, ohm *appoutbound.Manager) (*Observ
 		cancel:  cancel,
 		ohm:     ohm,
 		history: make(map[string]*probeHistory),
+		clients: make(map[string]*http.Client),
 	}, nil
 }
 

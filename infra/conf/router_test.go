@@ -346,7 +346,10 @@ func TestDNSConfig_Build_InvalidClientIP(t *testing.T) {
 
 func TestHostAddress_Single(t *testing.T) {
 	ha := mustHost(t, `"1.2.3.4"`)
-	hm := newHostMapping(ha)
+	hm, err := newHostMapping(ha)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if hm.ProxiedDomain != "" {
 		t.Error("IP host should not have ProxiedDomain")
 	}
@@ -357,7 +360,10 @@ func TestHostAddress_Single(t *testing.T) {
 
 func TestHostAddress_Array(t *testing.T) {
 	ha := mustHost(t, `["1.2.3.4","5.6.7.8"]`)
-	hm := newHostMapping(ha)
+	hm, err := newHostMapping(ha)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(hm.Ip) != 2 {
 		t.Errorf("IP count = %d, want 2", len(hm.Ip))
 	}
@@ -365,16 +371,21 @@ func TestHostAddress_Array(t *testing.T) {
 
 func TestHostAddress_Domain(t *testing.T) {
 	ha := mustHost(t, `"alias.example.com"`)
-	hm := newHostMapping(ha)
+	hm, err := newHostMapping(ha)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if hm.ProxiedDomain != "alias.example.com" {
 		t.Errorf("ProxiedDomain = %q", hm.ProxiedDomain)
 	}
 }
 
 func TestHostAddress_Invalid(t *testing.T) {
-	var ha HostAddress
-	if err := json.Unmarshal([]byte(`123`), &ha); err == nil {
-		t.Error("number should fail as HostAddress")
+	for _, raw := range []string{`123`, `null`, `[]`, `["1.2.3.4","alias.example.com"]`} {
+		var ha HostAddress
+		if err := json.Unmarshal([]byte(raw), &ha); err == nil {
+			t.Errorf("%s should fail as HostAddress", raw)
+		}
 	}
 }
 

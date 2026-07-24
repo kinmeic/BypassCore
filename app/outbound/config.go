@@ -53,6 +53,10 @@ func (m Mode) String() string {
 // UnmarshalJSON parses Mode from a JSON string.
 // Unknown values are rejected so a typo cannot silently become direct access.
 func (m *Mode) UnmarshalJSON(data []byte) error {
+	if strings.TrimSpace(string(data)) == "null" {
+		*m = ModeFreedom
+		return nil
+	}
 	s := strings.Trim(strings.Trim(string(data), `"`), " ")
 	switch strings.ToLower(s) {
 	case "", "freedom", "direct":
@@ -138,17 +142,19 @@ type handler struct {
 	ob       *Outbound
 	external outbound.Handler
 	dialer   dialer.Dialer
-	// dialerOnce confines lazy construction to this outbound. A slow factory
-	// no longer serializes unrelated outbound lookups behind Manager.mu.
-	dialerOnce sync.Once
+	dialerMu sync.Mutex
+	closed   bool
 }
 
 func (h *handler) getDialer() dialer.Dialer {
-	h.dialerOnce.Do(func() {
-		if h.dialer == nil {
-			h.dialer = currentDialerFactory()(h.ob)
-		}
-	})
+	h.dialerMu.Lock()
+	defer h.dialerMu.Unlock()
+	if h.closed {
+		return nil
+	}
+	if h.dialer == nil {
+		h.dialer = currentDialerFactory()(h.ob)
+	}
 	return h.dialer
 }
 
@@ -169,10 +175,11 @@ func (h *handler) Close() error {
 	if h.external != nil {
 		return h.external.Close()
 	}
-	// Mark the lazy initializer complete without constructing an outbound that
-	// was never used. If initialization is already in progress, Do waits for it.
-	h.dialerOnce.Do(func() {})
-	if closer, ok := h.dialer.(io.Closer); ok {
+	h.dialerMu.Lock()
+	h.closed = true
+	current := h.dialer
+	h.dialerMu.Unlock()
+	if closer, ok := current.(io.Closer); ok {
 		return closer.Close()
 	}
 	return nil

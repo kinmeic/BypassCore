@@ -33,3 +33,14 @@ func TestRetainLabelValues(t *testing.T) {
 		t.Fatalf("unexpected retained samples: %#v", samples)
 	}
 }
+
+func TestHandleUpdatesResolvedSeries(t *testing.T) {
+	ResetForTest()
+	handle := NewHandle("handled_total", "outbound", "direct")
+	handle.Add(2)
+	handle.Add(3)
+	samples := Snapshot()
+	if len(samples) != 1 || samples[0].Value != 5 {
+		t.Fatalf("unexpected handle samples: %#v", samples)
+	}
+}

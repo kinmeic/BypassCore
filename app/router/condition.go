@@ -144,14 +144,18 @@ type NetworkMatcher struct {
 func NewNetworkMatcher(network []net.Network) NetworkMatcher {
 	var matcher NetworkMatcher
 	for _, n := range network {
-		matcher.list[int(n)] = true
+		index := int(n)
+		if index >= 0 && index < len(matcher.list) {
+			matcher.list[index] = true
+		}
 	}
 	return matcher
 }
 
 // Apply implements Condition.
 func (v NetworkMatcher) Apply(ctx routing.Context) bool {
-	return v.list[int(ctx.GetNetwork())]
+	index := int(ctx.GetNetwork())
+	return index >= 0 && index < len(v.list) && v.list[index]
 }
 
 type UserMatcher struct {
@@ -293,13 +297,15 @@ type AttributeMatcher struct {
 
 // Match implements attributes matching.
 func (m *AttributeMatcher) Match(attrs map[string]string) bool {
-	// header keys are case insensitive most likely. So we do a convert
-	httpHeaders := make(map[string]string)
-	for key, value := range attrs {
-		httpHeaders[strings.ToLower(key)] = value
-	}
 	for key, regex := range m.configuredKeys {
-		if a, ok := httpHeaders[key]; !ok || !regex.MatchString(a) {
+		found := false
+		for attrKey, value := range attrs {
+			if strings.EqualFold(attrKey, key) {
+				found = regex.MatchString(value)
+				break
+			}
+		}
+		if !found {
 			return false
 		}
 	}

@@ -203,6 +203,15 @@ func (d *Dispatcher) SniffPacketMetadata(packets [][]byte) (string, string, bool
 	return sniffer.SniffPacketMetadata(packets)
 }
 
+// SniffPacketBytes exposes sniffing for an already accumulated packet prefix.
+func (d *Dispatcher) SniffPacketBytes(data []byte) (string, string, bool) {
+	sniffer := d.sniffer.Load()
+	if sniffer == nil {
+		return "", "", false
+	}
+	return sniffer.SniffPacketBytes(data)
+}
+
 func (d *Dispatcher) dialOutboundPackets(ctx context.Context, dest bcnet.Destination, packets [][]byte) (net.Conn, error) {
 	// Build routing context.
 	outboundSession := &bcsession.Outbound{OriginalTarget: dest, Target: dest}

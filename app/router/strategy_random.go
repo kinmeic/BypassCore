@@ -36,24 +36,8 @@ func (s *RandomStrategy) PickOutbound(candidates []string) string {
 	if s.observatory != nil {
 		observeReport, err := s.observatory.GetObservation(s.ctx)
 		if err == nil {
-			aliveTags := make([]string, 0)
 			if result, ok := observeReport.(*observatory.ObservationResult); ok {
-				status := result.Status
-				statusMap := make(map[string]*observatory.OutboundStatus)
-				for _, outboundStatus := range status {
-					statusMap[outboundStatus.OutboundTag] = outboundStatus
-				}
-				for _, candidate := range candidates {
-					if outboundStatus, found := statusMap[candidate]; found {
-						if outboundStatus.Alive {
-							aliveTags = append(aliveTags, candidate)
-						}
-					} else {
-						// unfound candidate is considered alive
-						aliveTags = append(aliveTags, candidate)
-					}
-				}
-				candidates = aliveTags
+				candidates = filterAliveCandidates(candidates, result.Status)
 			}
 		}
 	}

@@ -20,6 +20,7 @@ type healthTracker struct {
 	status     HealthStatus
 	failures   chan error
 	components map[string]componentHealth
+	closed     bool
 }
 
 type componentHealth struct {
@@ -33,6 +34,15 @@ func newHealthTracker(tag string) *healthTracker {
 
 func (h *healthTracker) set(tag, state string, err error, notify bool) {
 	h.mu.Lock()
+	if state == "starting" {
+		h.closed = false
+	} else if h.closed {
+		h.mu.Unlock()
+		return
+	}
+	if state == "closed" {
+		h.closed = true
+	}
 	h.status.Tag = tag
 	h.status.State = state
 	h.status.UpdatedAt = time.Now()
@@ -58,6 +68,10 @@ func (h *healthTracker) set(tag, state string, err error, notify bool) {
 
 func (h *healthTracker) setComponent(tag, name, state string, err error, notify bool) {
 	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return
+	}
 	value := componentHealth{state: state}
 	if err != nil {
 		value.err = err.Error()

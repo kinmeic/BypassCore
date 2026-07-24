@@ -58,7 +58,8 @@ func (g *MphValueMatcher) Build() error {
 
 // Match implements ValueMatcher.Match.
 func (g *MphValueMatcher) Match(input string) []uint32 {
-	result := make([][]uint32, 0, 5)
+	var storage [5][]uint32
+	result := storage[:0]
 	if g.mph != nil {
 		if matches := g.mph.Match(input); len(matches) > 0 {
 			result = append(result, matches)

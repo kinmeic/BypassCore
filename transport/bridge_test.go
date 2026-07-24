@@ -78,17 +78,27 @@ func TestBridge_BothClosedReturns(t *testing.T) {
 	}
 }
 
-func TestBridgeOneSidedEOFWithoutHalfCloseDoesNotLeak(t *testing.T) {
+func TestBridgeOneSidedEOFWithoutHalfCloseDrainsReverseData(t *testing.T) {
 	a, peerA := net.Pipe()
 	b, peerB := net.Pipe()
-	defer peerB.Close()
 	done := make(chan error, 1)
 	go func() { done <- Bridge(a, b) }()
+	go func() {
+		_, _ = peerB.Write([]byte("final"))
+		_ = peerB.Close()
+	}()
+	buffer := make([]byte, 5)
+	if _, err := io.ReadFull(peerA, buffer); err != nil {
+		t.Fatal(err)
+	}
+	if string(buffer) != "final" {
+		t.Fatalf("reverse data = %q, want final", buffer)
+	}
 	_ = peerA.Close()
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("Bridge retained the opposite copy after one-sided EOF")
+		t.Fatal("Bridge did not finish after both directions drained")
 	}
 }
 

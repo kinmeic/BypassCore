@@ -102,8 +102,16 @@ func formatLittleEndianString(addr net.IP, port Port) (string, error) {
 		return "", errors.New("invalid IP format for ", addr, ": ", ip)
 	}
 
-	for i, j := 0, len(ipBytes)-1; i < j; i, j = i+1, j-1 {
-		ipBytes[i], ipBytes[j] = ipBytes[j], ipBytes[i]
+	wordSize := len(ipBytes)
+	if len(ipBytes) == net.IPv6len {
+		// /proc/net/{tcp,udp}6 renders every 32-bit word in host byte order,
+		// rather than reversing the complete 128-bit address.
+		wordSize = 4
+	}
+	for start := 0; start < len(ipBytes); start += wordSize {
+		for i, j := start, start+wordSize-1; i < j; i, j = i+1, j-1 {
+			ipBytes[i], ipBytes[j] = ipBytes[j], ipBytes[i]
+		}
 	}
 	portHex := fmt.Sprintf("%04X", uint16(port))
 	ipHex := strings.ToUpper(hex.EncodeToString(ipBytes))

@@ -6,10 +6,12 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/eugene/bypasscore/common/errors"
@@ -29,6 +31,7 @@ type DoHNameServer struct {
 	clientIP        bcnet.IP
 	destination     bcnet.Destination
 	dial            Dialer
+	dialMu          sync.RWMutex
 }
 
 // NewDoHNameServer creates a DoH client. h2c selects HTTP/2 cleartext.
@@ -63,7 +66,7 @@ func NewDoHNameServer(u *url.URL, h2c bool, disableCache bool, serveStale bool, 
 		s.httpClient = &http.Client{Transport: &http2.Transport{
 			AllowHTTP: true,
 			DialTLSContext: func(ctx context.Context, _, _ string, _ *tls.Config) (net.Conn, error) {
-				return s.dial(ctx, s.destination)
+				return s.dialRaw(ctx, s.destination)
 			},
 		}, Timeout: 8 * time.Second}
 		return s
@@ -78,7 +81,7 @@ func NewDoHNameServer(u *url.URL, h2c bool, disableCache bool, serveStale bool, 
 			MinVersion: tls.VersionTLS12,
 		},
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return s.dial(ctx, s.destination)
+			return s.dialRaw(ctx, s.destination)
 		},
 	}
 	s.httpClient = &http.Client{Transport: transport, Timeout: 8 * time.Second}
@@ -90,7 +93,22 @@ func cloneURL(u *url.URL) *url.URL {
 	return &copy
 }
 
-func (s *DoHNameServer) SetDialer(dial Dialer) { s.dial = dial }
+func (s *DoHNameServer) SetDialer(dial Dialer) {
+	if dial == nil {
+		return
+	}
+	s.dialMu.Lock()
+	s.dial = dial
+	s.dialMu.Unlock()
+	s.httpClient.CloseIdleConnections()
+}
+
+func (s *DoHNameServer) dialRaw(ctx context.Context, destination bcnet.Destination) (net.Conn, error) {
+	s.dialMu.RLock()
+	dial := s.dial
+	s.dialMu.RUnlock()
+	return dial(ctx, destination)
+}
 
 // Name implements Server.
 func (s *DoHNameServer) Name() string { return s.cacheController.name }
@@ -228,16 +246,12 @@ func randBetween(lo, hi int) int {
 	if hi <= lo {
 		return lo
 	}
-	return lo + rand.Intn(hi-lo)
+	return lo + rand.IntN(hi-lo)
 }
 
-// randomPadding returns a base62-like random padding string of length in [lo, hi).
+// randomPadding returns an opaque padding string of length in [lo, hi). Only
+// the randomized length is meaningful; a constant byte avoids per-byte PRNG
+// contention and alphabet bias.
 func randomPadding(lo, hi int) string {
-	const letters = "0123123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-	n := randBetween(lo, hi)
-	b := make([]byte, n)
-	for i := range b {
-		b[i] = letters[rand.Intn(len(letters))]
-	}
-	return string(b)
+	return strings.Repeat("X", randBetween(lo, hi))
 }

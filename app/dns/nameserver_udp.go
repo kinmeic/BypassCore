@@ -21,12 +21,12 @@ import (
 // response synchronously with a deadline. This replaces the original routed-UDP
 // dispatcher which required the proxy forwarding stack.
 type ClassicNameServer struct {
-	sync.Mutex
 	cacheController *CacheController
 	address         bcnet.Destination
 	clientIP        bcnet.IP
 	reqID           uint32
 	dial            Dialer
+	dialMu          sync.RWMutex
 }
 
 // NewClassicNameServer creates a UDP DNS server.
@@ -47,7 +47,21 @@ func NewClassicNameServer(address bcnet.Destination, disableCache bool, serveSta
 	return s
 }
 
-func (s *ClassicNameServer) SetDialer(dial Dialer) { s.dial = dial }
+func (s *ClassicNameServer) SetDialer(dial Dialer) {
+	if dial == nil {
+		return
+	}
+	s.dialMu.Lock()
+	s.dial = dial
+	s.dialMu.Unlock()
+}
+
+func (s *ClassicNameServer) dialRaw(ctx context.Context, destination bcnet.Destination) (net.Conn, error) {
+	s.dialMu.RLock()
+	dial := s.dial
+	s.dialMu.RUnlock()
+	return dial(ctx, destination)
+}
 
 // Name implements Server.
 func (s *ClassicNameServer) Name() string { return s.cacheController.name }
@@ -103,7 +117,7 @@ func (s *ClassicNameServer) sendOneQuery(ctx context.Context, noResponseErrCh ch
 	if !ok {
 		deadline = time.Now().Add(8 * time.Second)
 	}
-	conn, err := s.dial(ctx, s.address)
+	conn, err := s.dialRaw(ctx, s.address)
 	if err != nil {
 		if noResponseErrCh != nil {
 			noResponseErrCh <- err
@@ -184,7 +198,7 @@ func (s *ClassicNameServer) QueryIP(ctx context.Context, domain string, option d
 // transport. The caller validates the response association and handles
 // client-facing UDP truncation.
 func (s *ClassicNameServer) QueryRaw(ctx context.Context, query []byte) ([]byte, error) {
-	conn, err := s.dial(ctx, s.address)
+	conn, err := s.dialRaw(ctx, s.address)
 	if err != nil {
 		return nil, err
 	}
@@ -206,7 +220,7 @@ func (s *ClassicNameServer) QueryRaw(ctx context.Context, query []byte) ([]byte,
 	if n >= 4 && response[2]&0x02 != 0 {
 		tcpDestination := bcnet.TCPDestination(s.address.Address, s.address.Port)
 		tcpResponse, tcpErr := exchangeRawTCP(ctx, query, func(ctx context.Context) (net.Conn, error) {
-			return s.dial(ctx, tcpDestination)
+			return s.dialRaw(ctx, tcpDestination)
 		})
 		if tcpErr == nil {
 			return tcpResponse, nil

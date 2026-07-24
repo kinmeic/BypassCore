@@ -28,11 +28,10 @@ func Bridge(a, b net.Conn) error {
 		// Close the write side of dst to signal EOF to the peer.
 		if dc, ok := dst.(interface{ CloseWrite() error }); ok {
 			_ = dc.CloseWrite()
-		} else {
-			// A connection without half-close support cannot signal EOF while
-			// remaining writable. Fully close it so the peer copy cannot leak.
-			_ = dst.Close()
 		}
+		// If dst cannot half-close, leave it open while the reverse direction
+		// drains. The bridge-wide timeout below still bounds peers that wait for
+		// EOF, without truncating a final response already in flight.
 		errCh <- err
 	}
 

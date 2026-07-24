@@ -16,6 +16,7 @@ package inbound
 import (
 	"context"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,12 +38,12 @@ type udpTproxyListener struct {
 	dispatcher *dispatcher.Dispatcher
 
 	conn     *net.UDPConn
-	sessions sync.Map // key: "srcAddr|originalDst" → *udpSession
+	sessions sync.Map // key: udpSessionKey → *udpSession
 	createMu sync.Mutex
 	count    atomic.Int64
 	// sourceCounts is guarded by createMu and contains entries only for source
 	// IPs with at least one active session.
-	sourceCounts map[string]int
+	sourceCounts map[netip.Addr]int
 	limits       atomic.Pointer[udpResourceLimits]
 	runtimeTag   atomic.Pointer[string]
 
@@ -55,8 +56,8 @@ type udpTproxyListener struct {
 // udpSession represents one client's UDP relay: the outbound connection +
 // a goroutine copying return packets back to the client.
 type udpSession struct {
-	key         string
-	sourceKey   string
+	key         udpSessionKey
+	sourceKey   netip.Addr
 	clientAddr  *net.UDPAddr      // client source address
 	originalDst bcnet.Destination // original target (from TPROXY)
 	outbound    net.Conn          // outbound connection (to proxy/freedom)
@@ -71,6 +72,15 @@ type udpSession struct {
 	mu        sync.Mutex
 	closeOnce sync.Once
 	closed    chan struct{}
+}
+
+type udpSessionKey struct {
+	source      netip.AddrPort
+	destination netip.AddrPort
+}
+
+func (k udpSessionKey) String() string {
+	return k.source.String() + "|" + k.destination.String()
 }
 
 func (l *udpTproxyListener) setLimits(limits udpResourceLimits) {
@@ -161,7 +171,7 @@ func startUDP(cfg *Config, d *dispatcher.Dispatcher, onState func(string, error)
 		cfg:          cfg,
 		dispatcher:   d,
 		conn:         udpConn,
-		sourceCounts: make(map[string]int),
+		sourceCounts: make(map[netip.Addr]int),
 		onState:      onState,
 	}
 	l.setLimits(limits)
@@ -208,6 +218,11 @@ func (l *udpTproxyListener) recvLoop() {
 				l.onState("degraded", err)
 			}
 			degraded = true
+			select {
+			case <-l.ctx.Done():
+				return
+			case <-time.After(100 * time.Millisecond):
+			}
 			continue
 		}
 		if degraded {
@@ -226,7 +241,10 @@ func (l *udpTproxyListener) recvLoop() {
 
 		// Match Xray's non-cone UDP key: the same client socket may talk to
 		// multiple destinations and those flows must not share one outbound.
-		key := srcAddr.String() + "|" + origDst.String()
+		key, ok := makeUDPSessionKey(srcAddr, origDst)
+		if !ok {
+			continue
+		}
 		s := l.getOrCreateSession(key, srcAddr, origDst)
 		if s == nil {
 			commonmetrics.Inc("bypasscore_udp_dropped_total", "inbound", l.inboundTag(), "reason", "session_limit")
@@ -237,7 +255,25 @@ func (l *udpTproxyListener) recvLoop() {
 	}
 }
 
-func (l *udpTproxyListener) getOrCreateSession(key string, src *net.UDPAddr, dst bcnet.Destination) *udpSession {
+func makeUDPSessionKey(source *net.UDPAddr, destination bcnet.Destination) (udpSessionKey, bool) {
+	if source == nil {
+		return udpSessionKey{}, false
+	}
+	destAddr, ok := netip.AddrFromSlice(destination.Address.IP())
+	if !ok {
+		return udpSessionKey{}, false
+	}
+	sourceAddr := source.AddrPort()
+	if !sourceAddr.IsValid() {
+		return udpSessionKey{}, false
+	}
+	return udpSessionKey{
+		source:      netip.AddrPortFrom(sourceAddr.Addr().Unmap(), sourceAddr.Port()),
+		destination: netip.AddrPortFrom(destAddr.Unmap(), uint16(destination.Port)),
+	}, true
+}
+
+func (l *udpTproxyListener) getOrCreateSession(key udpSessionKey, src *net.UDPAddr, dst bcnet.Destination) *udpSession {
 	if value, ok := l.sessions.Load(key); ok {
 		return value.(*udpSession)
 	}
@@ -247,7 +283,7 @@ func (l *udpTproxyListener) getOrCreateSession(key string, src *net.UDPAddr, dst
 	if value, ok := l.sessions.Load(key); ok {
 		return value.(*udpSession)
 	}
-	sourceKey := src.IP.String()
+	sourceKey := key.source.Addr()
 	limits := l.currentLimits()
 	if l.ctx.Err() != nil || l.count.Load() >= limits.maxSessions ||
 		l.sourceCounts[sourceKey] >= limits.maxSessionsPerSource {
@@ -342,17 +378,19 @@ func (s *udpSession) run() {
 	// packets; collect only when the sniffer explicitly requests more data and
 	// keep the wait tightly bounded for latency-sensitive UDP protocols.
 	var pending [][]byte
+	var sniffData []byte
 	select {
 	case <-s.ctx.Done():
 		return
 	case packet := <-s.packets:
 		s.queuedBytes.Add(-int64(len(packet)))
 		pending = append(pending, packet)
+		sniffData = appendSniffPrefix(sniffData, packet)
 	}
 	limits := s.listener.currentLimits()
 collectLoop:
 	for len(pending) < limits.sniffMaxPackets {
-		_, _, needMore := s.listener.dispatcher.SniffPacketMetadata(pending)
+		_, _, needMore := s.listener.dispatcher.SniffPacketBytes(sniffData)
 		if !needMore {
 			break
 		}
@@ -367,6 +405,7 @@ collectLoop:
 			}
 			s.queuedBytes.Add(-int64(len(packet)))
 			pending = append(pending, packet)
+			sniffData = appendSniffPrefix(sniffData, packet)
 		case <-timer.C:
 			break collectLoop
 		case <-s.ctx.Done():
@@ -441,6 +480,18 @@ collectLoop:
 			}
 		}
 	}
+}
+
+func appendSniffPrefix(current, packet []byte) []byte {
+	const maximum = 1024 * 1024
+	if len(current) >= maximum {
+		return current
+	}
+	remaining := maximum - len(current)
+	if len(packet) > remaining {
+		packet = packet[:remaining]
+	}
+	return append(current, packet...)
 }
 
 func (s *udpSession) routingContext(ctx context.Context) context.Context {

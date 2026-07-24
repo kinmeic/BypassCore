@@ -48,13 +48,29 @@ func ResolveAsset(file string) (string, error) {
 	if !filepath.IsLocal(file) {
 		return "", errors.New("asset path must stay in asset directory: ", file)
 	}
+	root, err := filepath.Abs(platform.GetAssetLocation("."))
+	if err != nil {
+		return "", err
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", err
+	}
 	path := platform.GetAssetLocation(file)
-	info, err := os.Stat(path)
+	resolvedPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", err
+	}
+	relative, err := filepath.Rel(resolvedRoot, resolvedPath)
+	if err != nil || !filepath.IsLocal(relative) {
+		return "", errors.New("asset symlink escapes asset directory: ", file)
+	}
+	info, err := os.Stat(resolvedPath)
 	if err != nil {
 		return "", err
 	}
 	if !info.Mode().IsRegular() {
 		return "", errors.New("asset is not a regular file: ", file)
 	}
-	return path, nil
+	return resolvedPath, nil
 }

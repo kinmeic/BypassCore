@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/eugene/bypasscore/common/errors"
 	"github.com/eugene/bypasscore/common/net"
@@ -43,12 +44,18 @@ type IPSet struct {
 
 type HeuristicIPMatcher struct {
 	ipset   *IPSet
-	reverse bool
+	reverse atomic.Bool
 }
 
 type ipBucket struct {
 	rep netip.Addr
 	ips []net.IP
+}
+
+func newHeuristicIPMatcher(ipset *IPSet, reverse bool) *HeuristicIPMatcher {
+	matcher := &HeuristicIPMatcher{ipset: ipset}
+	matcher.reverse.Store(reverse)
+	return matcher
 }
 
 // Match implements IPMatcher.
@@ -63,15 +70,15 @@ func (m *HeuristicIPMatcher) Match(ip net.IP) bool {
 func (m *HeuristicIPMatcher) matchAddr(ipx netip.Addr) bool {
 	if ipx.Is4() {
 		if m.ipset.max4 == 0xff {
-			return false
+			return m.reverse.Load()
 		}
-		return m.ipset.ipv4.Contains(ipx) != m.reverse
+		return m.ipset.ipv4.Contains(ipx) != m.reverse.Load()
 	}
 	if ipx.Is6() {
 		if m.ipset.max6 == 0xff {
-			return false
+			return m.reverse.Load()
 		}
-		return m.ipset.ipv6.Contains(ipx) != m.reverse
+		return m.ipset.ipv6.Contains(ipx) != m.reverse.Load()
 	}
 	return false
 }
@@ -306,12 +313,17 @@ func (m *HeuristicIPMatcher) FilterIPs(ips []net.IP) (matched []net.IP, unmatche
 
 // ToggleReverse implements IPMatcher.
 func (m *HeuristicIPMatcher) ToggleReverse() {
-	m.reverse = !m.reverse
+	for {
+		old := m.reverse.Load()
+		if m.reverse.CompareAndSwap(old, !old) {
+			return
+		}
+	}
 }
 
 // SetReverse implements IPMatcher.
 func (m *HeuristicIPMatcher) SetReverse(reverse bool) {
-	m.reverse = reverse
+	m.reverse.Store(reverse)
 }
 
 type GeneralMultiIPMatcher struct {
@@ -981,7 +993,7 @@ func buildOptimizedIPMatcher(f *IPSetFactory, rules []*IPRule) (IPMatcher, error
 		if err != nil {
 			return nil, err
 		}
-		subs = append(subs, &HeuristicIPMatcher{ipset: ipset, reverse: false})
+		subs = append(subs, newHeuristicIPMatcher(ipset, false))
 	}
 
 	if len(negCustom) > 0 {
@@ -989,7 +1001,7 @@ func buildOptimizedIPMatcher(f *IPSetFactory, rules []*IPRule) (IPMatcher, error
 		if err != nil {
 			return nil, err
 		}
-		subs = append(subs, &HeuristicIPMatcher{ipset: ipset, reverse: true})
+		subs = append(subs, newHeuristicIPMatcher(ipset, true))
 	}
 
 	if len(posGeoip) > 0 {
@@ -997,7 +1009,7 @@ func buildOptimizedIPMatcher(f *IPSetFactory, rules []*IPRule) (IPMatcher, error
 		if err != nil {
 			return nil, err
 		}
-		subs = append(subs, &HeuristicIPMatcher{ipset: ipset, reverse: false})
+		subs = append(subs, newHeuristicIPMatcher(ipset, false))
 	}
 
 	if len(negGeoip) > 0 {
@@ -1005,7 +1017,7 @@ func buildOptimizedIPMatcher(f *IPSetFactory, rules []*IPRule) (IPMatcher, error
 		if err != nil {
 			return nil, err
 		}
-		subs = append(subs, &HeuristicIPMatcher{ipset: ipset, reverse: true})
+		subs = append(subs, newHeuristicIPMatcher(ipset, true))
 	}
 
 	switch len(subs) {

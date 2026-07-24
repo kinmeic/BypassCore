@@ -212,7 +212,7 @@ func (s *Server) handler() http.Handler {
 
 func (s *Server) clientAllowed(remote string) bool {
 	s.mu.Lock()
-	allowed := append([]netip.Prefix(nil), s.allowed...)
+	allowed := s.allowed
 	s.mu.Unlock()
 	host, _, err := net.SplitHostPort(remote)
 	if err != nil {

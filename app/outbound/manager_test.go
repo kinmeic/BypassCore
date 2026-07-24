@@ -19,6 +19,16 @@ type testDialer struct{ tag string }
 func (*testDialer) Dial(context.Context, bcnet.Destination) (net.Conn, error) { return nil, nil }
 func (d *testDialer) Tag() string                                             { return d.tag }
 
+type closingTestDialer struct {
+	testDialer
+	closed *atomic.Int32
+}
+
+func (d *closingTestDialer) Close() error {
+	d.closed.Add(1)
+	return nil
+}
+
 type blockingCloseHandler struct {
 	tag     string
 	started chan struct{}
@@ -498,6 +508,21 @@ func TestAddHandlerReplacementClosesOldHandler(t *testing.T) {
 	}
 	if old.closed.Load() != 1 {
 		t.Fatalf("replaced handler close count=%d, want 1", old.closed.Load())
+	}
+}
+
+func TestAddDescriptorReplacementClosesInitializedDialer(t *testing.T) {
+	var closed atomic.Int32
+	SetDialerFactory(func(ob *Outbound) dialer.Dialer {
+		return &closingTestDialer{testDialer: testDialer{tag: ob.Tag}, closed: &closed}
+	})
+	m := NewManager(&Config{Outbounds: []*Outbound{{Tag: "same", Mode: ModeFreedom}}})
+	if m.GetDialer("same") == nil {
+		t.Fatal("failed to initialize old dialer")
+	}
+	m.Add(&Outbound{Tag: "same", Mode: ModeBlackhole})
+	if got := closed.Load(); got != 1 {
+		t.Fatalf("replaced descriptor dialer close count=%d, want 1", got)
 	}
 }
 

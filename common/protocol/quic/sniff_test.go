@@ -1,7 +1,9 @@
 package quic
 
 import (
+	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"testing"
 )
 
@@ -19,5 +21,27 @@ func TestSniffSNI_XrayFixture(t *testing.T) {
 func TestSniffSNIRejectsNonQUIC(t *testing.T) {
 	if host, more := SniffSNI([]byte("not quic")); host != "" || more {
 		t.Fatalf("non-QUIC classified as host=%q more=%v", host, more)
+	}
+}
+
+func TestParseInitialFramesRejectsOversizedCryptoOffset(t *testing.T) {
+	data := []byte{6}
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], uint64(1)<<61|0xc000000000000000)
+	data = append(data, encoded[:]...)
+	data = append(data, 0) // zero-length CRYPTO payload
+	if _, err := parseInitialFrames(data); !errors.Is(err, errNotQUIC) {
+		t.Fatalf("parseInitialFrames error = %v, want errNotQUIC", err)
+	}
+}
+
+func TestContiguousCryptoDataWaitsForLeadingHole(t *testing.T) {
+	fragments := []cryptoFragment{{offset: 3, data: []byte("def")}}
+	if got := contiguousCryptoData(fragments); len(got) != 0 {
+		t.Fatalf("leading hole produced %q", got)
+	}
+	fragments = append(fragments, cryptoFragment{offset: 0, data: []byte("abc")})
+	if got := string(contiguousCryptoData(fragments)); got != "abcdef" {
+		t.Fatalf("reassembled data = %q, want abcdef", got)
 	}
 }
