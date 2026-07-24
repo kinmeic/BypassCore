@@ -1029,7 +1029,7 @@ func (s *runtimeService) TCPProbe(ctx context.Context, request control.TCPProbeR
 		probeHost := request.Host
 		if _, needsCoreDNS := outboundDialer.(dialer.HandshakeProber); needsCoreDNS {
 			var resolveErr error
-			probeHost, resolveErr = resolveProbeHost(ctx, request.Host, outboundDialer)
+			probeHost, resolveErr = s.resolveProbeHost(ctx, request.Host, outboundDialer)
 			if resolveErr != nil {
 				return nil, &control.APIError{Code: "probe_dns_error", Message: resolveErr.Error(), Status: http.StatusBadGateway}
 			}
@@ -1092,7 +1092,7 @@ func (s *runtimeService) HandshakeProbe(ctx context.Context, request control.Han
 	}, nil
 }
 
-func resolveProbeHost(ctx context.Context, host string, outboundDialer dialer.Dialer) (string, error) {
+func resolveProbeHostThroughOutbound(ctx context.Context, host string, outboundDialer dialer.Dialer) (string, error) {
 	host = strings.TrimSpace(host)
 	if ip := net.ParseIP(host); ip != nil {
 		return ip.String(), nil
@@ -1170,6 +1170,50 @@ func resolveProbeHost(ctx context.Context, host string, outboundDialer dialer.Di
 	).Base(lastErr)
 }
 
+func (s *runtimeService) resolveProbeHost(ctx context.Context, host string, outboundDialer dialer.Dialer) (string, error) {
+	host = strings.TrimSpace(host)
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.String(), nil
+	}
+
+	// Prefer resolving through the tested WireGuard outbound, but do not let a
+	// provider's UDP/53 policy consume the complete URL-test deadline. DNS is
+	// only used to obtain the probe destination; the subsequent TCP/TLS/HTTP
+	// connection still goes through outboundDialer and remains authoritative.
+	dnsTimeout := 2 * time.Second
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return "", context.DeadlineExceeded
+		}
+		if quarter := remaining / 4; quarter < dnsTimeout {
+			dnsTimeout = quarter
+		}
+	}
+	outboundDNSCtx, cancel := context.WithTimeout(ctx, dnsTimeout)
+	resolved, outboundErr := resolveProbeHostThroughOutbound(outboundDNSCtx, host, outboundDialer)
+	cancel()
+	if outboundErr == nil {
+		return resolved, nil
+	}
+
+	ips, _, localErr := s.LookupIPContext(ctx, host, featdns.IPOption{IPv4Enable: true, IPv6Enable: true})
+	if localErr == nil {
+		for _, ip := range ips {
+			if ip.To4() != nil {
+				return ip.String(), nil
+			}
+		}
+		if len(ips) > 0 {
+			return ips[0].String(), nil
+		}
+		localErr = errors.New("BypassCore DNS returned no address")
+	}
+	return "", errors.New(
+		"resolve probe target failed through both WireGuard outbound DNS and BypassCore DNS",
+	).Base(errors.Combine(outboundErr, localErr))
+}
+
 func (s *runtimeService) URLTest(ctx context.Context, request control.URLTestRequest) (any, error) {
 	if len(request.URL) > 2048 {
 		return nil, &control.APIError{Code: "invalid_url_test", Message: "url is too long", Status: http.StatusBadRequest}
@@ -1220,7 +1264,7 @@ func (s *runtimeService) URLTest(ctx context.Context, request control.URLTestReq
 			probeHost := host
 			if _, needsCoreDNS := outboundDialer.(dialer.HandshakeProber); needsCoreDNS {
 				var resolveErr error
-				probeHost, resolveErr = resolveProbeHost(dialCtx, host, outboundDialer)
+				probeHost, resolveErr = s.resolveProbeHost(dialCtx, host, outboundDialer)
 				if resolveErr != nil {
 					return nil, resolveErr
 				}

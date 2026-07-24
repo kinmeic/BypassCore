@@ -38,7 +38,16 @@ func (d *probeDNSDialer) Dial(ctx context.Context, _ bcnet.Destination) (net.Con
 
 var _ dialer.Dialer = (*probeDNSDialer)(nil)
 
-func TestResolveProbeHostUsesOutboundDNS(t *testing.T) {
+type unavailableProbeDNSDialer struct{}
+
+func (*unavailableProbeDNSDialer) Tag() string { return "unavailable" }
+func (*unavailableProbeDNSDialer) Dial(context.Context, bcnet.Destination) (net.Conn, error) {
+	return nil, errors.New("outbound UDP/53 unavailable")
+}
+
+var _ dialer.Dialer = (*unavailableProbeDNSDialer)(nil)
+
+func TestResolveProbeHostThroughOutboundUsesOutboundDNS(t *testing.T) {
 	listener, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -79,7 +88,7 @@ func TestResolveProbeHostUsesOutboundDNS(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	address, err := resolveProbeHost(ctx, "probe.example", &probeDNSDialer{address: listener.LocalAddr().String()})
+	address, err := resolveProbeHostThroughOutbound(ctx, "probe.example", &probeDNSDialer{address: listener.LocalAddr().String()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,6 +97,32 @@ func TestResolveProbeHostUsesOutboundDNS(t *testing.T) {
 	}
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestResolveProbeHostFallsBackToCoreDNS(t *testing.T) {
+	cfg, _, err := decodeConfig([]byte(`{
+		"outbounds":[{"tag":"direct","mode":"freedom"}],
+		"dns":{"servers":["localhost"],"hosts":{"probe-fallback.test":"192.0.2.19"}},
+		"routing":{"finalOutboundTag":"direct"}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := newRuntimeService(context.Background(), "", cfg, "probe-fallback")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+
+	address, err := service.resolveProbeHost(
+		context.Background(), "probe-fallback.test", &unavailableProbeDNSDialer{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if address != "192.0.2.19" {
+		t.Fatalf("resolved address = %q", address)
 	}
 }
 
