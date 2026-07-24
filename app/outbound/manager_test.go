@@ -540,3 +540,52 @@ func itoa(n int) string {
 	}
 	return string(buf[i:])
 }
+
+func TestValidateWireGuardReservedAndDNS(t *testing.T) {
+	private, err := wgkey.GeneratePrivate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	public, err := wgkey.Public(private)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerPrivate, err := wgkey.GeneratePrivate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerPublic, err := wgkey.Public(peerPrivate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := &WireGuardConfig{
+		SecretKey: wgkey.Encode(private),
+		PublicKey: wgkey.Encode(public),
+		Address:   []string{"10.0.0.2/32"},
+		Peers: []*WireGuardPeerConfig{{
+			PublicKey: wgkey.Encode(peerPublic),
+			Endpoint:  "vpn.example.com:51820",
+		}},
+	}
+	manager := NewManager(&Config{Outbounds: []*Outbound{{
+		Tag: "wg", Mode: ModeWireGuard, WireGuard: config,
+	}}})
+
+	config.Reserved = []byte{1, 2}
+	if err := manager.Validate(); err == nil {
+		t.Fatal("2-byte reserved was accepted")
+	}
+	config.Reserved = []byte{1, 2, 3}
+	if err := manager.Validate(); err != nil {
+		t.Fatalf("3-byte reserved rejected: %v", err)
+	}
+
+	config.DNS = []string{"not-an-ip"}
+	if err := manager.Validate(); err == nil {
+		t.Fatal("invalid DNS server was accepted")
+	}
+	config.DNS = []string{"192.168.3.1", "2606:4700:4700::1111"}
+	if err := manager.Validate(); err != nil {
+		t.Fatalf("valid DNS servers rejected: %v", err)
+	}
+}

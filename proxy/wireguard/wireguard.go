@@ -74,7 +74,7 @@ func (h *Handler) Dial(ctx context.Context, dest bcnet.Destination) (net.Conn, e
 		dialCtx, cancel = context.WithTimeout(ctx, defaultDialTimeout)
 		defer cancel()
 	}
-	address, err := numericDestination(dialCtx, dest, hasIPv4, hasIPv6)
+	address, err := h.numericDestination(dialCtx, tnet, dest, hasIPv4, hasIPv6)
 	if err != nil {
 		return nil, err
 	}
@@ -227,12 +227,33 @@ func (h *Handler) handshakeSummary() string {
 	return fmt.Sprintf("last WireGuard handshake was %s ago", time.Since(handshake).Round(time.Second))
 }
 
-func numericDestination(ctx context.Context, dest bcnet.Destination, hasIPv4, hasIPv6 bool) (string, error) {
+// lookupDomain resolves a domain destination. When Local DNS servers are
+// configured the query goes through the tunnel itself (wg-quick [Interface]
+// DNS semantics); the host resolver remains the fallback so an unreachable
+// tunnel resolver cannot deadlock dialing.
+func (h *Handler) lookupDomain(ctx context.Context, tnet *netstack.Net, host string) ([]netip.Addr, error) {
+	if tnet != nil && h.config != nil && len(h.config.DNS) > 0 {
+		if raw, err := tnet.LookupContextHost(ctx, host); err == nil {
+			addresses := make([]netip.Addr, 0, len(raw))
+			for _, value := range raw {
+				if addr, parseErr := netip.ParseAddr(value); parseErr == nil {
+					addresses = append(addresses, addr)
+				}
+			}
+			if len(addresses) > 0 {
+				return addresses, nil
+			}
+		}
+	}
+	return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+}
+
+func (h *Handler) numericDestination(ctx context.Context, tnet *netstack.Net, dest bcnet.Destination, hasIPv4, hasIPv6 bool) (string, error) {
 	// common/net renders literal IPv6 addresses with brackets for display.
 	// netip.ParseAddr and net.JoinHostPort expect the host itself unbracketed.
 	host := strings.Trim(dest.Address.String(), "[]")
 	if dest.Address.Family().IsDomain() {
-		addresses, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+		addresses, err := h.lookupDomain(ctx, tnet, host)
 		if err != nil {
 			return "", errors.New("resolve WireGuard target ", host).Base(err)
 		}
@@ -311,11 +332,19 @@ func (h *Handler) initialize(ctx context.Context) error {
 	if mtu == 0 {
 		mtu = defaultMTU
 	}
-	tunDevice, virtualNet, err := netstack.CreateNetTUN(localAddresses, nil, mtu)
+	dnsServers, err := parseDNSServers(h.config.DNS)
 	if err != nil {
 		return err
 	}
-	wgDevice := device.NewDevice(tunDevice, conn.NewDefaultBind(), &device.Logger{
+	tunDevice, virtualNet, err := netstack.CreateNetTUN(localAddresses, dnsServers, mtu)
+	if err != nil {
+		return err
+	}
+	var bind conn.Bind = conn.NewDefaultBind()
+	if len(h.config.Reserved) == 3 {
+		bind = &reservedBind{Bind: bind, reserved: [3]byte(h.config.Reserved)}
+	}
+	wgDevice := device.NewDevice(tunDevice, bind, &device.Logger{
 		Verbosef: func(format string, args ...any) {
 			errors.LogDebug(context.Background(), "wireguard[", h.tag, "]: ", fmt.Sprintf(format, args...))
 		},
@@ -474,6 +503,64 @@ func resolveEndpoint(ctx context.Context, endpoint string) (string, error) {
 		return "", errors.New("no usable address for ", host)
 	}
 	return net.JoinHostPort(address.String(), port), nil
+}
+
+// ProbeResolvers implements dialer.ProbeResolverProvider. It returns the
+// configured Local DNS servers filtered to the address families the tunnel
+// can actually carry, so probe resolution never burns its deadline on a
+// resolver family that cannot work. nil means callers keep their defaults.
+func (h *Handler) ProbeResolvers() []string {
+	if h.config == nil || len(h.config.DNS) == 0 {
+		return nil
+	}
+	hasIPv4, hasIPv6 := localFamilies(h.config)
+	resolvers := make([]string, 0, len(h.config.DNS))
+	for _, server := range h.config.DNS {
+		addr, err := netip.ParseAddr(strings.TrimSpace(server))
+		if err != nil {
+			continue // rejected during config validation
+		}
+		addr = addr.Unmap()
+		if (addr.Is4() && hasIPv4) || (addr.Is6() && hasIPv6) {
+			resolvers = append(resolvers, addr.String())
+		}
+	}
+	return resolvers
+}
+
+// localFamilies reports which address families the device's local addresses
+// cover, applying the same compatibility defaults as initialization.
+func localFamilies(config *appoutbound.WireGuardConfig) (hasIPv4, hasIPv6 bool) {
+	addresses := config.Address
+	if len(addresses) == 0 {
+		addresses = defaultAddresses
+	}
+	for _, value := range addresses {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(value))
+		if err != nil {
+			continue // rejected during config validation
+		}
+		addr := prefix.Addr().Unmap()
+		hasIPv4 = hasIPv4 || addr.Is4()
+		hasIPv6 = hasIPv6 || addr.Is6()
+	}
+	return hasIPv4, hasIPv6
+}
+
+// parseDNSServers converts configured Local DNS entries for the netstack.
+func parseDNSServers(servers []string) ([]netip.Addr, error) {
+	if len(servers) == 0 {
+		return nil, nil
+	}
+	addrs := make([]netip.Addr, 0, len(servers))
+	for _, server := range servers {
+		addr, err := netip.ParseAddr(strings.TrimSpace(server))
+		if err != nil {
+			return nil, fmt.Errorf("invalid WireGuard DNS server %q: %w", server, err)
+		}
+		addrs = append(addrs, addr.Unmap())
+	}
+	return addrs, nil
 }
 
 func preferredAddress(addresses []netip.Addr, allowIPv4, allowIPv6 bool) (netip.Addr, bool) {

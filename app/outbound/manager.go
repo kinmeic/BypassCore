@@ -277,6 +277,14 @@ func validateWireGuard(tag string, config *WireGuardConfig) error {
 	if config.MTU != 0 && (config.MTU < 576 || config.MTU > 65535) {
 		return errors.New(prefix, "mtu must be between 576 and 65535")
 	}
+	if len(config.Reserved) != 0 && len(config.Reserved) != 3 {
+		return errors.New(prefix, "reserved must be exactly 3 bytes")
+	}
+	for index, server := range config.DNS {
+		if _, err := netip.ParseAddr(strings.TrimSpace(server)); err != nil {
+			return errors.New(prefix, "has invalid dns[", index, "]").Base(err)
+		}
+	}
 	for index, address := range config.Address {
 		if _, err := netip.ParsePrefix(strings.TrimSpace(address)); err != nil {
 			return errors.New(prefix, "has invalid address[", index, "]").Base(err)

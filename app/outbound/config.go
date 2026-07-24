@@ -114,6 +114,14 @@ type WireGuardConfig struct {
 	Address   []string               `json:"address,omitempty"`
 	Peers     []*WireGuardPeerConfig `json:"peers"`
 	MTU       int                    `json:"mtu,omitempty"`
+	// DNS lists Local DNS servers used when resolving through the tunnel
+	// (wg-quick [Interface] DNS semantics). Probe resolution and domain
+	// destinations prefer these over the host resolver.
+	DNS []string `json:"dns,omitempty"`
+	// Reserved carries the 3-byte client identifier required by WARP-derived
+	// providers. It is injected into bytes 1-3 of every outgoing packet;
+	// vanilla WireGuard servers ignore it.
+	Reserved []byte `json:"reserved,omitempty"`
 }
 
 // Outbound is a single outbound descriptor.

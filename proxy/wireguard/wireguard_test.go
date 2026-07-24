@@ -37,7 +37,7 @@ func TestCloseBeforeDialDoesNotInitialize(t *testing.T) {
 
 func TestNumericDestinationRejectsUnavailableFamily(t *testing.T) {
 	destination := bcnet.TCPDestination(bcnet.LocalHostIPv6, 443)
-	if _, err := numericDestination(context.Background(), destination, true, false); err == nil {
+	if _, err := (&Handler{}).numericDestination(context.Background(), nil, destination, true, false); err == nil {
 		t.Fatal("IPv6 destination accepted by an IPv4-only WireGuard device")
 	}
 }
@@ -216,4 +216,48 @@ func roundTrip(connection net.Conn, payload []byte) error {
 		return fmt.Errorf("response %q, want %q", response, payload)
 	}
 	return nil
+}
+
+func TestProbeResolversFiltersByLocalFamily(t *testing.T) {
+	ipv4Only := New("wg", &appoutbound.WireGuardConfig{
+		Address: []string{"10.0.3.4/32"},
+		DNS:     []string{"192.168.3.1", "2606:4700:4700::1111"},
+	})
+	if got := ipv4Only.ProbeResolvers(); len(got) != 1 || got[0] != "192.168.3.1" {
+		t.Fatalf("IPv4-only ProbeResolvers = %v, want [192.168.3.1]", got)
+	}
+
+	dualStack := New("wg", &appoutbound.WireGuardConfig{
+		Address: []string{"10.0.3.4/32", "fd00::2/128"},
+		DNS:     []string{"192.168.3.1", "2606:4700:4700::1111"},
+	})
+	if got := dualStack.ProbeResolvers(); len(got) != 2 {
+		t.Fatalf("dual-stack ProbeResolvers = %v, want both resolvers", got)
+	}
+}
+
+func TestProbeResolversDefaults(t *testing.T) {
+	if got := New("wg", &appoutbound.WireGuardConfig{}).ProbeResolvers(); got != nil {
+		t.Fatalf("unconfigured ProbeResolvers = %v, want nil", got)
+	}
+	// The compatibility default addresses cover both families.
+	handler := New("wg", &appoutbound.WireGuardConfig{
+		DNS: []string{"192.168.3.1", "2606:4700:4700::1111"},
+	})
+	if got := handler.ProbeResolvers(); len(got) != 2 {
+		t.Fatalf("default-address ProbeResolvers = %v, want both resolvers", got)
+	}
+}
+
+func TestParseDNSServers(t *testing.T) {
+	if got, err := parseDNSServers(nil); err != nil || got != nil {
+		t.Fatalf("empty parseDNSServers = %v, %v; want nil, nil", got, err)
+	}
+	if _, err := parseDNSServers([]string{"not-an-ip"}); err == nil {
+		t.Fatal("invalid DNS server accepted")
+	}
+	got, err := parseDNSServers([]string{"192.168.3.1", "::ffff:192.168.3.2"})
+	if err != nil || len(got) != 2 || !got[1].Is4() {
+		t.Fatalf("parseDNSServers = %v, %v; want two unmapped addresses", got, err)
+	}
 }

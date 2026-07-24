@@ -1161,12 +1161,22 @@ func resolveProbeHostThroughOutbound(ctx context.Context, host string, outboundD
 		return "", errors.New("build outbound DNS probe").Base(err)
 	}
 
-	var lastErr error
-	for _, resolver := range []string{"1.1.1.1", "2606:4700:4700::1111"} {
+	resolvers := []string{"1.1.1.1", "2606:4700:4700::1111"}
+	// An outbound with configured Local DNS (e.g. WireGuard) resolves through
+	// its own servers; the defaults assume a resolver that may not be reachable
+	// from every tunnel egress.
+	if provider, ok := outboundDialer.(dialer.ProbeResolverProvider); ok {
+		if configured := provider.ProbeResolvers(); len(configured) > 0 {
+			resolvers = configured
+		}
+	}
+
+	var errs []error
+	for _, resolver := range resolvers {
 		connection, dialErr := outboundDialer.Dial(ctx,
 			bcnet.UDPDestination(bcnet.ParseAddress(resolver), 53))
 		if dialErr != nil {
-			lastErr = dialErr
+			errs = append(errs, dialErr)
 			continue
 		}
 		deadline, ok := ctx.Deadline()
@@ -1176,7 +1186,7 @@ func resolveProbeHostThroughOutbound(ctx context.Context, host string, outboundD
 		_ = connection.SetDeadline(deadline)
 		if _, err = connection.Write(query); err != nil {
 			_ = connection.Close()
-			lastErr = err
+			errs = append(errs, err)
 			continue
 		}
 		buffer := make([]byte, 4096)
@@ -1184,16 +1194,16 @@ func resolveProbeHostThroughOutbound(ctx context.Context, host string, outboundD
 		count, err = connection.Read(buffer)
 		_ = connection.Close()
 		if err != nil {
-			lastErr = err
+			errs = append(errs, err)
 			continue
 		}
 		var response dnsmessage.Message
 		if err = response.Unpack(buffer[:count]); err != nil {
-			lastErr = err
+			errs = append(errs, err)
 			continue
 		}
 		if !response.Response || response.ID != queryID || response.RCode != dnsmessage.RCodeSuccess {
-			lastErr = errors.New("outbound DNS returned an invalid response")
+			errs = append(errs, errors.New("outbound DNS returned an invalid response"))
 			continue
 		}
 		for _, records := range [][]dnsmessage.Resource{response.Answers, response.Additionals} {
@@ -1203,16 +1213,19 @@ func resolveProbeHostThroughOutbound(ctx context.Context, host string, outboundD
 				}
 			}
 		}
-		lastErr = errors.New("outbound DNS response has no IPv4 address")
+		errs = append(errs, errors.New("outbound DNS response has no IPv4 address"))
 	}
-	if lastErr == nil {
-		lastErr = errors.New("no outbound DNS resolver is reachable")
+	// Preserve every resolver's failure instead of only the last one: the last
+	// resolver is not necessarily the meaningful one (e.g. an IPv6 resolver on
+	// an IPv4-only tunnel used to mask the real IPv4 timeout).
+	if len(errs) == 0 {
+		errs = append(errs, errors.New("no outbound DNS resolver is reachable"))
 	}
 	return "", errors.New(
 		"resolve probe target through WireGuard outbound DNS failed ",
 		"(a peer handshake alone does not verify tunnel addresses or server forwarding; ",
 		"check Local Address, server peer AllowedIPs, IP forwarding, and NAT)",
-	).Base(lastErr)
+	).Base(errors.Combine(errs...))
 }
 
 func preferredProbeIP(ips []bcnet.IP) (string, bool) {

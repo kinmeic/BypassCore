@@ -36,3 +36,10 @@ type HandshakeResult struct {
 type HandshakeProber interface {
 	ProbeHandshake(ctx context.Context) (HandshakeResult, error)
 }
+
+// ProbeResolverProvider is implemented by outbounds that prefer specific DNS
+// resolvers for control-plane probe resolution through the tunnel. An empty
+// or nil result means the caller's default resolvers apply.
+type ProbeResolverProvider interface {
+	ProbeResolvers() []string
+}
