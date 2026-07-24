@@ -477,14 +477,6 @@ func (l *DNSListener) serveUDP() {
 	}
 }
 
-func (l *DNSListener) queryLimit() int {
-	queryBytes := l.currentPolicy().queryBytes
-	if queryBytes >= 512 && queryBytes <= maxDNSMessageSize {
-		return queryBytes
-	}
-	return defaultDNSMaxQueryBytes
-}
-
 func (l *DNSListener) acceptTCP() {
 	defer l.wg.Done()
 	degraded := false

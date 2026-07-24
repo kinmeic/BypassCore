@@ -443,16 +443,19 @@ func (s *DNS) lookupIP(ctx context.Context, domain string, option dns.IPOption) 
 
 func (s *DNS) sortClients(domain string) []*Client {
 	clients := make([]*Client, 0, len(s.clients))
-	clientUsed, _ := s.clientUsedPool.Get().([]bool)
-	if cap(clientUsed) < len(s.clients) {
-		clientUsed = make([]bool, len(s.clients))
+	// Use a *[]bool so the value handed to sync.Pool is pointer-like and
+	// does not allocate a new interface box on every Put (staticcheck SA6002).
+	clientUsedPtr, _ := s.clientUsedPool.Get().(*[]bool)
+	if clientUsedPtr == nil || cap(*clientUsedPtr) < len(s.clients) {
+		clientUsed := make([]bool, len(s.clients))
+		clientUsedPtr = &clientUsed
 	} else {
-		clientUsed = clientUsed[:len(s.clients)]
+		clientUsed := (*clientUsedPtr)[:len(s.clients)]
 		clear(clientUsed)
+		*clientUsedPtr = clientUsed
 	}
-	if clientUsed != nil {
-		defer s.clientUsedPool.Put(clientUsed)
-	}
+	clientUsed := *clientUsedPtr
+	defer s.clientUsedPool.Put(clientUsedPtr)
 	debug := errors.LogEnabled(errors.Severity_Debug)
 	var clientNames, domainRules []string
 	if debug {
