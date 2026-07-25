@@ -12,8 +12,10 @@ import (
 
 // Subscriber receives published messages on its buffer channel.
 type Subscriber struct {
-	buffer chan interface{}
-	done   *done.Instance
+	buffer  chan interface{}
+	done    *done.Instance
+	service *Service
+	topic   string
 }
 
 func (s *Subscriber) push(msg interface{}) {
@@ -35,7 +37,19 @@ func (s *Subscriber) push(msg interface{}) {
 func (s *Subscriber) Wait() <-chan interface{} { return s.buffer }
 
 // Close unsubscribes.
-func (s *Subscriber) Close() error { return s.done.Close() }
+func (s *Subscriber) Close() error {
+	if s.done.Done() {
+		return nil
+	}
+	err := s.done.Close()
+	// Remove the subscriber from the service map immediately instead of
+	// waiting for the periodic Cleanup sweep, so the map does not grow with
+	// churn between sweeps. Removal is idempotent, so racing Closes are safe.
+	if s.service != nil {
+		s.service.unsubscribe(s.topic, s)
+	}
+	return err
+}
 
 // IsClosed reports whether Close has been called.
 func (s *Subscriber) IsClosed() bool { return s.done.Done() }
@@ -57,7 +71,30 @@ func NewService() *Service {
 	return s
 }
 
-// Cleanup removes closed subscribers.
+// unsubscribe removes target from the named topic right away.
+func (s *Service) unsubscribe(name string, target *Subscriber) {
+	s.Lock()
+	defer s.Unlock()
+	subs := s.subs[name]
+	if len(subs) == 0 {
+		return
+	}
+	filtered := make([]*Subscriber, 0, len(subs))
+	for _, sub := range subs {
+		if sub != target {
+			filtered = append(filtered, sub)
+		}
+	}
+	if len(filtered) == 0 {
+		delete(s.subs, name)
+	} else {
+		s.subs[name] = filtered
+	}
+}
+
+// Cleanup removes closed subscribers. It is a backstop: Subscriber.Close
+// already removes entries eagerly, this sweep only catches subscribers that
+// were closed through some other path.
 func (s *Service) Cleanup() error {
 	s.Lock()
 	defer s.Unlock()
@@ -86,8 +123,10 @@ func (s *Service) Cleanup() error {
 // Subscribe creates a new Subscriber for the named topic.
 func (s *Service) Subscribe(name string) *Subscriber {
 	sub := &Subscriber{
-		buffer: make(chan interface{}, 16),
-		done:   done.New(),
+		buffer:  make(chan interface{}, 16),
+		done:    done.New(),
+		service: s,
+		topic:   name,
 	}
 	s.Lock()
 	s.subs[name] = append(s.subs[name], sub)

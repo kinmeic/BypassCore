@@ -16,6 +16,7 @@ type RandomStrategy struct {
 
 	ctx         context.Context
 	observatory extension.Observatory
+	alive       aliveCache
 }
 
 func (s *RandomStrategy) InjectContext(ctx context.Context) {
@@ -37,7 +38,7 @@ func (s *RandomStrategy) PickOutbound(candidates []string) string {
 		observeReport, err := s.observatory.GetObservation(s.ctx)
 		if err == nil {
 			if result, ok := observeReport.(*observatory.ObservationResult); ok {
-				candidates = filterAliveCandidates(candidates, result.Status)
+				candidates = s.alive.filter(candidates, result.Status)
 			}
 		}
 	}

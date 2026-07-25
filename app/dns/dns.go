@@ -34,6 +34,12 @@ type DNS struct {
 	checkSystem            bool
 	backgroundQuerySlots   chan struct{}
 	clientUsedPool         sync.Pool
+	// sortCache memoizes the per-domain ordered client list computed by
+	// sortClients. Client rules are immutable after construction, so the
+	// ordering for a given domain never changes; caching it avoids a slice
+	// allocation plus a sort on every query.
+	sortCacheMu sync.Mutex
+	sortCache   map[string][]*Client
 }
 
 var _ dns.ContextClient = (*DNS)(nil)
@@ -200,6 +206,7 @@ func New(ctx context.Context, config *Config) (*DNS, error) {
 		enableParallelQuery:    config.EnableParallelQuery,
 		checkSystem:            checkSystem,
 		backgroundQuerySlots:   make(chan struct{}, 64),
+		sortCache:              make(map[string][]*Client),
 	}
 	success = true
 	return server, nil
@@ -441,7 +448,39 @@ func (s *DNS) lookupIP(ctx context.Context, domain string, option dns.IPOption) 
 	}
 }
 
+// sortClientCacheCap bounds the memoized per-domain client orderings. On
+// overflow the whole map is cleared, amortizing eviction to O(1); entries are
+// cheap to recompute, so a simple clear beats tracking LRU state.
+const sortClientCacheCap = 4096
+
 func (s *DNS) sortClients(domain string) []*Client {
+	// strings.ToLower returns the original string when it is already
+	// lowercase, so the common path does not allocate for the cache key.
+	key := strings.ToLower(domain)
+	s.sortCacheMu.Lock()
+	cached, ok := s.sortCache[key]
+	s.sortCacheMu.Unlock()
+	if ok {
+		return cached
+	}
+
+	clients := s.sortClientsForDomain(key)
+
+	s.sortCacheMu.Lock()
+	if s.sortCache == nil { // tests construct DNS directly, without New
+		s.sortCache = make(map[string][]*Client)
+	}
+	if len(s.sortCache) >= sortClientCacheCap {
+		clear(s.sortCache)
+	}
+	s.sortCache[key] = clients
+	s.sortCacheMu.Unlock()
+	return clients
+}
+
+// sortClientsForDomain computes the ordered client list for an already
+// lowercased domain.
+func (s *DNS) sortClientsForDomain(domain string) []*Client {
 	clients := make([]*Client, 0, len(s.clients))
 	// Use a *[]bool so the value handed to sync.Pool is pointer-like and
 	// does not allocate a new interface box on every Put (staticcheck SA6002).
@@ -465,7 +504,7 @@ func (s *DNS) sortClients(domain string) []*Client {
 	// Priority domain matching
 	hasMatch := false
 	if s.domainMatcher != nil {
-		matchSlice := s.domainMatcher.Match(strings.ToLower(domain))
+		matchSlice := s.domainMatcher.Match(domain)
 		sort.Slice(matchSlice, func(i, j int) bool {
 			return matchSlice[i] < matchSlice[j]
 		})

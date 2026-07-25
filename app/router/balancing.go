@@ -25,6 +25,7 @@ type RoundRobinStrategy struct {
 
 	ctx         context.Context
 	observatory extension.Observatory
+	alive       aliveCache
 	mu          sync.Mutex
 	index       int
 }
@@ -48,7 +49,7 @@ func (s *RoundRobinStrategy) PickOutbound(tags []string) string {
 		observeReport, err := s.observatory.GetObservation(s.ctx)
 		if err == nil {
 			if result, ok := observeReport.(*observatory.ObservationResult); ok {
-				tags = filterAliveCandidates(tags, result.Status)
+				tags = s.alive.filter(tags, result.Status)
 			}
 		}
 	}
@@ -87,6 +88,62 @@ func filterAliveCandidates(candidates []string, statuses []*observatory.Outbound
 		return candidates
 	}
 	return alive
+}
+
+// statusFingerprint returns an order-independent fingerprint of observation
+// statuses. GetObservation builds its result by ranging over a map, so status
+// order varies between calls and a positional hash would report a change on
+// every call.
+func statusFingerprint(statuses []*observatory.OutboundStatus) uint64 {
+	var fp uint64
+	for _, status := range statuses {
+		h := uint64(14695981039346656037) // FNV-1a offset basis
+		for i := 0; i < len(status.OutboundTag); i++ {
+			h ^= uint64(status.OutboundTag[i])
+			h *= 1099511628211 // FNV prime
+		}
+		if status.Alive {
+			h ^= 0x9e3779b97f4a7c15
+		}
+		fp += h
+	}
+	return fp
+}
+
+// aliveCache memoizes the alive-filtered candidate list. Observation results
+// only change when a probe round completes, so re-filtering on every
+// connection wastes work and allocations whenever any outbound is down.
+type aliveCache struct {
+	mu          sync.Mutex
+	fingerprint uint64
+	candidates  []string
+	alive       []string
+}
+
+func (c *aliveCache) filter(candidates []string, statuses []*observatory.OutboundStatus) []string {
+	fp := statusFingerprint(statuses)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if fp == c.fingerprint && stringSlicesEqual(c.candidates, candidates) {
+		return c.alive
+	}
+	alive := filterAliveCandidates(candidates, statuses)
+	c.fingerprint = fp
+	c.candidates = append(c.candidates[:0], candidates...)
+	c.alive = alive
+	return alive
+}
+
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 type Balancer struct {

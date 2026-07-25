@@ -31,7 +31,44 @@ const (
 	maxDNSConfiguredLimit          = 65535
 	maxDoHConcurrentStreams        = 1024
 	rcodeBadVersion                = dnsmessage.RCode(16)
+
+	// maxPooledDNSQueryBytes caps the capacity of request buffers returned to
+	// dnsQueryBufPool, so a rare jumbo query does not pin a large allocation
+	// in the pool.
+	maxPooledDNSQueryBytes = 16 * 1024
 )
+
+// dnsQueryBufPool recycles per-query request buffers so the UDP serve loop
+// does not allocate a fresh copy for every accepted datagram. Values are
+// *[]byte so Put does not allocate an interface box (staticcheck SA6002).
+var dnsQueryBufPool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, 0, 2048)
+		return &buf
+	},
+}
+
+// acquireDNSQueryBuf copies src into a pooled buffer and returns the pool
+// handle alongside the request slice. The caller must release the handle
+// with releaseDNSQueryBuf once the request is fully processed.
+func acquireDNSQueryBuf(src []byte) (*[]byte, []byte) {
+	bufPtr, _ := dnsQueryBufPool.Get().(*[]byte)
+	if bufPtr == nil {
+		buf := make([]byte, 0, 2048)
+		bufPtr = &buf
+	}
+	request := append((*bufPtr)[:0], src...)
+	*bufPtr = request
+	return bufPtr, request
+}
+
+func releaseDNSQueryBuf(bufPtr *[]byte) {
+	if cap(*bufPtr) > maxPooledDNSQueryBytes {
+		return
+	}
+	*bufPtr = (*bufPtr)[:0]
+	dnsQueryBufPool.Put(bufPtr)
+}
 
 type dnsListenerState uint8
 
@@ -447,12 +484,16 @@ func (l *DNSListener) serveUDP() {
 		commonmetrics.Inc("bypasscore_dns_queries_total", "inbound", l.inboundTag(), "transport", "udp")
 		select {
 		case policy.querySlots <- struct{}{}:
-			request := append([]byte(nil), buf[:n]...)
+			// handleQuery does not retain the request past its return (the
+			// raw cache keys on a copied string and upstream raw lookups are
+			// synchronous), so the buffer is safe to recycle afterwards.
+			bufPtr, request := acquireDNSQueryBuf(buf[:n])
 			querySlots := policy.querySlots
 			l.wg.Add(1)
 			go func() {
 				defer l.wg.Done()
 				defer func() { <-querySlots }()
+				defer releaseDNSQueryBuf(bufPtr)
 				response, err := l.handleQuery(request, true)
 				if err != nil {
 					errors.LogErrorInner(context.Background(), err, "DNS inbound UDP query failed")
