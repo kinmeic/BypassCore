@@ -90,7 +90,8 @@ type BindConfig struct {
 // Settings is an open map so the engine stays protocol-agnostic; the upper
 // layer interprets protocol-specific fields.
 type UpstreamConfig struct {
-	// Protocol is the proxy protocol, e.g. "trojan", "vless", "socks", "shadowsocks".
+	// Protocol is the proxy protocol. Supported values are "socks" (or
+	// "socks5") and "https" for an HTTP CONNECT proxy over TLS.
 	Protocol string `json:"protocol"`
 	// Server is the upstream server "host:port".
 	Server string `json:"server"`

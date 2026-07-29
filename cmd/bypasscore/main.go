@@ -42,6 +42,7 @@ import (
 	"github.com/eugene/bypasscore/infra/conf"
 	"github.com/eugene/bypasscore/proxy/blackhole"
 	"github.com/eugene/bypasscore/proxy/freedom"
+	"github.com/eugene/bypasscore/proxy/httpconnect"
 	"github.com/eugene/bypasscore/proxy/socks"
 	wgoutbound "github.com/eugene/bypasscore/proxy/wireguard"
 )
@@ -60,7 +61,7 @@ type Config struct {
 }
 
 // version is overridden by release builds with -ldflags=-X main.version=... .
-var version = "1.5.1"
+var version = "1.5.2"
 var commit = "unknown"
 var buildDate = "unknown"
 
@@ -264,6 +265,9 @@ func registerDialerFactory() {
 		case appoutbound.ModeFreedom:
 			return freedom.New(ob.Tag, bindIP, bindIface)
 		case appoutbound.ModeProxy:
+			if strings.EqualFold(strings.TrimSpace(ob.Upstream.Protocol), "https") {
+				return httpconnect.NewFromSettings(ob.Tag, ob.Upstream.Server, ob.Upstream.Settings)
+			}
 			return socks.NewFromSettings(ob.Tag, ob.Upstream.Server, ob.Upstream.Settings)
 		case appoutbound.ModeWireGuard:
 			return wgoutbound.New(ob.Tag, ob.WireGuard)
@@ -569,8 +573,8 @@ func repeat(s string, n int) string {
 	return out
 }
 
-// runDaemon starts all transparent-proxy and DNS inbound listeners and blocks
-// until a signal is received.
+// runDaemon starts all proxy and DNS inbound listeners and blocks until a
+// signal is received.
 func runDaemon(r *router.Router, ohm *appoutbound.Manager, dnsClient featdns.Client, inbounds []*appinbound.Config, baseCtx context.Context) error {
 	return runDaemonWithReload(r, ohm, dnsClient, inbounds, baseCtx, nil)
 }
@@ -604,8 +608,8 @@ func runDaemonWithReload(r featrouting.Router, ohm dispatcher.DialerManager, dns
 		if inboundType == "dns" || inboundType == "dot" || inboundType == "doh" {
 			ln = appinbound.NewDNS(ibCfg, dnsClient)
 		} else {
-			// Sniffing is an inbound property. Give each transparent listener its
-			// own dispatcher so one inbound cannot affect another.
+			// Sniffing is an inbound property. Give each proxy listener its own
+			// dispatcher so one inbound cannot affect another.
 			sniffer, err := dispatcher.NewSnifferWithOptions(ibCfg.Sniffing, ibCfg.SniffingTimeoutMs, ibCfg.SniffingMaxBytes)
 			if err != nil {
 				closeListeners()

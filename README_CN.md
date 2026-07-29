@@ -5,13 +5,14 @@
 ## 特性
 
 - **透明代理入站**：TCP REDIRECT（SO_ORIGINAL_DST）+ UDP TPROXY（IP_TRANSPARENT + IP_RECVORIGDSTADDR）
+- **SOCKS5 入站**：本地无认证 TCP CONNECT 服务，可承接 Caddy `forward_proxy` 并保留原始目标域名参与规则分流
 - **TLS/HTTP/QUIC 嗅探**：从纯 IP 连接恢复域名（TLS SNI / HTTP Host / QUIC Initial），让 TCP/UDP 域名规则对透明代理流量生效
 - **规则匹配引擎**：domain / IP(CIDR+GeoIP) / 端口 / 网络(TCP/UDP) / 协议 / inboundTag / user / process / 属性
 - **GeoData 支持**：`geosite:` / `geoip:` 规则，支持 `geoip.dat` / `geosite.dat` 加载
 - **4 种出站拨号器**：
   - `freedom` — 直连，支持源 IP / 接口绑定（多 WAN）
   - `blackhole` — 丢弃
-  - `proxy` — SOCKS5 client 拨到本地 naiveproxy/sing-box 的 socks 端口
+  - `proxy` — 可选择 SOCKS5 或 HTTPS CONNECT 上游；HTTPS 可连接另一台 Caddy `forward_proxy`
   - `wireguard` — 进程内用户态 WireGuard 客户端与用户态 TCP/IP 栈
 - **DNS 子系统**：多上游 DNS + 缓存 + 域名分流 + IP 过滤，UDP / TCP / DoT(RFC 7858) / DoH(RFC 8484)
 - **DNS 监听服务**：通过普通 UDP/TCP 端口提供 A/AAAA 解析，并将 MX/TXT/SRV/PTR/CAA 等记录类型沿相同 tagged outbound 转发
@@ -84,11 +85,101 @@ router.PickRoute → outboundTag
 outbound dialer:
   ├─ freedom:  net.Dial 直连 + 源IP/接口绑定
   ├─ blackhole: 丢弃
-  ├─ proxy:    SOCKS5 client → 127.0.0.1:<naiveproxy_port>
+  ├─ proxy/socks: SOCKS5 client → 127.0.0.1:<naiveproxy_port>
+  ├─ proxy/https: TLS + HTTP CONNECT → remote Caddy forward_proxy
   └─ wireguard: 用户态 WireGuard 设备 + 用户态 TCP/IP 栈
   ↓
 transport.Bridge (双向拷贝)
 ```
+
+## SOCKS5 入站与 Caddy
+
+BypassCore 可提供仅监听本机的 SOCKS5 TCP CONNECT 入站，让 Caddy 负责公网
+TLS、HTTP/2/3 和认证，BypassCore 负责规则匹配与出口选择：
+
+```json
+{"tag":"caddy-forward","type":"socks","listen":"127.0.0.1","port":1081,"network":"tcp"}
+```
+
+对应的 Caddy `forward_proxy` 配置：
+
+```caddyfile
+example.com:443 {
+    forward_proxy {
+        basic_auth user password
+        upstream socks5://127.0.0.1:1081
+    }
+}
+```
+
+SOCKS 请求携带的域名/IP和端口会直接成为路由目标，因此 `domain`、`ip`、`port`
+和 `inboundTag` 规则均可生效，无需 TLS/HTTP 嗅探。未设置 `listen` 时安全地默认
+监听 `127.0.0.1`。当前只支持无认证的 SOCKS5 TCP `CONNECT`，不支持
+`BIND`、`UDP ASSOCIATE`；如需对外开放，应在 Caddy 层完成认证，且不要将该本地
+端口暴露到非可信网络。
+
+### 按规则选择远端 Caddy HTTPS 出口
+
+HTTPS CONNECT 是一个普通 tagged outbound，而不是全局 upstream。入口 Caddy
+先通过本机 SOCKS5 入站把目标交给 BypassCore；只有命中规则的连接才转发到第二台
+Caddy：
+
+```json
+{
+  "outbounds": [
+    {"tag":"direct","mode":"freedom"},
+    {
+      "tag":"caddy-exit",
+      "mode":"proxy",
+      "upstream":{
+        "protocol":"https",
+        "server":"exit.example.com:443",
+        "settings":{
+          "username":"upstream-user",
+          "password":"upstream-password",
+          "tlsServerName":"exit.example.com",
+          "enableHTTP2":true
+        }
+      }
+    }
+  ],
+  "routing":{
+    "finalOutboundTag":"direct",
+    "rules":[
+      {
+        "inboundTag":["caddy-forward"],
+        "domain":["domain:example.com"],
+        "outboundTag":"caddy-exit"
+      }
+    ]
+  }
+}
+```
+
+第二台 Caddy：
+
+```caddyfile
+exit.example.com:443 {
+    forward_proxy {
+        basic_auth upstream-user upstream-password
+    }
+}
+```
+
+该 outbound 默认严格验证系统 CA、证书主机名和最低 TLS 1.2，并通过 ALPN 支持
+HTTP/1.1 CONNECT 与可复用的 HTTP/2 CONNECT。私有 CA 可用 `caFile` 追加；
+`insecureSkipVerify` 仅用于明确的测试场景。HTTPS CONNECT 只支持 TCP，UDP 规则
+应选择 SOCKS5、WireGuard、freedom 或 blackhole 出口。
+
+它是标准 Go TLS + HTTP CONNECT 客户端，不等同于 NaïveProxy 客户端：不使用
+Chromium TLS 指纹、不实现 Naïve payload/HEADERS/RST_STREAM padding、HTTP/3 或
+CONNECT Fast Open。连接到支持 Naïve padding 的 forwardproxy fork 时仍可互操作，
+但因没有 `padding` 协商头，第二段链路会以普通未填充 CONNECT 工作。
+
+同样地，仅在支持 Naïve 的 Caddy `forward_proxy` 上配置 `upstream`，也不会让
+Caddy→upstream 这一跳自动继承客户端→Caddy 的 padding：入站 padding 会在当前
+Caddy 解码，而其 HTTPS upstream dialer 会新建普通 CONNECT 请求且不添加
+`padding` 头。Naïve padding 是逐跳协商的，每一跳都必须由该跳客户端主动实现。
 
 ## outbound 目标模型
 
@@ -99,12 +190,14 @@ transport.Bridge (双向拷贝)
 | `freedom` | — | — | 直连（direct） |
 | `freedom` | ✅ interface + localIP | — | 多 WAN 分流（wan1/wan2） |
 | `blackhole` | — | — | 丢弃 |
-| `proxy` | — | ✅ socks server | SOCKS5 → 本地 naiveproxy |
+| `proxy` | — | ✅ SOCKS5 server | SOCKS5 → 本地 naiveproxy/sing-box |
+| `proxy` | — | ✅ HTTPS proxy | TLS + HTTP/1.1 或 HTTP/2 CONNECT → Caddy |
 | `wireguard` | — | ✅ WireGuard 配置 | 仅客户端的用户态 WireGuard 隧道 |
 
 ```json
 {"tag": "wan1", "mode": "freedom", "bind": {"interface": "en0", "localIP": "192.168.1.2"}}
 {"tag": "proxy", "mode": "proxy", "upstream": {"protocol": "socks", "server": "127.0.0.1:1080", "settings": {"udpMaxPacketBytes": 8192}}}
+{"tag": "caddy-exit", "mode": "proxy", "upstream": {"protocol": "https", "server": "exit.example.com:443", "settings": {"username": "upstream-user", "password": "upstream-password", "tlsServerName": "exit.example.com", "enableHTTP2": true}}}
 {"tag": "wg", "mode": "wireguard", "wireguard": {"secretKey": "<base64>", "publicKey": "<base64>", "address": ["10.0.0.2/32"], "peers": [{"publicKey": "<base64>", "endpoint": "vpn.example.com:51820", "allowedIPs": ["0.0.0.0/0", "::/0"], "preSharedKey": "<base64>", "keepAlive": 25}], "mtu": 1420}}
 ```
 
@@ -333,10 +426,12 @@ DNS 上游结果/延迟、sniff 结果、配置 revision 和 reload 结果。热
     {"tag": "direct", "mode": "freedom"},
     {"tag": "block", "mode": "blackhole"},
     {"tag": "wan1", "mode": "freedom", "bind": {"interface": "en0", "localIP": "192.168.1.2"}},
-    {"tag": "proxy", "mode": "proxy", "upstream": {"protocol": "socks", "server": "127.0.0.1:1080"}}
+    {"tag": "proxy", "mode": "proxy", "upstream": {"protocol": "socks", "server": "127.0.0.1:1080"}},
+    {"tag": "caddy-exit", "mode": "proxy", "upstream": {"protocol": "https", "server": "exit.example.com:443", "settings": {"username": "upstream-user", "password": "upstream-password"}}}
   ],
   "inbounds": [
 	{"tag": "dns-in", "type": "dns", "listen": "127.0.0.1", "port": 1053, "network": "tcp,udp"},
+	{"tag": "caddy-forward", "type": "socks", "listen": "127.0.0.1", "port": 1081, "network": "tcp"},
 	{"tag": "tcp_redir", "type": "redirect", "listen": "0.0.0.0", "port": 12345, "network": "tcp", "sniffing": true},
 	{"tag": "udp_tproxy", "type": "tproxy", "listen": "0.0.0.0", "port": 12345, "network": "udp", "sniffing": false}
   ],
@@ -355,7 +450,7 @@ DNS 上游结果/延迟、sniff 结果、配置 revision 和 reload 结果。热
 ## 项目结构
 
 ```
-app/inbound/       tproxy/redirect 透明代理监听器 + 普通 UDP/TCP DNS 监听器
+app/inbound/       SOCKS5/tproxy/redirect 代理监听器 + 普通 UDP/TCP DNS 监听器
 app/dispatcher/    数据面枢纽 (inbound → sniff → route → outbound)
 app/dialer/        共享 Dialer 接口
 app/outbound/      outbound 描述符 + Manager (tag 查找 + dialer factory)
@@ -366,6 +461,7 @@ app/dnsnftset/     DNS server tag → nftables set 的有界原生 netlink write
 proxy/freedom/     直连拨号器 (net.Dial + 源IP/接口绑定)
 proxy/blackhole/   丢弃拨号器
 proxy/socks/       SOCKS5 client 拨号器
+proxy/httpconnect/ HTTPS forward proxy CONNECT 拨号器（HTTP/1.1 + HTTP/2）
 common/protocol/tls/   TLS SNI 嗅探
 common/protocol/http/  HTTP Host 嗅探
 common/protocol/quic/  QUIC Initial 解密与 SNI 嗅探

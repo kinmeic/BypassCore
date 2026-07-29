@@ -32,6 +32,21 @@
         "server": "127.0.0.1:1080",
         "settings": {"udpMaxPacketBytes": 8192}
       }
+    },
+    {
+      "tag": "caddy-exit",
+      "mode": "proxy",
+      "upstream": {
+        "protocol": "https",
+        "server": "exit.example.com:443",
+        "settings": {
+          "username": "upstream-user",
+          "password": "upstream-password",
+          "tlsServerName": "exit.example.com",
+          "enableHTTP2": true,
+          "connectTimeoutMs": 10000
+        }
+      }
     }
   ],
   "inbounds": [
@@ -55,6 +70,13 @@
       "dnsRules": [
         {"qType": ["TXT", "MX", "SRV", "PTR", "CAA"], "action": "direct"}
       ]
+    },
+    {
+      "tag": "caddy-forward",
+      "type": "socks",
+      "listen": "127.0.0.1",
+      "port": 1081,
+      "network": "tcp"
     },
     {
       "tag": "tcp_redir",
@@ -107,6 +129,11 @@
     "domainStrategy": "IpIfNonMatch",
     "finalOutboundTag": "direct",
     "rules": [
+      {
+        "inboundTag": ["caddy-forward"],
+        "domain": ["domain:example.com"],
+        "outboundTag": "caddy-exit"
+      },
       {
         "domain": [
           "domain:baidu.com",

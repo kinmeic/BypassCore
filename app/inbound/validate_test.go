@@ -7,12 +7,20 @@ func TestValidateConfig(t *testing.T) {
 	if err := ValidateConfig(valid); err != nil {
 		t.Fatalf("valid DNS config: %v", err)
 	}
+	if err := ValidateConfig(&Config{Tag: "caddy", Type: "socks", Port: 1081, Network: "tcp"}); err != nil {
+		t.Fatalf("valid SOCKS5 config: %v", err)
+	}
+	if err := ValidateConfig(&Config{Tag: "caddy-alias", Type: "socks5", Port: 1082}); err != nil {
+		t.Fatalf("valid SOCKS5 alias config: %v", err)
+	}
 	tests := []*Config{
 		{Tag: "", Type: "dns", Port: 53},
 		{Tag: "dns", Type: "dns", Port: 53, DNSGlobalQueryBurst: 1},
 		{Tag: "redirect", Type: "redirect", Port: 12345, Network: "udp"},
 		{Tag: "doh", Type: "doh", Port: 443, Network: "tcp"},
 		{Tag: "udp", Type: "tproxy", Port: 12345, Network: "udp", UDPMaxSessions: -1},
+		{Tag: "socks-udp", Type: "socks", Port: 1081, Network: "udp"},
+		{Tag: "socks-sniff", Type: "socks", Port: 1081, Network: "tcp", Sniffing: true},
 	}
 	for index, config := range tests {
 		if err := ValidateConfig(config); err == nil {

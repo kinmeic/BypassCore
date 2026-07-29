@@ -1,6 +1,6 @@
-// Package inbound implements transparent proxy and DNS listeners. Transparent
-// connections are dispatched to the router→outbound flow; DNS queries are
-// answered by the configured internal DNS client.
+// Package inbound implements transparent proxy, SOCKS5, and DNS listeners.
+// Proxy connections are dispatched to the router→outbound flow; DNS queries
+// are answered by the configured internal DNS client.
 //
 // This replaces xray-core's dokodemo-door inbound + app/proxyman/inbound/worker.
 package inbound
@@ -19,9 +19,12 @@ type DNSRuleConfig struct {
 type Config struct {
 	// Tag is the inbound identifier (e.g. "tcp_redir").
 	Tag string `json:"tag"`
-	// Type is the listener type: "tproxy", "redirect", or "dns".
+	// Type is the listener type: "tproxy", "redirect", "socks" (or "socks5"),
+	// or "dns".
 	//   "redirect": iptables REDIRECT mode, uses SO_ORIGINAL_DST.
 	//   "tproxy":   uses IP_TRANSPARENT and the socket's local address.
+	//   "socks":    SOCKS5 TCP CONNECT server. It defaults to loopback and
+	//               currently supports the no-authentication method.
 	Type string `json:"type"`
 	// Listen is the bind address (e.g. "0.0.0.0").
 	Listen string `json:"listen"`

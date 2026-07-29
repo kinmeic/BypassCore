@@ -142,6 +142,27 @@ func TestValidateProxyRequiresUpstream(t *testing.T) {
 	if err := m4.Validate(); err == nil {
 		t.Fatal("Validate should reject a non-integer UDP packet limit")
 	}
+	m5 := NewManager(&Config{Outbounds: []*Outbound{{
+		Tag: "https", Mode: ModeProxy,
+		Upstream: &UpstreamConfig{Protocol: "https", Server: "proxy.example:443", Settings: map[string]any{"username": "user", "password": "pass"}},
+	}}})
+	if err := m5.Validate(); err != nil {
+		t.Fatalf("Validate should accept HTTPS CONNECT: %v", err)
+	}
+	m6 := NewManager(&Config{Outbounds: []*Outbound{{
+		Tag: "bad-https", Mode: ModeProxy,
+		Upstream: &UpstreamConfig{Protocol: "https", Server: "proxy.example:443", Settings: map[string]any{"insecureSkipVerify": "yes"}},
+	}}})
+	if err := m6.Validate(); err == nil {
+		t.Fatal("Validate should reject invalid HTTPS settings")
+	}
+	m7 := NewManager(&Config{Outbounds: []*Outbound{{
+		Tag: "typo-https", Mode: ModeProxy,
+		Upstream: &UpstreamConfig{Protocol: "https", Server: "proxy.example:443", Settings: map[string]any{"enableHttp2": true}},
+	}}})
+	if err := m7.Validate(); err == nil {
+		t.Fatal("Validate should reject unknown HTTPS settings")
+	}
 }
 
 func TestValidateRejectsDuplicateTags(t *testing.T) {

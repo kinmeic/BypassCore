@@ -2,9 +2,11 @@ package outbound
 
 import (
 	"context"
+	"crypto/x509"
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -225,18 +227,32 @@ func (m *Manager) Validate() error {
 			return errors.New("proxy outbound ", tag, " requires upstream.server")
 		}
 		if h.ob.Mode == ModeProxy {
-			protocol := strings.TrimSpace(h.ob.Upstream.Protocol)
-			if protocol != "" && !strings.EqualFold(protocol, "socks") {
-				return errors.New("proxy outbound ", tag, " only supports upstream.protocol=socks")
+			protocol := strings.ToLower(strings.TrimSpace(h.ob.Upstream.Protocol))
+			if protocol == "" {
+				protocol = "socks"
 			}
-			if _, _, err := net.SplitHostPort(h.ob.Upstream.Server); err != nil {
+			host, port, err := net.SplitHostPort(h.ob.Upstream.Server)
+			if err != nil {
 				return errors.New("proxy outbound ", tag, " has invalid upstream.server").Base(err)
 			}
-			if raw, exists := h.ob.Upstream.Settings["udpMaxPacketBytes"]; exists {
-				value, ok := integerSetting(raw)
-				if !ok || value < 512 || value > 65245 {
-					return errors.New("proxy outbound ", tag, " udpMaxPacketBytes must be an integer between 512 and 65245")
+			portNumber, portErr := strconv.ParseUint(port, 10, 16)
+			if strings.TrimSpace(host) == "" || portErr != nil || portNumber == 0 {
+				return errors.New("proxy outbound ", tag, " upstream.server must contain a host and port between 1 and 65535")
+			}
+			switch protocol {
+			case "socks", "socks5":
+				if raw, exists := h.ob.Upstream.Settings["udpMaxPacketBytes"]; exists {
+					value, ok := integerSetting(raw)
+					if !ok || value < 512 || value > 65245 {
+						return errors.New("proxy outbound ", tag, " udpMaxPacketBytes must be an integer between 512 and 65245")
+					}
 				}
+			case "https":
+				if err := validateHTTPSProxySettings(tag, h.ob.Upstream.Settings); err != nil {
+					return err
+				}
+			default:
+				return errors.New("proxy outbound ", tag, " supports upstream.protocol=socks or https")
 			}
 		}
 		if h.ob.Mode == ModeWireGuard {
@@ -246,6 +262,61 @@ func (m *Manager) Validate() error {
 		}
 		if h.ob.Bind != nil && h.ob.Bind.LocalIP != "" && net.ParseIP(h.ob.Bind.LocalIP) == nil {
 			return errors.New("outbound ", tag, " has invalid bind.localIP")
+		}
+	}
+	return nil
+}
+
+func validateHTTPSProxySettings(tag string, settings map[string]any) error {
+	prefix := "https proxy outbound " + tag + " "
+	allowed := map[string]struct{}{
+		"username": {}, "password": {}, "tlsServerName": {}, "caFile": {},
+		"insecureSkipVerify": {}, "enableHTTP2": {}, "connectTimeoutMs": {},
+	}
+	for key := range settings {
+		if _, ok := allowed[key]; !ok {
+			return errors.New(prefix, "contains unsupported setting ", key)
+		}
+	}
+	for _, key := range []string{"username", "password", "tlsServerName", "caFile"} {
+		if raw, exists := settings[key]; exists {
+			if _, ok := raw.(string); !ok {
+				return errors.New(prefix, key, " must be a string")
+			}
+		}
+	}
+	username, _ := settings["username"].(string)
+	password, _ := settings["password"].(string)
+	if strings.Contains(username, ":") {
+		return errors.New(prefix, "username must not contain ':'")
+	}
+	if username == "" && password != "" {
+		return errors.New(prefix, "username is required when password is set")
+	}
+	for _, key := range []string{"insecureSkipVerify", "enableHTTP2"} {
+		if raw, exists := settings[key]; exists {
+			if _, ok := raw.(bool); !ok {
+				return errors.New(prefix, key, " must be a boolean")
+			}
+		}
+	}
+	if raw, exists := settings["connectTimeoutMs"]; exists {
+		value, ok := integerSetting(raw)
+		if !ok || value < 1 || value > 120000 {
+			return errors.New(prefix, "connectTimeoutMs must be an integer between 1 and 120000")
+		}
+	}
+	if raw, exists := settings["udpMaxPacketBytes"]; exists {
+		return errors.New(prefix, "does not support udpMaxPacketBytes (HTTPS CONNECT is TCP-only): ", raw)
+	}
+	if raw, exists := settings["caFile"]; exists && strings.TrimSpace(raw.(string)) != "" {
+		pem, err := os.ReadFile(raw.(string))
+		if err != nil {
+			return errors.New(prefix, "cannot read caFile").Base(err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return errors.New(prefix, "caFile contains no certificates")
 		}
 	}
 	return nil

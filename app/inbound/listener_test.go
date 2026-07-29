@@ -56,6 +56,11 @@ func TestSameListenerBindingUsesEffectiveAddress(t *testing.T) {
 	if !SameListenerBinding(left, right) {
 		t.Fatal("bracketed IPv6 address was treated as a binding change")
 	}
+	left = &Config{Type: "socks", Port: 1081, Network: "tcp"}
+	right = &Config{Type: "SOCKS", Listen: "127.0.0.1", Port: 1081}
+	if !SameListenerBinding(left, right) {
+		t.Fatal("equivalent SOCKS5 defaults were treated as a binding change")
+	}
 }
 
 func TestListenerReloadAdoptsNewConfig(t *testing.T) {

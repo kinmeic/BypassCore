@@ -7,9 +7,17 @@
 ### outbound 描述符
 - `direct` / `block` — 直连 / 阻断
 - `wan1` / `wan2` — 多 WAN，绑定到 en0/en1 接口和本地 IP
-- `proxy` — 经 trojan 代理转发
+- `proxy` — 经本地 SOCKS5 上游转发
+- `caddy-exit` — 经远端 Caddy `forward_proxy` 的 HTTPS CONNECT 出口
+
+### inbound
+- `caddy-forward` — 仅监听本机的 SOCKS5 TCP CONNECT，可作为 Caddy
+  `forward_proxy` 的 `upstream socks5://127.0.0.1:1081`
+- `tcp_redir` / `udp_tproxy` — 透明代理流量入口
+- `dns-in` — 本地 UDP/TCP DNS 服务
 
 ### routing 规则
+- `inboundTag: caddy-forward` + `domain:example.com` — 选择 `caddy-exit`
 - `domain:cn` / `geosite:google` — 域名匹配
 - `geoip:private` — GeoIP 匹配私网地址段
 - `port: 80,443` — 端口匹配

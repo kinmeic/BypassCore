@@ -11,7 +11,27 @@ import (
 	appinbound "github.com/eugene/bypasscore/app/inbound"
 	appoutbound "github.com/eugene/bypasscore/app/outbound"
 	"github.com/eugene/bypasscore/app/router"
+	"github.com/eugene/bypasscore/proxy/httpconnect"
 )
+
+func TestRegisterDialerFactorySelectsHTTPSConnect(t *testing.T) {
+	registerDialerFactory()
+	manager := appoutbound.NewManager(&appoutbound.Config{Outbounds: []*appoutbound.Outbound{{
+		Tag:  "caddy-exit",
+		Mode: appoutbound.ModeProxy,
+		Upstream: &appoutbound.UpstreamConfig{
+			Protocol: "https",
+			Server:   "exit.example.com:443",
+		},
+	}}})
+	defer manager.Close()
+	if err := manager.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := manager.GetDialer("caddy-exit").(*httpconnect.Handler); !ok {
+		t.Fatal("HTTPS proxy outbound did not create an HTTP CONNECT dialer")
+	}
+}
 
 func TestValidateRoutingTargetsRejectsUnknownOutbound(t *testing.T) {
 	ohm := appoutbound.NewManager(&appoutbound.Config{Outbounds: []*appoutbound.Outbound{

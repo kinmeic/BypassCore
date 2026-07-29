@@ -15,8 +15,8 @@ import (
 	"github.com/eugene/bypasscore/common/session"
 )
 
-// Listener is a transparent proxy listener supporting both TCP (redirect/tproxy)
-// and UDP (tproxy). The network config field determines which protocols to listen on.
+// Listener accepts transparent TCP/UDP traffic and explicit SOCKS5 TCP
+// connections. The network config field determines which protocols to listen on.
 type Listener struct {
 	cfg         *Config
 	dispatcher  *dispatcher.Dispatcher
@@ -148,7 +148,7 @@ func normalizedInboundListen(cfg *Config) string {
 	value := strings.Trim(strings.TrimSpace(cfg.Listen), "[]")
 	if value == "" {
 		typ := normalizedInboundType(cfg.Type)
-		if typ == "dns" || typ == "dot" || typ == "doh" {
+		if typ == "dns" || typ == "dot" || typ == "doh" || typ == "socks" {
 			return "127.0.0.1"
 		}
 	}
@@ -159,6 +159,9 @@ func normalizedInboundType(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
 	if value == "" {
 		return "redirect"
+	}
+	if value == "socks5" {
+		return "socks"
 	}
 	return value
 }
@@ -231,12 +234,9 @@ func (l *Listener) startLocked() error {
 	l.connMu.Lock()
 	l.activeConns = make(map[net.Conn]struct{})
 	l.connMu.Unlock()
-	typeCfg := strings.ToLower(strings.TrimSpace(l.cfg.Type))
-	if typeCfg == "" {
-		typeCfg = "redirect"
-	}
-	if typeCfg != "redirect" && typeCfg != "tproxy" {
-		return errors.New("inbound: type must be redirect or tproxy")
+	typeCfg := normalizedInboundType(l.cfg.Type)
+	if typeCfg != "redirect" && typeCfg != "tproxy" && typeCfg != "socks" {
+		return errors.New("inbound: type must be redirect, tproxy, or socks")
 	}
 	// Keep normalized runtime state separate from the source configuration.
 	// The latter is compared during SIGHUP reload and must remain immutable.
@@ -251,6 +251,9 @@ func (l *Listener) startLocked() error {
 	}
 	if wantUDP && typeCfg != "tproxy" {
 		return errors.New("inbound: UDP requires type=tproxy")
+	}
+	if typeCfg == "socks" && (!wantTCP || wantUDP) {
+		return errors.New("inbound: SOCKS5 requires network=tcp")
 	}
 
 	if wantTCP {
@@ -368,26 +371,39 @@ func (l *Listener) acceptLoop() {
 			l.health.setComponent(l.inboundTag(), "tcp", "running", nil, false)
 			degraded = false
 		}
+		// Register the accepted connection before launching its goroutine. This
+		// closes the race where Close could clear activeConns after Accept but
+		// before handleConn registered itself, leaving shutdown blocked on an
+		// untracked SOCKS handshake or transparent flow.
+		l.connMu.Lock()
+		if l.activeConns == nil {
+			l.connMu.Unlock()
+			_ = conn.Close()
+			return
+		}
+		l.activeConns[conn] = struct{}{}
+		l.connMu.Unlock()
 		l.wg.Add(1)
 		go l.handleConn(conn)
 	}
 }
 
-// handleConn recovers the original destination and dispatches.
+// handleConn reads an explicit SOCKS5 target or recovers a transparent
+// connection's original destination, then dispatches it.
 func (l *Listener) handleConn(conn net.Conn) {
 	defer l.wg.Done()
+	defer func() {
+		l.connMu.Lock()
+		delete(l.activeConns, conn)
+		l.connMu.Unlock()
+	}()
 
-	// Track the connection so Close() can force-close it to unblock Bridge.
-	l.connMu.Lock()
-	if l.activeConns != nil {
-		l.activeConns[conn] = struct{}{}
-		defer func() {
-			l.connMu.Lock()
-			delete(l.activeConns, conn)
-			l.connMu.Unlock()
-		}()
+	if l.inboundType == "socks" {
+		if err := l.handleSOCKS5Conn(conn); err != nil {
+			errors.LogDebugInner(context.Background(), err, "SOCKS5 inbound connection failed")
+		}
+		return
 	}
-	l.connMu.Unlock()
 
 	var dest bcnet.Destination
 	var err error

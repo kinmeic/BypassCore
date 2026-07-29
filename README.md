@@ -8,6 +8,8 @@ domain through sniffing, match routing rules, and forward through an outbound.
 
 - Transparent inbound: TCP REDIRECT (`SO_ORIGINAL_DST`) and UDP TPROXY
   (`IP_TRANSPARENT` + `IP_RECVORIGDSTADDR`)
+- SOCKS5 inbound: a local no-authentication TCP CONNECT endpoint for Caddy
+  `forward_proxy`, preserving the requested destination for routing
 - TLS/HTTP/QUIC sniffing: recover TLS SNI, HTTP Host, or QUIC Initial SNI from
   IP-only connections so domain rules also work for transparent traffic
 - Rule matching by domain, IP (CIDR + GeoIP), port, network, protocol,
@@ -15,7 +17,8 @@ domain through sniffing, match routing rules, and forward through an outbound.
 - GeoData rules with `geosite:` and `geoip:`, loading `geoip.dat` and
   `geosite.dat`
 - Outbounds: `freedom` direct connections with source-IP/interface binding,
-  `blackhole`, a SOCKS5 `proxy`, and an in-process userspace WireGuard client
+  `blackhole`, SOCKS5 or HTTPS CONNECT `proxy`, and an in-process userspace
+  WireGuard client
 - DNS subsystem with multiple upstreams, caching, domain routing, IP filtering,
   UDP, TCP, DoT (RFC 7858), and DoH (RFC 8484)
 - A local UDP/TCP DNS listening service with routed A/AAAA and raw
@@ -93,11 +96,105 @@ router.PickRoute → outboundTag
 outbound dialer:
   ├─ freedom:  direct net.Dial with source-IP/interface binding
   ├─ blackhole: drop
-  ├─ proxy:    SOCKS5 client → 127.0.0.1:<naiveproxy_port>
+  ├─ proxy/socks: SOCKS5 client → 127.0.0.1:<naiveproxy_port>
+  ├─ proxy/https: TLS + HTTP CONNECT → remote Caddy forward_proxy
   └─ wireguard: userspace WireGuard device + userspace TCP/IP stack
   ↓
 transport.Bridge (bidirectional copy)
 ```
+
+## SOCKS5 inbound and Caddy
+
+BypassCore can expose a loopback-only SOCKS5 TCP CONNECT inbound. Caddy handles
+public TLS, HTTP/2/3, and authentication, while BypassCore selects the outbound:
+
+```json
+{"tag":"caddy-forward","type":"socks","listen":"127.0.0.1","port":1081,"network":"tcp"}
+```
+
+Use it as the Caddy `forward_proxy` upstream:
+
+```caddyfile
+example.com:443 {
+    forward_proxy {
+        basic_auth user password
+        upstream socks5://127.0.0.1:1081
+    }
+}
+```
+
+The SOCKS destination domain/IP and port are routed directly, so `domain`,
+`ip`, `port`, and `inboundTag` rules work without payload sniffing. An omitted
+`listen` safely defaults to `127.0.0.1`. The inbound currently implements
+no-authentication TCP `CONNECT` only, not `BIND` or `UDP ASSOCIATE`; keep it on
+a trusted local interface and authenticate public clients at Caddy.
+
+### Rule-selected remote Caddy HTTPS outbound
+
+HTTPS CONNECT is a normal tagged outbound, not a global upstream. The ingress
+Caddy hands destinations to the local SOCKS5 inbound, and only matching rules
+select the second Caddy:
+
+```json
+{
+  "outbounds": [
+    {"tag":"direct","mode":"freedom"},
+    {
+      "tag":"caddy-exit",
+      "mode":"proxy",
+      "upstream":{
+        "protocol":"https",
+        "server":"exit.example.com:443",
+        "settings":{
+          "username":"upstream-user",
+          "password":"upstream-password",
+          "tlsServerName":"exit.example.com",
+          "enableHTTP2":true
+        }
+      }
+    }
+  ],
+  "routing":{
+    "finalOutboundTag":"direct",
+    "rules":[
+      {
+        "inboundTag":["caddy-forward"],
+        "domain":["domain:example.com"],
+        "outboundTag":"caddy-exit"
+      }
+    ]
+  }
+}
+```
+
+The exit Caddy uses matching credentials:
+
+```caddyfile
+exit.example.com:443 {
+    forward_proxy {
+        basic_auth upstream-user upstream-password
+    }
+}
+```
+
+The outbound verifies system roots and the certificate hostname by default,
+requires TLS 1.2 or newer, and supports HTTP/1.1 CONNECT plus reusable HTTP/2
+CONNECT via ALPN. `caFile` adds a private CA. `insecureSkipVerify` is an
+explicit test-only escape hatch. HTTPS CONNECT is TCP-only; route UDP to
+SOCKS5, WireGuard, freedom, or blackhole instead.
+
+This is a standard Go TLS + HTTP CONNECT client, not a NaïveProxy client. It
+does not reproduce Chromium's TLS fingerprint, Naïve payload/HEADERS/RST_STREAM
+padding, HTTP/3, or CONNECT Fast Open. It remains interoperable with a
+Naïve-capable forwardproxy fork, but without the `padding` negotiation header
+that second hop operates as an ordinary unpadded CONNECT tunnel.
+
+Likewise, merely configuring `upstream` on a Naïve-capable Caddy
+`forward_proxy` does not carry client-to-Caddy padding into the
+Caddy-to-upstream hop. The current Caddy decodes inbound padding, while its
+HTTPS upstream dialer creates a new ordinary CONNECT request without a
+`padding` header. Naïve padding is negotiated independently on every hop and
+must be implemented by that hop's client.
 
 ## Outbound model
 
@@ -108,12 +205,14 @@ Each outbound is a descriptor with optional binding metadata:
 | `freedom` | — | — | Direct connection |
 | `freedom` | interface + localIP | — | Multi-WAN routing (wan1/wan2) |
 | `blackhole` | — | — | Drop the connection |
-| `proxy` | — | SOCKS server | SOCKS5 → local naiveproxy |
+| `proxy` | — | SOCKS5 server | SOCKS5 → local naiveproxy/sing-box |
+| `proxy` | — | HTTPS proxy | TLS + HTTP/1.1 or HTTP/2 CONNECT → Caddy |
 | `wireguard` | — | WireGuard settings | Client-only userspace WireGuard tunnel |
 
 ```json
 {"tag":"wan1","mode":"freedom","bind":{"interface":"en0","localIP":"192.168.1.2"}}
 {"tag":"proxy","mode":"proxy","upstream":{"protocol":"socks","server":"127.0.0.1:1080","settings":{"udpMaxPacketBytes":8192}}}
+{"tag":"caddy-exit","mode":"proxy","upstream":{"protocol":"https","server":"exit.example.com:443","settings":{"username":"upstream-user","password":"upstream-password","tlsServerName":"exit.example.com","enableHTTP2":true}}}
 {"tag":"wg","mode":"wireguard","wireguard":{"secretKey":"<base64>","publicKey":"<base64>","address":["10.0.0.2/32"],"peers":[{"publicKey":"<base64>","endpoint":"vpn.example.com:51820","allowedIPs":["0.0.0.0/0","::/0"],"preSharedKey":"<base64>","keepAlive":25}],"mtu":1420}}
 ```
 
@@ -365,8 +464,9 @@ lifetime.
 ## Configuration
 
 See `examples/config.example.json` for a complete configuration containing
-direct, blocked, multi-WAN, and proxy outbounds, TCP REDIRECT and UDP TPROXY
-inbounds, a local UDP/TCP DNS inbound, routing, DNS, and Observatory settings.
+direct, blocked, multi-WAN, and proxy outbounds, SOCKS5, TCP REDIRECT and UDP
+TPROXY inbounds, a local UDP/TCP DNS inbound, routing, DNS, and Observatory
+settings.
 
 ## GeoData files
 
@@ -376,7 +476,7 @@ rules, download them into the working directory or `$BYPASSCORE_ASSETS` from
 
 ## Project structure
 
-The main packages are `app/inbound` (transparent-proxy and DNS listeners),
+The main packages are `app/inbound` (SOCKS5, transparent-proxy, and DNS listeners),
 `app/dispatcher`, `app/dialer`,
 `app/outbound`, `app/router`, `app/observatory`, `app/dns`, and
 `app/dnsnftset`; protocol

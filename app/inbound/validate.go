@@ -26,10 +26,7 @@ func ValidateConfig(cfg *Config) error {
 	if host := strings.Trim(strings.TrimSpace(cfg.Listen), "[]"); host != "" && net.ParseIP(host) == nil {
 		return errors.New("inbound listen must be an IP address")
 	}
-	typ := strings.ToLower(strings.TrimSpace(cfg.Type))
-	if typ == "" {
-		typ = "redirect"
-	}
+	typ := normalizedInboundType(cfg.Type)
 	wantTCP, wantUDP, err := parseInboundNetworks(cfg.Network)
 	if err != nil {
 		return err
@@ -80,8 +77,15 @@ func ValidateConfig(cfg *Config) error {
 				return err
 			}
 		}
+	case "socks":
+		if !wantTCP || wantUDP {
+			return errors.New("SOCKS5 inbound requires network=tcp")
+		}
+		if cfg.Sniffing {
+			return errors.New("SOCKS5 inbound does not use sniffing; the requested destination is routed directly")
+		}
 	default:
-		return errors.New("inbound type must be redirect, tproxy, dns, dot, or doh")
+		return errors.New("inbound type must be redirect, tproxy, socks/socks5, dns, dot, or doh")
 	}
 	return nil
 }
