@@ -1,7 +1,9 @@
 // BypassCore CLI: load config, then either test a routing decision
 // (-test "tcp:host:port"), resolve a domain (-resolve "domain"), measure a TCP
 // handshake (-tcp-probe "host:port"), run an observatory probe (-observe), or
-// run as a daemon (-run).
+// run as a daemon (-run). The install/uninstall subcommands manage the system
+// service (systemd, procd, launchd, Windows SCM), and -fmt normalizes the
+// config file's JSON formatting.
 package main
 
 import (
@@ -66,6 +68,15 @@ var commit = "unknown"
 var buildDate = "unknown"
 
 func main() {
+	// When started by the Windows Service Control Manager, run under SCM
+	// control instead of parsing CLI flags. No-op on other platforms.
+	if handled, err := runAsPlatformService(); handled {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
@@ -73,7 +84,16 @@ func main() {
 }
 
 func run() error {
+	// Subcommands that do not need the config loaded up front.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "install", "uninstall":
+			return runServiceCommand(os.Args[1], os.Args[2:])
+		}
+	}
 	configPath := flag.String("config", "examples/config.example.json", "path to config file")
+	fmtConfig := flag.Bool("fmt", false, "format the config file to canonical two-space JSON and print to stdout")
+	fmtWrite := flag.Bool("w", false, "with -fmt, write the formatted config back to the file in place")
 	testDest := flag.String("test", "", `test a routing decision, e.g. "tcp:www.google.com:443"`)
 	resolve := flag.String("resolve", "", `resolve a domain via DNS, e.g. "example.com"`)
 	observe := flag.Bool("observe", false, "run a single observatory probe round")
@@ -134,6 +154,9 @@ func run() error {
 			return err
 		}
 		return writeKeyResult(*jsonOutput, map[string]string{"preSharedKey": wgkey.Encode(key)})
+	}
+	if *fmtConfig {
+		return formatConfig(*configPath, *fmtWrite, os.Stdout)
 	}
 
 	cfg, configHash, err := loadConfigAndHash(*configPath)
