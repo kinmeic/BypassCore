@@ -85,14 +85,6 @@ func detectServicePlatform() (servicePlatform, error) {
 	}
 }
 
-// defaultServiceConfigPath is the config path the installed service runs with.
-func defaultServiceConfigPath() string {
-	if runtime.GOOS == "windows" {
-		return filepath.Join(programDataDir(), defaultServiceName, "config.json")
-	}
-	return filepath.Join("/etc", defaultServiceName, "config.json")
-}
-
 func programDataDir() string {
 	if dir := os.Getenv("ProgramData"); dir != "" {
 		return dir

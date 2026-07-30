@@ -6,6 +6,7 @@ import (
 	"context"
 	"flag"
 	"os"
+	"path/filepath"
 	"time"
 
 	"golang.org/x/sys/windows/svc"
@@ -34,6 +35,11 @@ func windowsServiceName() string {
 		return name
 	}
 	return defaultServiceName
+}
+
+// defaultServiceConfigPath is the config path the installed service runs with.
+func defaultServiceConfigPath() string {
+	return filepath.Join(programDataDir(), defaultServiceName, "config.json")
 }
 
 type windowsService struct{}
