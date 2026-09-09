@@ -86,7 +86,7 @@ func (l *Listener) handleSOCKS5Conn(client net.Conn) error {
 	if err := writeSOCKS5Reply(client, socks5ReplySucceeded, outbound.LocalAddr()); err != nil {
 		return errors.New("write SOCKS5 success reply").Base(err)
 	}
-	return transport.Bridge(client, outbound)
+	return transport.BridgeWithIdleTimeout(client, outbound, l.currentTCPIdleTimeout())
 }
 
 func negotiateSOCKS5NoAuth(conn net.Conn) error {

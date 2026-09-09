@@ -13,6 +13,7 @@ import (
 	"github.com/eugene/bypasscore/common/errors"
 	bcnet "github.com/eugene/bypasscore/common/net"
 	"github.com/eugene/bypasscore/common/session"
+	"github.com/eugene/bypasscore/transport"
 )
 
 // Listener accepts transparent TCP/UDP traffic and explicit SOCKS5 TCP
@@ -38,6 +39,10 @@ type Listener struct {
 	state      listenerState
 	runtimeTag atomic.Pointer[string]
 	health     *healthTracker
+
+	// tcpIdleTimeout stores nanoseconds applied to established TCP tunnels;
+	// zero disables idle eviction. Reloadable without rebinding sockets.
+	tcpIdleTimeout atomic.Int64
 }
 
 type listenerState uint8
@@ -119,6 +124,10 @@ func (l *Listener) PrepareReload(cfg *Config) (func() error, error) {
 			return nil, err
 		}
 	}
+	tcpIdleTimeout, err := tcpIdleTimeoutFromConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
 	return func() error {
 		l.stateMu.Lock()
 		defer l.stateMu.Unlock()
@@ -129,6 +138,7 @@ func (l *Listener) PrepareReload(cfg *Config) (func() error, error) {
 		if l.udpListener != nil {
 			l.udpListener.setLimits(limits)
 		}
+		l.tcpIdleTimeout.Store(int64(tcpIdleTimeout))
 		l.cfg = cfg
 		return nil
 	}, nil
@@ -241,6 +251,11 @@ func (l *Listener) startLocked() error {
 	// Keep normalized runtime state separate from the source configuration.
 	// The latter is compared during SIGHUP reload and must remain immutable.
 	l.inboundType = typeCfg
+	tcpIdleTimeout, err := tcpIdleTimeoutFromConfig(l.cfg)
+	if err != nil {
+		return err
+	}
+	l.tcpIdleTimeout.Store(int64(tcpIdleTimeout))
 
 	if l.cfg.Port < 1 || l.cfg.Port > 65535 {
 		return errors.New("inbound: port must be between 1 and 65535")
@@ -426,9 +441,16 @@ func (l *Listener) handleConn(conn net.Conn) {
 		Tag:    l.inboundTag(),
 	})
 	ctx = session.ContextWithContent(ctx, new(session.Content))
+	ctx = transport.ContextWithConnIdleTimeout(ctx, l.currentTCPIdleTimeout())
 
 	// Dispatch blocks until the connection is fully proxied.
 	if err := l.dispatcher.Dispatch(ctx, conn, dest); err != nil {
 		errors.LogErrorInner(context.Background(), err, "inbound dispatch failed for ", dest.String())
 	}
+}
+
+// currentTCPIdleTimeout returns the idle eviction timeout applied to newly
+// established TCP tunnels. A zero duration disables eviction.
+func (l *Listener) currentTCPIdleTimeout() time.Duration {
+	return time.Duration(l.tcpIdleTimeout.Load())
 }

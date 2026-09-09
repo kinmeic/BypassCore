@@ -72,6 +72,9 @@ func ValidateConfig(cfg *Config) error {
 		if wantUDP && typ != "tproxy" {
 			return errors.New("inbound: UDP requires type=tproxy")
 		}
+		if _, err := tcpIdleTimeoutFromConfig(cfg); err != nil {
+			return err
+		}
 		if wantUDP {
 			if _, err := udpResourceLimitsFromConfig(cfg); err != nil {
 				return err
@@ -83,6 +86,9 @@ func ValidateConfig(cfg *Config) error {
 		}
 		if cfg.Sniffing {
 			return errors.New("SOCKS5 inbound does not use sniffing; the requested destination is routed directly")
+		}
+		if _, err := tcpIdleTimeoutFromConfig(cfg); err != nil {
+			return err
 		}
 	default:
 		return errors.New("inbound type must be redirect, tproxy, socks/socks5, dns, dot, or doh")

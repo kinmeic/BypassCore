@@ -96,7 +96,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, conn net.Conn, dest bcnet.Des
 			result = "default"
 		}
 		commonmetrics.Inc("bypasscore_route_decisions_total", "outbound", outTag, "result", result)
-		err = transport.Bridge(conn, outbound)
+		err = transport.BridgeWithIdleTimeout(conn, outbound, transport.ConnIdleTimeoutFromContext(ctx))
 		_ = conn.Close()
 		_ = outbound.Close()
 		return err
@@ -147,8 +147,8 @@ func (d *Dispatcher) bridge(ctx context.Context, inbound net.Conn, dialer dialer
 		return errors.New("outbound dial failed for ", dest.String()).Base(err)
 	}
 
-	// Bidirectional copy until either side closes.
-	err = transport.Bridge(inbound, outbound)
+	// Bidirectional copy until either side closes or the tunnel goes idle.
+	err = transport.BridgeWithIdleTimeout(inbound, outbound, transport.ConnIdleTimeoutFromContext(ctx))
 	inbound.Close()
 	outbound.Close()
 	return err

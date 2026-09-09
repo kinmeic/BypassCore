@@ -93,4 +93,9 @@ type Config struct {
 	// UDPSessionIdleTimeoutSeconds controls inactive flow eviction. Zero uses
 	// 120 seconds.
 	UDPSessionIdleTimeoutSeconds int `json:"udpSessionIdleTimeoutSeconds,omitempty"`
+	// TCPIdleTimeoutSeconds closes an established TCP tunnel that carried no
+	// traffic in either direction for this long. Zero uses 300 seconds; a
+	// negative value disables idle eviction. This field applies to the
+	// redirect, tproxy, and socks types.
+	TCPIdleTimeoutSeconds int `json:"tcpIdleTimeoutSeconds,omitempty"`
 }

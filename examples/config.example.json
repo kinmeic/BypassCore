@@ -76,7 +76,8 @@
       "type": "socks",
       "listen": "127.0.0.1",
       "port": 1081,
-      "network": "tcp"
+      "network": "tcp",
+      "tcpIdleTimeoutSeconds": 300
     },
     {
       "tag": "tcp_redir",

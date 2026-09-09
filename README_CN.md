@@ -118,6 +118,11 @@ SOCKS 请求携带的域名/IP和端口会直接成为路由目标，因此 `dom
 `BIND`、`UDP ASSOCIATE`；如需对外开放，应在 Caddy 层完成认证，且不要将该本地
 端口暴露到非可信网络。
 
+已建立的隧道在双向均无流量超过 `tcpIdleTimeoutSeconds` 后会被回收（默认 300
+秒，负数禁用），可自动清理前置 Caddy 在 upstream 上长期挂着的空闲连接，避免
+连接数与内存持续上涨。该设置同样适用于 `redirect`、`tproxy` 的 TCP 入站，且可通过
+SIGHUP 热重载修改。
+
 ### 按规则选择远端 Caddy HTTPS 出口
 
 HTTPS CONNECT 是一个普通 tagged outbound，而不是全局 upstream。入口 Caddy

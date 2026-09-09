@@ -102,6 +102,124 @@ func TestBridgeOneSidedEOFWithoutHalfCloseDrainsReverseData(t *testing.T) {
 	}
 }
 
+// TestBridgeIdleTimeoutEvictsSilentTunnel verifies a tunnel with no traffic
+// in either direction is closed after the idle timeout, and both bridge-side
+// conns are closed so the peers observe the eviction.
+func TestBridgeIdleTimeoutEvictsSilentTunnel(t *testing.T) {
+	a, peerA := net.Pipe()
+	b, peerB := net.Pipe()
+	defer peerA.Close()
+	defer peerB.Close()
+
+	done := make(chan error, 1)
+	go func() { done <- BridgeWithIdleTimeout(a, b, 50*time.Millisecond) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Bridge returned %v, want nil on idle eviction", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Bridge did not evict a silent tunnel")
+	}
+
+	if _, err := a.Write([]byte("x")); err == nil {
+		t.Error("bridge side a still writable after idle eviction")
+	}
+	if _, err := b.Write([]byte("x")); err == nil {
+		t.Error("bridge side b still writable after idle eviction")
+	}
+}
+
+// TestBridgeIdleTimeoutRefreshesOnActivity verifies traffic in one direction
+// keeps the whole tunnel alive (a one-way stream must not be evicted), and
+// eviction happens once traffic stops.
+func TestBridgeIdleTimeoutRefreshesOnActivity(t *testing.T) {
+	a, peerA := net.Pipe()
+	b, peerB := net.Pipe()
+	defer peerA.Close()
+	defer peerB.Close()
+
+	done := make(chan error, 1)
+	go func() { done <- BridgeWithIdleTimeout(a, b, 100*time.Millisecond) }()
+
+	stop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(30 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				if _, err := peerA.Write([]byte("k")); err != nil {
+					return
+				}
+			}
+		}
+	}()
+	go func() {
+		buf := make([]byte, 16)
+		for {
+			if _, err := peerB.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("Bridge evicted an active tunnel: %v", err)
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	close(stop)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Bridge returned %v, want nil on idle eviction", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Bridge did not evict after traffic stopped")
+	}
+}
+
+// TestBridgeDisabledIdleTimeoutKeepsSilentTunnel verifies a non-positive
+// timeout preserves the original wait-forever semantics.
+func TestBridgeDisabledIdleTimeoutKeepsSilentTunnel(t *testing.T) {
+	a, peerA := net.Pipe()
+	b, peerB := net.Pipe()
+	defer peerA.Close()
+	defer peerB.Close()
+
+	done := make(chan error, 1)
+	go func() { done <- BridgeWithIdleTimeout(a, b, 0) }()
+
+	select {
+	case err := <-done:
+		t.Fatalf("Bridge with disabled idle timeout returned early: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	_ = peerA.Close()
+	_ = peerB.Close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Bridge did not finish after peers closed")
+	}
+}
+
+func TestConnIdleTimeoutContext(t *testing.T) {
+	if got := ConnIdleTimeoutFromContext(t.Context()); got != DefaultConnIdleTimeout {
+		t.Fatalf("unset context: got %v, want default %v", got, DefaultConnIdleTimeout)
+	}
+	ctx := ContextWithConnIdleTimeout(t.Context(), 42*time.Second)
+	if got := ConnIdleTimeoutFromContext(ctx); got != 42*time.Second {
+		t.Fatalf("override context: got %v, want 42s", got)
+	}
+}
+
 // TestNewConnLink verifies the Link wrapper reads through the conn.
 func TestNewConnLink(t *testing.T) {
 	server, client := net.Pipe()

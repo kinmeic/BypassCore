@@ -129,6 +129,12 @@ The SOCKS destination domain/IP and port are routed directly, so `domain`,
 no-authentication TCP `CONNECT` only, not `BIND` or `UDP ASSOCIATE`; keep it on
 a trusted local interface and authenticate public clients at Caddy.
 
+Established tunnels are evicted after `tcpIdleTimeoutSeconds` without traffic
+in either direction (default 300, negative disables). This reaps the idle
+connections a fronting Caddy keeps pooled against the upstream instead of
+letting them accumulate. The setting also applies to `redirect` and `tproxy`
+TCP inbounds and can be changed by SIGHUP reload.
+
 ### Rule-selected remote Caddy HTTPS outbound
 
 HTTPS CONNECT is a normal tagged outbound, not a global upstream. The ingress
