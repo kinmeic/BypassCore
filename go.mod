@@ -2,7 +2,7 @@ module github.com/eugene/bypasscore
 
 go 1.26
 
-toolchain go1.26.5
+toolchain go1.26.6
 
 require (
 	github.com/google/nftables v0.3.0
