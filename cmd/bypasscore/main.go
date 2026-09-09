@@ -63,7 +63,7 @@ type Config struct {
 }
 
 // version is overridden by release builds with -ldflags=-X main.version=... .
-var version = "1.5.2"
+var version = "1.5.3"
 var commit = "unknown"
 var buildDate = "unknown"
 
