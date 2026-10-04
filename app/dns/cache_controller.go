@@ -40,11 +40,17 @@ type CacheController struct {
 	requestGroup  singleflight.Group
 	closeOnce     sync.Once
 	closeErr      error
+	closed        bool
+	done          chan struct{}
 }
 
 func (c *CacheController) Close() error {
 	c.closeOnce.Do(func() {
+		c.Lock()
+		c.closed = true
+		close(c.done)
 		_ = c.cacheCleanup.Close()
+		c.Unlock()
 		c.closeErr = c.pub.Close()
 	})
 	return c.closeErr
@@ -58,6 +64,7 @@ func NewCacheController(name string, disableCache bool, serveStale bool, serveEx
 		serveExpiredTTL: -int32(serveExpiredTTL),
 		ips:             make(map[string]*record),
 		pub:             pubsub.NewService(),
+		done:            make(chan struct{}),
 	}
 
 	c.cacheCleanup = &task.Periodic{
@@ -253,6 +260,11 @@ func (c *CacheController) flush(batch []migrationEntry) {
 }
 
 func (c *CacheController) updateRecord(req *dnsRequest, rep *IPRecord) {
+	select {
+	case <-c.done:
+		return
+	default:
+	}
 	rtt := time.Since(req.start)
 
 	switch req.reqType {
@@ -268,6 +280,10 @@ func (c *CacheController) updateRecord(req *dnsRequest, rep *IPRecord) {
 	}
 
 	c.Lock()
+	if c.closed {
+		c.Unlock()
+		return
+	}
 	lockWait := time.Since(req.start) - rtt
 
 	newRec := &record{}
@@ -302,6 +318,11 @@ func (c *CacheController) updateRecord(req *dnsRequest, rep *IPRecord) {
 	}
 
 	c.ips[req.domain] = newRec
+	// Starting cleanup under the lifecycle lock prevents a late response from
+	// restarting its timer after Close has stopped it.
+	if !c.serveStale || c.serveExpiredTTL != 0 {
+		common.Must(c.cacheCleanup.Start())
+	}
 	c.Unlock()
 
 	if pubRecord != nil {
@@ -313,9 +334,6 @@ func (c *CacheController) updateRecord(req *dnsRequest, rep *IPRecord) {
 
 	errors.LogInfo(context.Background(), c.name, " got answer: ", req.domain, " ", req.reqType, " -> ", rep.IP, ", rtt: ", rtt, ", lock: ", lockWait)
 
-	if !c.serveStale || c.serveExpiredTTL != 0 {
-		common.Must(c.cacheCleanup.Start())
-	}
 }
 
 func (c *CacheController) findRecords(domain string) *record {

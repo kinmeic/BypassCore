@@ -111,10 +111,11 @@ func decryptInitial(packet []byte) (int, []cryptoFragment, bool, error) {
 	}
 	pos += n
 	pnOffset := pos
-	end := pnOffset + int(packetLen)
-	if end > len(work) {
+	// Check before converting to int: OpenWrt also runs on 32-bit targets.
+	if packetLen > uint64(len(work)-pnOffset) {
 		return 0, nil, false, io.ErrUnexpectedEOF
 	}
+	end := pnOffset + int(packetLen)
 	if !initial {
 		return end, nil, false, nil
 	}
@@ -220,7 +221,7 @@ func parseInitialFrames(data []byte) ([]cryptoFragment, error) {
 			}
 			data = data[used:]
 			length, used, ok := readVarint(data)
-			if !ok || length > uint64(len(data)) {
+			if !ok || length > uint64(len(data)-used) {
 				return nil, io.ErrUnexpectedEOF
 			}
 			data = data[used:]

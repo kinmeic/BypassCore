@@ -3,6 +3,7 @@ package dns
 import (
 	"context"
 	"errors"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -75,5 +76,46 @@ func TestFindRecordsReturnsSnapshot(t *testing.T) {
 	}
 	if cache.findRecords("example.test.") != nil {
 		t.Fatal("expired cache entry was not removed")
+	}
+}
+
+type partialCachedNameserver struct{ cache *CacheController }
+
+func (s *partialCachedNameserver) getCacheController() *CacheController { return s.cache }
+func (s *partialCachedNameserver) sendQuery(_ context.Context, failures chan<- error, fqdn string, option dns_feature.IPOption) {
+	if option.IPv6Enable {
+		failures <- errors.New("AAAA exchange failed")
+	}
+	if option.IPv4Enable {
+		go func() {
+			time.Sleep(10 * time.Millisecond) // Failure arrives before A succeeds.
+			s.cache.updateRecord(&dnsRequest{reqType: dnsmessage.TypeA, domain: fqdn, start: time.Now()},
+				&IPRecord{IP: []bcnet.IP{{192, 0, 2, 1}}, Expire: time.Now().Add(time.Minute)})
+		}()
+	}
+}
+
+func TestFetchPreservesSuccessfulFamilyAfterOtherFamilyFails(t *testing.T) {
+	server := &partialCachedNameserver{cache: NewCacheController("partial", true, false, 0)}
+	defer server.cache.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer cancel()
+	got := doFetch(ctx, server, "example.test.", dns_feature.IPOption{IPv4Enable: true, IPv6Enable: true})
+	if got.error != nil || len(got.ips) != 1 || got.ips[0].String() != "192.0.2.1" || got.ttl < 50 {
+		t.Fatalf("partial lookup = %+v", got)
+	}
+}
+
+func TestCacheCloseRejectsLateResponsesAndNewQueries(t *testing.T) {
+	cache := NewCacheController("closed", false, false, 0)
+	_ = cache.Close()
+	cache.updateRecord(&dnsRequest{reqType: dnsmessage.TypeA, domain: "example.test.", start: time.Now()},
+		&IPRecord{IP: []bcnet.IP{{192, 0, 2, 1}}, Expire: time.Now().Add(time.Minute)})
+	if cache.findRecords("example.test.") != nil {
+		t.Fatal("late response repopulated a closed cache")
+	}
+	server := &partialCachedNameserver{cache: cache}
+	if _, _, err := queryIP(t.Context(), server, "example.test", dns_feature.IPOption{IPv4Enable: true}); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("lookup after Close = %v", err)
 	}
 }

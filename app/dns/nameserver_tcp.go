@@ -25,6 +25,8 @@ type TCPNameServer struct {
 	rawDialMu       sync.RWMutex
 	clientIP        bcnet.IP
 	idleConns       chan net.Conn
+	poolMu          sync.Mutex
+	activeConns     map[net.Conn]struct{}
 	closed          atomic.Bool
 }
 
@@ -55,6 +57,7 @@ func baseTCPNameServer(u *url.URL, prefix string, disableCache bool, serveStale 
 		destination:     dest,
 		clientIP:        clientIP,
 		idleConns:       make(chan net.Conn, defaultDNSMaxIdleTCPConnections),
+		activeConns:     make(map[net.Conn]struct{}),
 		rawDial: func(ctx context.Context, dest bcnet.Destination) (net.Conn, error) {
 			d := net.Dialer{}
 			return d.DialContext(ctx, "tcp", dest.NetAddr())
@@ -196,6 +199,8 @@ func exchangeRawTCP(ctx context.Context, query []byte, dial func(context.Context
 		return nil, err
 	}
 	defer conn.Close()
+	stopCancellation := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancellation()
 	deadline, ok := ctx.Deadline()
 	if !ok {
 		deadline = time.Now().Add(5 * time.Second)
@@ -232,7 +237,13 @@ func (s *TCPNameServer) exchangeTCP(ctx context.Context, query []byte, validate 
 			return nil, err
 		}
 		_ = conn.SetDeadline(deadline)
+		stopCancellation := context.AfterFunc(ctx, func() { _ = conn.Close() })
 		response, err := exchangeDNSMessage(conn, query)
+		if !stopCancellation() {
+			// The callback may still be closing conn; never return it to the pool.
+			s.releaseTCP(conn, false)
+			return nil, ctx.Err()
+		}
 		if err == nil && validate != nil {
 			err = validate(response)
 		}
@@ -272,22 +283,40 @@ func exchangeDNSMessage(conn net.Conn, query []byte) ([]byte, error) {
 }
 
 func (s *TCPNameServer) acquireTCP(ctx context.Context) (net.Conn, bool, error) {
+	s.poolMu.Lock()
 	if s.closed.Load() {
+		s.poolMu.Unlock()
 		return nil, false, net.ErrClosed
 	}
 	select {
 	case conn := <-s.idleConns:
+		s.activeConns[conn] = struct{}{}
+		s.poolMu.Unlock()
 		return conn, true, nil
 	default:
 	}
+	s.poolMu.Unlock()
 	conn, err := s.dial(ctx)
-	return conn, false, err
+	if err != nil {
+		return nil, false, err
+	}
+	s.poolMu.Lock()
+	defer s.poolMu.Unlock()
+	if s.closed.Load() {
+		_ = conn.Close()
+		return nil, false, net.ErrClosed
+	}
+	s.activeConns[conn] = struct{}{}
+	return conn, false, nil
 }
 
 func (s *TCPNameServer) releaseTCP(conn net.Conn, healthy bool) {
 	if conn == nil {
 		return
 	}
+	s.poolMu.Lock()
+	defer s.poolMu.Unlock()
+	delete(s.activeConns, conn)
 	if !healthy || s.closed.Load() {
 		_ = conn.Close()
 		return
@@ -301,6 +330,8 @@ func (s *TCPNameServer) releaseTCP(conn net.Conn, healthy bool) {
 }
 
 func (s *TCPNameServer) closeIdleConnections() {
+	s.poolMu.Lock()
+	defer s.poolMu.Unlock()
 	for {
 		select {
 		case conn := <-s.idleConns:
@@ -326,8 +357,18 @@ func writeDNSPayload(writer io.Writer, payload []byte) error {
 }
 
 func (s *TCPNameServer) Close() error {
+	s.poolMu.Lock()
 	if !s.closed.CompareAndSwap(false, true) {
+		s.poolMu.Unlock()
 		return nil
+	}
+	active := make([]net.Conn, 0, len(s.activeConns))
+	for conn := range s.activeConns {
+		active = append(active, conn)
+	}
+	s.poolMu.Unlock()
+	for _, conn := range active {
+		_ = conn.Close()
 	}
 	s.closeIdleConnections()
 	return s.cacheController.Close()

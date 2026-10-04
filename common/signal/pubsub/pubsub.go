@@ -57,8 +57,9 @@ func (s *Subscriber) IsClosed() bool { return s.done.Done() }
 // Service manages named subscriber groups and cleans up closed subscribers.
 type Service struct {
 	sync.RWMutex
-	subs  map[string][]*Subscriber
-	ctask *task.Periodic
+	subs   map[string][]*Subscriber
+	ctask  *task.Periodic
+	closed bool
 }
 
 // NewService creates a new pubsub Service.
@@ -129,9 +130,14 @@ func (s *Service) Subscribe(name string) *Subscriber {
 		topic:   name,
 	}
 	s.Lock()
+	if s.closed {
+		_ = sub.done.Close()
+		s.Unlock()
+		return sub
+	}
 	s.subs[name] = append(s.subs[name], sub)
-	s.Unlock()
 	_ = s.ctask.Start()
+	s.Unlock()
 	return sub
 }
 
@@ -148,8 +154,14 @@ func (s *Service) Publish(name string, message interface{}) {
 
 // Close stops background cleanup and releases subscriber references.
 func (s *Service) Close() error {
-	_ = s.ctask.Close()
 	s.Lock()
+	s.closed = true
+	_ = s.ctask.Close()
+	for _, subscribers := range s.subs {
+		for _, sub := range subscribers {
+			_ = sub.done.Close()
+		}
+	}
 	s.subs = make(map[string][]*Subscriber)
 	s.Unlock()
 	return nil

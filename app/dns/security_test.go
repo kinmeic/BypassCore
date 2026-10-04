@@ -3,9 +3,11 @@ package dns
 import (
 	"context"
 	"errors"
+	"math"
 	"net"
 	"net/url"
 	"testing"
+	"time"
 
 	bcnet "github.com/eugene/bypasscore/common/net"
 	dnsfeature "github.com/eugene/bypasscore/features/dns"
@@ -104,5 +106,74 @@ func TestUDPLocalURLParsesDestination(t *testing.T) {
 	classic := server.(*ClassicNameServer)
 	if classic.address.NetAddr() != "1.1.1.1:5353" {
 		t.Fatalf("destination = %s", classic.address.NetAddr())
+	}
+}
+
+func TestParseResponseForRequestFiltersAnswers(t *testing.T) {
+	req, payload := validDNSExchange(t)
+	var response dnsmessage.Message
+	if err := response.Unpack(payload); err != nil {
+		t.Fatal(err)
+	}
+	response.Answers = append(response.Answers,
+		dnsmessage.Resource{Header: dnsmessage.ResourceHeader{Name: dnsmessage.MustNewName("unrelated.example."), Class: dnsmessage.ClassINET, TTL: 1}, Body: &dnsmessage.AResource{A: [4]byte{6, 6, 6, 6}}},
+		dnsmessage.Resource{Header: dnsmessage.ResourceHeader{Name: req.msg.Questions[0].Name, Class: dnsmessage.ClassINET, TTL: 1}, Body: &dnsmessage.AAAAResource{AAAA: [16]byte{0x20, 1}}},
+		dnsmessage.Resource{Header: dnsmessage.ResourceHeader{Name: req.msg.Questions[0].Name, Class: dnsmessage.ClassCHAOS, TTL: 1}, Body: &dnsmessage.AResource{A: [4]byte{7, 7, 7, 7}}})
+	payload, err := response.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := parseResponseForRequest(payload, req)
+	if err != nil || len(record.IP) != 1 || record.IP[0].String() != "1.2.3.4" {
+		t.Fatalf("unrelated answers reached lookup: record=%v err=%v", record, err)
+	}
+	if time.Until(record.Expire) < 50*time.Second {
+		t.Fatal("unrelated answer changed the cache TTL")
+	}
+}
+
+func TestParseResponseForRequestFollowsUnorderedCNAMEChain(t *testing.T) {
+	req, payload := validDNSExchange(t)
+	var response dnsmessage.Message
+	if err := response.Unpack(payload); err != nil {
+		t.Fatal(err)
+	}
+	alias := dnsmessage.MustNewName("alias.example.")
+	response.Answers[0].Header.Name = alias
+	response.Answers = append(response.Answers, dnsmessage.Resource{
+		Header: dnsmessage.ResourceHeader{Name: req.msg.Questions[0].Name, Class: dnsmessage.ClassINET, TTL: 10},
+		Body:   &dnsmessage.CNAMEResource{CNAME: alias},
+	})
+	payload, err := response.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := parseResponseForRequest(payload, req)
+	if err != nil || len(record.IP) != 1 || record.IP[0].String() != "1.2.3.4" {
+		t.Fatalf("CNAME chain rejected: record=%v err=%v", record, err)
+	}
+	if time.Until(record.Expire) > 11*time.Second {
+		t.Fatal("CNAME TTL was ignored")
+	}
+}
+
+func TestParseResponseForRequestBoundsTTL(t *testing.T) {
+	req, payload := validDNSExchange(t)
+	var response dnsmessage.Message
+	if err := response.Unpack(payload); err != nil {
+		t.Fatal(err)
+	}
+	response.Answers[0].Header.TTL = math.MaxUint32
+	payload, err := response.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := parseResponseForRequest(payload, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, ttl, err := record.getIPs()
+	if err != nil || ttl <= 0 {
+		t.Fatalf("large TTL overflowed: %d, %v", ttl, err)
 	}
 }

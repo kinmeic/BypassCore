@@ -709,6 +709,14 @@ func (s *runtimeService) retireSnapshot(snapshot *runtimeSnapshot) {
 	if snapshot.closed.Load() {
 		return
 	}
+	// Register the detached snapshot before Close can collect the retired set.
+	// A reload may have swapped current just before shutdown takes s.mu.
+	s.mu.RLock()
+	if s.closed {
+		s.mu.RUnlock()
+		snapshot.forceClose()
+		return
+	}
 	s.retiredMu.Lock()
 	kept := s.retired[:0]
 	for _, retired := range s.retired {
@@ -723,6 +731,7 @@ func (s *runtimeService) retireSnapshot(snapshot *runtimeSnapshot) {
 		s.retired = s.retired[1:]
 	}
 	s.retiredMu.Unlock()
+	s.mu.RUnlock()
 	if victim != nil {
 		go victim.forceClose()
 	}
@@ -1197,6 +1206,10 @@ func resolveProbeHostThroughOutbound(ctx context.Context, host string, outboundD
 			errs = append(errs, err)
 			continue
 		}
+		if err = featdns.ValidateRawResponse(query, buffer[:count]); err != nil {
+			errs = append(errs, err)
+			continue
+		}
 		var response dnsmessage.Message
 		if err = response.Unpack(buffer[:count]); err != nil {
 			errs = append(errs, err)
@@ -1206,14 +1219,11 @@ func resolveProbeHostThroughOutbound(ctx context.Context, host string, outboundD
 			errs = append(errs, errors.New("outbound DNS returned an invalid response"))
 			continue
 		}
-		for _, records := range [][]dnsmessage.Resource{response.Answers, response.Additionals} {
-			for _, answer := range records {
-				if record, ok := answer.Body.(*dnsmessage.AResource); ok {
-					return net.IP(record.A[:]).String(), nil
-				}
-			}
+		if address, addressErr := probeIPv4Answer(&response, name); addressErr == nil {
+			return address, nil
+		} else {
+			errs = append(errs, addressErr)
 		}
-		errs = append(errs, errors.New("outbound DNS response has no IPv4 address"))
 	}
 	// Preserve every resolver's failure instead of only the last one: the last
 	// resolver is not necessarily the meaningful one (e.g. an IPv6 resolver on
@@ -1226,6 +1236,45 @@ func resolveProbeHostThroughOutbound(ctx context.Context, host string, outboundD
 		"(a peer handshake alone does not verify tunnel addresses or server forwarding; ",
 		"check Local Address, server peer AllowedIPs, IP forwarding, and NAT)",
 	).Base(errors.Combine(errs...))
+}
+
+func probeIPv4Answer(response *dnsmessage.Message, name dnsmessage.Name) (string, error) {
+	aliases := make(map[string]string)
+	for _, answer := range response.Answers {
+		if answer.Header.Class != dnsmessage.ClassINET || answer.Header.Type != dnsmessage.TypeCNAME {
+			continue
+		}
+		if record, ok := answer.Body.(*dnsmessage.CNAMEResource); ok {
+			owner, target := strings.ToLower(answer.Header.Name.String()), strings.ToLower(record.CNAME.String())
+			if previous, exists := aliases[owner]; exists && previous != target {
+				return "", errors.New("outbound DNS returned conflicting CNAME targets")
+			}
+			aliases[owner] = target
+		}
+	}
+	owner := strings.ToLower(name.String())
+	visited := make(map[string]bool)
+	for {
+		if visited[owner] {
+			return "", errors.New("outbound DNS returned a CNAME loop")
+		}
+		visited[owner] = true
+		target, exists := aliases[owner]
+		if !exists {
+			break
+		}
+		owner = target
+	}
+	for _, answer := range response.Answers {
+		if answer.Header.Class != dnsmessage.ClassINET || answer.Header.Type != dnsmessage.TypeA ||
+			!strings.EqualFold(answer.Header.Name.String(), owner) {
+			continue
+		}
+		if record, ok := answer.Body.(*dnsmessage.AResource); ok {
+			return net.IP(record.A[:]).String(), nil
+		}
+	}
+	return "", errors.New("outbound DNS response has no IPv4 address for the requested name")
 }
 
 func preferredProbeIP(ips []bcnet.IP) (string, bool) {
@@ -1513,6 +1562,9 @@ func reloadCompatibility(current, next *Config) error {
 		return &control.APIError{Code: "restart_required", Message: "adding or removing inbound listeners requires restart", Status: http.StatusConflict}
 	}
 	for index := range current.Inbounds {
+		if current.Inbounds[index] == nil || next.Inbounds[index] == nil {
+			return invalidConfigError(errors.New("inbound[", index, "] is null"))
+		}
 		if current.Inbounds[index].Tag != next.Inbounds[index].Tag {
 			return &control.APIError{Code: "restart_required", Message: "inbound tag changes require restart", Status: http.StatusConflict}
 		}

@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
 )
@@ -95,5 +96,66 @@ func TestTCPNameServerRetriesStalePooledConnectionOnce(t *testing.T) {
 	}
 	if got := dials.Load(); got != 2 {
 		t.Fatalf("TCP dials=%d, want stale retry to dial twice", got)
+	}
+}
+
+func TestTCPNameServerCloseInterruptsActiveExchange(t *testing.T) {
+	client, peer := net.Pipe()
+	defer peer.Close()
+	server := pooledTCPServer(t, func(context.Context) (net.Conn, error) { return client, nil })
+	defer server.Close()
+	done := make(chan error, 1)
+	go func() {
+		_, err := server.QueryRaw(t.Context(), tcpRawQuery(t, 1))
+		done <- err
+	}()
+	var size uint16
+	if err := binary.Read(peer, binary.BigEndian, &size); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(peer, make([]byte, int(size))); err != nil {
+		t.Fatal(err)
+	}
+	_ = server.Close()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("exchange succeeded after Close")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not interrupt active I/O")
+	}
+	if len(server.idleConns) != 0 {
+		t.Fatal("closed pool retained a connection")
+	}
+}
+
+func TestTCPNameServerCancelInterruptsActiveExchange(t *testing.T) {
+	client, peer := net.Pipe()
+	defer peer.Close()
+	server := pooledTCPServer(t, func(context.Context) (net.Conn, error) { return client, nil })
+	defer server.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, err := server.QueryRaw(ctx, tcpRawQuery(t, 1)); done <- err }()
+	var size uint16
+	if err := binary.Read(peer, binary.BigEndian, &size); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(peer, make([]byte, int(size))); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("exchange succeeded after cancellation")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("exchange did not observe cancellation")
+	}
+	if len(server.idleConns) != 0 {
+		t.Fatal("canceled connection returned to pool")
 	}
 }

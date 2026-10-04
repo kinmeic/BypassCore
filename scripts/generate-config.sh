@@ -9,6 +9,7 @@
 # Usage: scripts/generate-config.sh [output-path]
 
 set -u
+umask 077
 
 die() {
 	echo "error: $*" >&2
@@ -45,7 +46,21 @@ prompt_yesno() {
 
 # json_escape STRING -> prints a JSON-safe string literal (with quotes)
 json_escape() {
-	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | awk 'BEGIN{printf "\""}{printf "%s", $0}END{printf "\""}'
+	printf '%s' "$1" | awk '
+	BEGIN {
+		printf "\""
+		for (i = 1; i < 32; i++) escapes[sprintf("%c", i)] = sprintf("\\u%04x", i)
+	}
+	{
+		if (NR > 1) printf "\\n"
+		for (i = 1; i <= length($0); i++) {
+			c = substr($0, i, 1)
+			if (c == "\\" || c == "\"") printf "\\%s", c
+			else if (c in escapes) printf "%s", escapes[c]
+			else printf "%s", c
+		}
+	}
+	END { printf "\"" }'
 }
 
 is_port() {
@@ -71,7 +86,10 @@ echo "-- Local SOCKS5 inbound --"
 prompt listen "Listen address" "127.0.0.1"
 prompt port "Listen port" "1080"
 is_port "$port" || die "invalid port: $port"
-prompt network "Network (tcp or tcp,udp)" "tcp"
+# Remove leading zeroes: JSON numbers cannot use shell-style octal notation.
+port=$(printf '%s' "$port" | sed 's/^0*//')
+prompt network "Network (tcp)" "tcp"
+[ "$network" = "tcp" ] || die "SOCKS inbound supports only tcp"
 
 # --- Outbound ---
 echo
@@ -117,7 +135,8 @@ case $mode in
     }"
 	final_tag="proxy"
 	;;
-*) ;;
+1) ;;
+*) die "invalid outbound choice: $mode" ;;
 esac
 
 # --- DNS ---
@@ -134,7 +153,10 @@ if prompt_yesno "Configure built-in DNS (multi-upstream, caching, DoH/DoT)?" "n"
 fi
 
 # --- Write config ---
-cat >"$output" <<EOF
+temporary=$(mktemp "${output}.tmp.XXXXXX") || die "cannot create config temporary file"
+trap 'rm -f "$temporary"' 0
+trap 'exit 1' HUP INT TERM
+cat >"$temporary" <<EOF || die "cannot write config"
 {
   "outbounds": [
     {
@@ -160,6 +182,7 @@ cat >"$output" <<EOF
   ]$dns_json
 }
 EOF
+mv -f "$temporary" "$output" || die "cannot replace config"
 
 echo
 echo "Wrote $output"

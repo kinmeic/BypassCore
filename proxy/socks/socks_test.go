@@ -3,6 +3,8 @@ package socks
 import (
 	"context"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"testing"
@@ -10,6 +12,50 @@ import (
 
 	bcnet "github.com/eugene/bypasscore/common/net"
 )
+
+func TestDialBoundsAndCancelsHandshake(t *testing.T) {
+	for _, cancelEarly := range []bool{false, true} {
+		t.Run(fmt.Sprint(cancelEarly), func(t *testing.T) {
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			h := New("test", listener.Addr().String(), "", "")
+			h.timeout = 100 * time.Millisecond
+			ctx, cancel := context.WithTimeout(t.Context(), time.Hour)
+			defer cancel()
+			done := make(chan error, 1)
+			go func() {
+				conn, err := h.Dial(ctx, bcnet.TCPDestination(bcnet.DomainAddress("example.com"), 443))
+				if conn != nil {
+					_ = conn.Close()
+				}
+				done <- err
+			}()
+			peer, err := listener.Accept()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer peer.Close()
+			// Leave the SOCKS method selection unanswered after reading greeting.
+			if _, err := io.ReadFull(peer, make([]byte, 3)); err != nil {
+				t.Fatal(err)
+			}
+			if cancelEarly {
+				cancel()
+			}
+			select {
+			case err := <-done:
+				if err == nil || cancelEarly && !errors.Is(err, context.Canceled) {
+					t.Fatalf("unexpected handshake error: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("handshake ignored cancellation or the configured timeout")
+			}
+		})
+	}
+}
 
 // TestBuildConnectRequest_Domain verifies the SOCKS5 CONNECT request for a
 // domain destination (ATYP=0x03).

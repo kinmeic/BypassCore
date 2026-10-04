@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"io"
+	"math"
 	"runtime"
 	"strings"
 
@@ -72,6 +73,9 @@ func decodeVarint(br *bufio.Reader) (uint64, error) {
 		if err != nil {
 			return 0, err
 		}
+		if shift == 63 && b > 1 {
+			return 0, errors.New("varint overflow")
+		}
 		x |= (uint64(b) & 0x7F) << shift
 		if (b & 0x80) == 0 {
 			return x, nil
@@ -100,10 +104,10 @@ func find(r io.Reader, code []byte, readBody bool) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		bodyL := int(x)
-		if bodyL <= 0 {
-			return nil, errors.New("invalid body length: ", bodyL)
+		if x == 0 || x > math.MaxInt {
+			return nil, errors.New("invalid body length: ", x)
 		}
+		bodyL := int(x)
 
 		prefixL := bodyL
 		if prefixL > need {
@@ -126,14 +130,16 @@ func find(r io.Reader, code []byte, readBody bool) ([]byte, error) {
 
 		remain := bodyL - prefixL
 		if match {
-			out := make([]byte, bodyL)
-			copy(out, prefix)
+			// Grow only as bytes arrive. A truncated asset with a forged length
+			// must not force a huge allocation before ReadFull discovers EOF.
+			var out bytes.Buffer
+			_, _ = out.Write(prefix)
 			if remain > 0 {
-				if _, err := io.ReadFull(br, out[prefixL:]); err != nil {
+				if _, err := io.CopyN(&out, br, int64(remain)); err != nil {
 					return nil, err
 				}
 			}
-			return out, nil
+			return out.Bytes(), nil
 		}
 
 		if remain > 0 {

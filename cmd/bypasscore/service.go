@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
+	"html"
 	"io"
 	"os"
 	"os/exec"
@@ -242,7 +243,12 @@ LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
-`, name, binPath, configPath)
+`, name, quoteSystemdArgument(binPath), quoteSystemdArgument(strings.ReplaceAll(configPath, "$", "$$")))
+}
+
+func quoteSystemdArgument(value string) string {
+	// systemd expands percent specifiers even inside quoted arguments.
+	return `"` + strings.NewReplacer("\\", "\\\\", `"`, `\"`, "%", "%%", "\n", `\n`, "\r", `\r`, "\t", `\t`).Replace(value) + `"`
 }
 
 func installSystemd(opts *serviceOptions, binPath, configPath string) error {
@@ -304,7 +310,11 @@ start_service() {
 	procd_set_param stderr 1
 	procd_close_instance
 }
-`, name, binPath, configPath, name)
+`, name, quoteShellArgument(binPath), quoteShellArgument(configPath), name)
+}
+
+func quoteShellArgument(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
 func installOpenWrt(opts *serviceOptions, binPath, configPath string) error {
@@ -380,7 +390,7 @@ func renderLaunchdPlist(label, binPath, configPath string) string {
 	<string>/var/log/bypasscore.err</string>
 </dict>
 </plist>
-`, label, binPath, configPath)
+`, html.EscapeString(label), html.EscapeString(binPath), html.EscapeString(configPath))
 }
 
 func installLaunchd(opts *serviceOptions, binPath, configPath string) error {
@@ -459,8 +469,16 @@ func copyFile(src, dst string, mode os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	// Replace the destination atomically, with the requested permissions even
+	// when an older file exists. This also avoids following destination symlinks
+	// or truncating a source that shares an inode with the installed file.
+	out, err := os.CreateTemp(filepath.Dir(dst), ".bypasscore-install-*")
 	if err != nil {
+		return err
+	}
+	defer os.Remove(out.Name())
+	if err := out.Chmod(mode); err != nil {
+		_ = out.Close()
 		return err
 	}
 	_, copyErr := io.Copy(out, in)
@@ -468,7 +486,10 @@ func copyFile(src, dst string, mode os.FileMode) error {
 	if copyErr != nil {
 		return copyErr
 	}
-	return closeErr
+	if closeErr != nil {
+		return closeErr
+	}
+	return os.Rename(out.Name(), dst)
 }
 
 func sameFilePath(a, b string) bool {

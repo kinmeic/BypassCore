@@ -118,6 +118,14 @@ func (h *Handler) Tag() string { return h.tag }
 // Dial connects to the SOCKS5 server, performs the handshake, and returns a
 // tunnelled connection to dest.
 func (h *Handler) Dial(ctx context.Context, dest bcnet.Destination) (net.Conn, error) {
+	if dest.Network != bcnet.Network_TCP && dest.Network != bcnet.Network_UDP {
+		return nil, errors.New("socks5: unsupported destination network")
+	}
+	if dest.Address == nil || dest.Address.String() == "" || dest.Port == 0 {
+		return nil, errors.New("socks5: invalid destination address or port")
+	}
+	ctx, cancel := context.WithTimeout(ctx, h.timeout)
+	defer cancel()
 	network := "tcp"
 	d := net.Dialer{Timeout: h.timeout}
 	conn, err := d.DialContext(ctx, network, h.server)
@@ -126,17 +134,23 @@ func (h *Handler) Dial(ctx context.Context, dest bcnet.Destination) (net.Conn, e
 	}
 
 	// Set deadline for the handshake phase.
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		deadline = time.Now().Add(h.timeout)
-	}
+	deadline, _ := ctx.Deadline()
 	_ = conn.SetDeadline(deadline)
+	stopCancellation := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancellation()
 
 	if dest.Network == bcnet.Network_UDP {
 		udpConn, err := h.udpAssociate(ctx, conn, dest)
 		if err != nil {
 			conn.Close()
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			return nil, err
+		}
+		if !stopCancellation() || ctx.Err() != nil {
+			_ = udpConn.Close()
+			return nil, ctx.Err()
 		}
 		_ = conn.SetDeadline(time.Time{})
 		return udpConn, nil
@@ -144,7 +158,14 @@ func (h *Handler) Dial(ctx context.Context, dest bcnet.Destination) (net.Conn, e
 
 	if err := h.handshake(conn, dest); err != nil {
 		conn.Close()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, err
+	}
+	if !stopCancellation() || ctx.Err() != nil {
+		_ = conn.Close()
+		return nil, ctx.Err()
 	}
 
 	// Reset deadline — the caller (transport.Bridge) will manage I/O timeouts.
@@ -203,6 +224,9 @@ func (h *Handler) authenticate(conn net.Conn) error {
 			return errors.New("socks5: server selected unoffered no-auth method")
 		}
 	case 0x02: // username/password
+		if h.username == "" && h.password == "" {
+			return errors.New("socks5: server selected unoffered username/password method")
+		}
 		if err := h.doUserPassAuth(conn); err != nil {
 			return err
 		}

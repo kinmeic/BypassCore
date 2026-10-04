@@ -16,10 +16,10 @@ import (
 	"github.com/eugene/bypasscore/common/errors"
 	bcnet "github.com/eugene/bypasscore/common/net"
 	"github.com/eugene/bypasscore/common/wgkey"
+	netstack "github.com/eugene/bypasscore/internal/wgnetstack"
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
-	"golang.zx2c4.com/wireguard/tun/netstack"
 )
 
 const (
@@ -354,7 +354,6 @@ func (h *Handler) initialize(ctx context.Context) error {
 	})
 	fail := func(cause error) error {
 		wgDevice.Close()
-		_ = tunDevice.Close()
 		return cause
 	}
 

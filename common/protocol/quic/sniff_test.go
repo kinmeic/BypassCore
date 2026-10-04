@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"io"
 	"testing"
 )
 
@@ -44,4 +45,31 @@ func TestContiguousCryptoDataWaitsForLeadingHole(t *testing.T) {
 	if got := string(contiguousCryptoData(fragments)); got != "abcdef" {
 		t.Fatalf("reassembled data = %q, want abcdef", got)
 	}
+}
+
+func TestParseInitialFramesRejectsTruncatedCrypto(t *testing.T) {
+	for _, data := range [][]byte{{6, 0, 1}, {6, 0, 2, 0}} {
+		if _, err := parseInitialFrames(data); !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("parseInitialFrames(%x) = %v, want unexpected EOF", data, err)
+		}
+	}
+}
+
+func TestDecryptInitialRejectsHugePacketLength(t *testing.T) {
+	packet := []byte{0xc0, 0, 0, 0, 1, 0, 0, 0}
+	var length [8]byte
+	binary.BigEndian.PutUint64(length[:], 0xffffffffffffffff)
+	packet = append(packet, length[:]...)
+	if _, _, _, err := decryptInitial(packet); err == nil {
+		t.Fatal("oversized packet length accepted")
+	}
+}
+
+func FuzzQUICParsers(f *testing.F) {
+	f.Add([]byte{6, 0, 1})
+	f.Add([]byte{0xc0, 0, 0, 0, 1, 0, 0, 0, 4})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		_, _ = SniffSNI(data)
+		_, _ = parseInitialFrames(data)
+	})
 }

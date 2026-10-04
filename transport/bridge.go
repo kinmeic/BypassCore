@@ -122,7 +122,7 @@ func BridgeWithIdleTimeout(a, b net.Conn, idleTimeout time.Duration) error {
 }
 
 // copyWithIdleTimeout copies src→dst. With an active guard it refreshes the
-// shared session deadline on every read; without one it is a plain io.Copy.
+// shared session deadline on reads and writes; without one it is a plain io.Copy.
 func copyWithIdleTimeout(dst, src net.Conn, guard *idleGuard) error {
 	if guard == nil {
 		_, err := io.Copy(dst, src)
@@ -134,7 +134,7 @@ func copyWithIdleTimeout(dst, src net.Conn, guard *idleGuard) error {
 		n, err := src.Read(buf)
 		if n > 0 {
 			guard.ping()
-			if writeErr := writeFully(dst, buf[:n]); writeErr != nil {
+			if writeErr := writeFullyWithActivity(dst, buf[:n], guard); writeErr != nil {
 				return writeErr
 			}
 		}
@@ -145,10 +145,10 @@ func copyWithIdleTimeout(dst, src net.Conn, guard *idleGuard) error {
 }
 
 // idleGuard applies a session-level idle timeout across both bridge
-// directions: traffic in either direction extends the read deadline of both
+// directions: traffic in either direction extends the read/write deadlines of both
 // conns, so a one-way stream (e.g. a long download) is not evicted while it
 // is still making progress. Only when both directions stay silent for the
-// full timeout do the pending reads expire and the bridge close.
+// full timeout do the pending reads and writes expire and the bridge close.
 type idleGuard struct {
 	timeout  time.Duration
 	a, b     net.Conn
@@ -163,26 +163,30 @@ func newIdleGuard(a, b net.Conn, timeout time.Duration) *idleGuard {
 	return &idleGuard{timeout: timeout, a: a, b: b}
 }
 
-// ping records activity and pushes out both conns' read deadlines. To avoid
+// ping records activity and pushes out both conns' deadlines. To avoid
 // per-read timer churn on busy tunnels, extensions are skipped while more
 // than half of the previous runway remains.
 func (g *idleGuard) ping() {
 	now := time.Now()
 	g.mu.Lock()
-	if now.Add(g.timeout/2).Before(g.deadline) {
-		g.mu.Unlock()
+	defer g.mu.Unlock()
+	if now.Add(g.timeout / 2).Before(g.deadline) {
 		return
 	}
 	g.deadline = now.Add(g.timeout)
 	deadline := g.deadline
-	g.mu.Unlock()
-	_ = g.a.SetReadDeadline(deadline)
-	_ = g.b.SetReadDeadline(deadline)
+	// Serialize deadline installation so an older ping cannot overwrite a newer
+	// one. Bound writes too: both copy loops can block writing to silent peers.
+	_ = g.a.SetDeadline(deadline)
+	_ = g.b.SetDeadline(deadline)
 }
 
-func writeFully(conn net.Conn, data []byte) error {
+func writeFullyWithActivity(conn net.Conn, data []byte, guard *idleGuard) error {
 	for len(data) > 0 {
 		n, err := conn.Write(data)
+		if n > 0 && guard != nil {
+			guard.ping()
+		}
 		if err != nil {
 			return err
 		}

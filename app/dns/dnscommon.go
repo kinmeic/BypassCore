@@ -177,75 +177,6 @@ func buildReqMsgs(domain string, option dns_feature.IPOption, reqIDGen func() ui
 	return reqs, nil
 }
 
-// parseResponse parses DNS answers from the returned payload.
-func parseResponse(payload []byte) (*IPRecord, error) {
-	var parser dnsmessage.Parser
-	h, err := parser.Start(payload)
-	if err != nil {
-		return nil, errors.New("failed to parse DNS response").Base(err).AtWarning()
-	}
-	if err := parser.SkipAllQuestions(); err != nil {
-		return nil, errors.New("failed to skip questions in DNS response").Base(err).AtWarning()
-	}
-
-	now := time.Now()
-	ipRecord := &IPRecord{
-		ReqID:     h.ID,
-		RCode:     h.RCode,
-		RawHeader: &h,
-	}
-	defer func() {
-		// set to default TTL if no valid TTL is found
-		if ipRecord.Expire.IsZero() {
-			ipRecord.Expire = now.Add(time.Second * dns_feature.DefaultTTL)
-		}
-	}()
-
-	for {
-		ah, err := parser.AnswerHeader()
-		if err != nil {
-			if err != dnsmessage.ErrSectionDone {
-				return nil, errors.New("failed to parse DNS answer header for ", ah.Name.String()).Base(err)
-			}
-			break
-		}
-
-		ttl := ah.TTL
-		if ttl == 0 {
-			ttl = 1
-		}
-		expire := now.Add(time.Duration(ttl) * time.Second)
-		if ipRecord.Expire.IsZero() || ipRecord.Expire.After(expire) {
-			ipRecord.Expire = expire
-		}
-
-		switch ah.Type {
-		case dnsmessage.TypeA:
-			ans, err := parser.AResource()
-			if err != nil {
-				return nil, errors.New("failed to parse A record for ", ah.Name).Base(err)
-			}
-			ipRecord.IP = append(ipRecord.IP, net.IPAddress(ans.A[:]).IP())
-		case dnsmessage.TypeAAAA:
-			ans, err := parser.AAAAResource()
-			if err != nil {
-				return nil, errors.New("failed to parse AAAA record for ", ah.Name).Base(err)
-			}
-			newIP := net.IPAddress(ans.AAAA[:]).IP()
-			if len(newIP) == net.IPv6len {
-				ipRecord.IP = append(ipRecord.IP, newIP)
-			}
-		default:
-			if err := parser.SkipAnswer(); err != nil {
-				return nil, errors.New("failed to skip DNS answer").Base(err)
-			}
-			continue
-		}
-	}
-
-	return ipRecord, nil
-}
-
 // parseResponseForRequest rejects unsolicited, stale, or malformed DNS
 // responses before they can enter the cache.
 func parseResponseForRequest(payload []byte, req *dnsRequest) (*IPRecord, error) {
@@ -263,6 +194,9 @@ func parseResponseForRequest(payload []byte, req *dnsRequest) (*IPRecord, error)
 	if header.ID != req.msg.ID {
 		return nil, errors.New("DNS response ID mismatch")
 	}
+	if header.OpCode != req.msg.OpCode {
+		return nil, errors.New("DNS response opcode mismatch")
+	}
 	question, err := parser.Question()
 	if err != nil {
 		return nil, errors.New("DNS response has no matching question").Base(err)
@@ -275,5 +209,70 @@ func parseResponseForRequest(payload []byte, req *dnsRequest) (*IPRecord, error)
 	if _, err := parser.Question(); err != dnsmessage.ErrSectionDone {
 		return nil, errors.New("DNS response contains unexpected questions")
 	}
-	return parseResponse(payload)
+	// Decode all sections so malformed authority/additional records cannot be
+	// accepted into the cache. Only addresses for the requested owner (or its
+	// CNAME target), type and class belong to this lookup.
+	var message dnsmessage.Message
+	if err := message.Unpack(payload); err != nil {
+		return nil, errors.New("invalid DNS response").Base(err)
+	}
+	record := &IPRecord{ReqID: header.ID, RCode: header.RCode, RawHeader: &header}
+	ttl := uint32(dns_feature.DefaultTTL)
+	hasTTL := false
+	includeTTL := func(value uint32) {
+		if value == 0 {
+			value = 1
+		}
+		// The public cache API represents TTL as int32.
+		if value > math.MaxInt32 {
+			value = math.MaxInt32
+		}
+		if !hasTTL || value < ttl {
+			ttl = value
+		}
+		hasTTL = true
+	}
+	aliases := make(map[string]dnsmessage.Resource)
+	for _, answer := range message.Answers {
+		if answer.Header.Class != expected.Class || answer.Header.Type != dnsmessage.TypeCNAME {
+			continue
+		}
+		owner := strings.ToLower(answer.Header.Name.String())
+		if previous, exists := aliases[owner]; exists && !strings.EqualFold(
+			previous.Body.(*dnsmessage.CNAMEResource).CNAME.String(), answer.Body.(*dnsmessage.CNAMEResource).CNAME.String()) {
+			return nil, errors.New("conflicting DNS CNAME targets")
+		}
+		aliases[owner] = answer
+	}
+	owner := strings.ToLower(expected.Name.String())
+	visited := make(map[string]bool)
+	for {
+		if visited[owner] {
+			return nil, errors.New("DNS CNAME loop")
+		}
+		visited[owner] = true
+		alias, exists := aliases[owner]
+		if !exists {
+			break
+		}
+		includeTTL(alias.Header.TTL)
+		owner = strings.ToLower(alias.Body.(*dnsmessage.CNAMEResource).CNAME.String())
+	}
+	for _, answer := range message.Answers {
+		if answer.Header.Class != expected.Class || answer.Header.Type != expected.Type ||
+			!strings.EqualFold(answer.Header.Name.String(), owner) {
+			continue
+		}
+		switch body := answer.Body.(type) {
+		case *dnsmessage.AResource:
+			record.IP = append(record.IP, net.IPAddress(body.A[:]).IP())
+		case *dnsmessage.AAAAResource:
+			record.IP = append(record.IP, net.IPAddress(body.AAAA[:]).IP())
+		default:
+			continue
+		}
+		includeTTL(answer.Header.TTL)
+	}
+	record.Expire = time.Now().Add(time.Duration(ttl) * time.Second)
+	return record, nil
 }

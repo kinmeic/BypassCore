@@ -38,6 +38,50 @@ func (d *probeDNSDialer) Dial(ctx context.Context, _ bcnet.Destination) (net.Con
 
 var _ dialer.Dialer = (*probeDNSDialer)(nil)
 
+func TestReloadCompatibilityRejectsNullInbound(t *testing.T) {
+	current := &Config{Inbounds: []*appinbound.Config{{Tag: "socks", Type: "socks", Port: 1080}}}
+	next := &Config{Inbounds: []*appinbound.Config{nil}}
+	if err := reloadCompatibility(current, next); err == nil {
+		t.Fatal("null inbound accepted")
+	}
+}
+
+func TestRetireAfterServiceCloseClosesDetachedSnapshot(t *testing.T) {
+	cfg, hash, err := decodeConfig([]byte(`{"outbounds":[{"tag":"direct","mode":"freedom"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := newRuntimeService(t.Context(), "", cfg, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	old, err := service.acquire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer old.forceClose()
+	conn, peer := net.Pipe()
+	defer peer.Close()
+	leased, err := old.track(conn, "direct")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer leased.Close()
+	// Model the interval between a reload's pointer swap and retirement.
+	service.mu.Lock()
+	service.current = nil
+	service.mu.Unlock()
+	_ = service.Close()
+	service.retireSnapshot(old)
+	if !old.forced.Load() || !old.closed.Load() {
+		t.Fatal("shutdown missed the detached snapshot")
+	}
+	if _, err := leased.Write([]byte("x")); err == nil {
+		t.Fatal("detached connection remained open after shutdown")
+	}
+}
+
 type unavailableProbeDNSDialer struct{}
 
 func (*unavailableProbeDNSDialer) Tag() string { return "unavailable" }
@@ -97,6 +141,35 @@ func TestResolveProbeHostThroughOutboundUsesOutboundDNS(t *testing.T) {
 	}
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestProbeIPv4AnswerFiltersOwnersAndFollowsCNAME(t *testing.T) {
+	name := dnsmessage.MustNewName("probe.example.")
+	alias := dnsmessage.MustNewName("alias.example.")
+	unrelated := dnsmessage.Resource{
+		Header: dnsmessage.ResourceHeader{Name: dnsmessage.MustNewName("unrelated.example."), Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET},
+		Body:   &dnsmessage.AResource{A: [4]byte{6, 6, 6, 6}},
+	}
+	response := &dnsmessage.Message{Answers: []dnsmessage.Resource{unrelated}, Additionals: []dnsmessage.Resource{{
+		Header: dnsmessage.ResourceHeader{Name: name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET},
+		Body:   &dnsmessage.AResource{A: [4]byte{7, 7, 7, 7}},
+	}}}
+	if address, err := probeIPv4Answer(response, name); err == nil {
+		t.Fatalf("unrelated/additional answer accepted: %s", address)
+	}
+	response.Answers = append(response.Answers,
+		dnsmessage.Resource{Header: dnsmessage.ResourceHeader{Name: alias, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}, Body: &dnsmessage.AResource{A: [4]byte{203, 0, 113, 9}}},
+		dnsmessage.Resource{Header: dnsmessage.ResourceHeader{Name: name, Type: dnsmessage.TypeCNAME, Class: dnsmessage.ClassINET}, Body: &dnsmessage.CNAMEResource{CNAME: alias}})
+	if address, err := probeIPv4Answer(response, name); err != nil || address != "203.0.113.9" {
+		t.Fatalf("CNAME resolution = %s, %v", address, err)
+	}
+	response.Answers = append(response.Answers, dnsmessage.Resource{
+		Header: dnsmessage.ResourceHeader{Name: alias, Type: dnsmessage.TypeCNAME, Class: dnsmessage.ClassINET},
+		Body:   &dnsmessage.CNAMEResource{CNAME: name},
+	})
+	if _, err := probeIPv4Answer(response, name); err == nil {
+		t.Fatal("CNAME loop accepted")
 	}
 }
 

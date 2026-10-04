@@ -185,13 +185,11 @@ func TestMerge_NilRecordsReturnsNotFound(t *testing.T) {
 
 func TestMerge_OneFamilyEmpty(t *testing.T) {
 	// Asking both families; v4 returns IPs, v6 record is nil (errRecordNotFound).
-	// Documented behavior of merge: a nil v6 record short-circuits to
-	// errRecordNotFound because getIPs on a nil *IPRecord returns that sentinel
-	// and merge's "Is(err, errRecordNotFound)" branch fires.
+	// A missing family must not discard the successful family's addresses.
 	opt := dns_feature.IPOption{IPv4Enable: true, IPv6Enable: true}
-	_, _, err := merge(opt, rec(ipOf("1.2.3.4")), nil)
-	if !errors.Is(err, errRecordNotFound) {
-		t.Errorf("merge with nil v6 record err = %v, want errRecordNotFound", err)
+	ips, ttl, err := merge(opt, rec(ipOf("1.2.3.4")), nil)
+	if err != nil || len(ips) != 1 || !ips[0].Equal(ipOf("1.2.3.4")) || ttl < 50 {
+		t.Errorf("merge with nil v6 record = %v, ttl=%d, err=%v", ips, ttl, err)
 	}
 }
 

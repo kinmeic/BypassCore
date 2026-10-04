@@ -3,6 +3,7 @@ package dns
 import (
 	"context"
 	go_errors "errors"
+	stdnet "net"
 	"time"
 
 	"github.com/eugene/bypasscore/common/errors"
@@ -23,8 +24,16 @@ func queryIP(ctx context.Context, s CachedNameserver, domain string, option dns.
 	fqdn := Fqdn(domain)
 
 	cache := s.getCacheController()
+	select {
+	case <-cache.done:
+		return nil, 0, stdnet.ErrClosed
+	default:
+	}
 	if !cache.disableCache {
 		if rec := cache.findRecords(fqdn); rec != nil {
+			if option.IPv4Enable && rec.A == nil || option.IPv6Enable && rec.AAAA == nil {
+				return fetch(ctx, s, fqdn, option)
+			}
 			ips, ttl, err := merge(option, rec.A, rec.AAAA)
 			if !go_errors.Is(err, errRecordNotFound) {
 				if ttl > 0 {
@@ -95,15 +104,17 @@ func doFetch(ctx context.Context, s CachedNameserver, fqdn string, option dns.IP
 	sub4, sub6 := s.getCacheController().registerSubscribers(fqdn, option)
 	defer closeSubscribers(sub4, sub6)
 
-	noResponseErrCh := make(chan error, 2)
-	onEvent := func(sub *pubsub.Subscriber) (*IPRecord, error) {
+	err4Ch, err6Ch := make(chan error, 1), make(chan error, 1)
+	onEvent := func(sub *pubsub.Subscriber, errCh <-chan error) (*IPRecord, error) {
 		if sub == nil {
 			return nil, nil
 		}
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case err := <-noResponseErrCh:
+		case <-s.getCacheController().done:
+			return nil, stdnet.ErrClosed
+		case err := <-errCh:
 			return nil, err
 		case msg := <-sub.Wait():
 			sub.Close()
@@ -112,10 +123,21 @@ func doFetch(ctx context.Context, s CachedNameserver, fqdn string, option dns.IP
 	}
 
 	start := time.Now()
-	s.sendQuery(ctx, noResponseErrCh, fqdn, option)
+	// Associate transport failures with their family. An AAAA failure must not
+	// consume the A subscription and then leave us waiting for the failed AAAA.
+	if sub4 != nil {
+		v4 := option
+		v4.IPv6Enable = false
+		s.sendQuery(ctx, err4Ch, fqdn, v4)
+	}
+	if sub6 != nil {
+		v6 := option
+		v6.IPv4Enable = false
+		s.sendQuery(ctx, err6Ch, fqdn, v6)
+	}
 
-	rec4, err4 := onEvent(sub4)
-	rec6, err6 := onEvent(sub6)
+	rec4, err4 := onEvent(sub4, err4Ch)
+	rec6, err6 := onEvent(sub6, err6Ch)
 
 	var errs []error
 	if err4 != nil {
@@ -147,10 +169,13 @@ func merge(option dns.IPOption, rec4 *IPRecord, rec6 *IPRecord, errs ...error) (
 
 	if option.IPv4Enable {
 		ips, ttl, err := rec4.getIPs() // it's safe
-		if !mergeReq || go_errors.Is(err, errRecordNotFound) {
+		if !mergeReq {
+			if go_errors.Is(err, errRecordNotFound) && len(errs) > 0 {
+				return nil, ttl, errors.Combine(errs...)
+			}
 			return ips, ttl, err
 		}
-		if ttl < rTTL {
+		if rec4 != nil && ttl < rTTL {
 			rTTL = ttl
 		}
 		if len(ips) > 0 {
@@ -162,10 +187,13 @@ func merge(option dns.IPOption, rec4 *IPRecord, rec6 *IPRecord, errs ...error) (
 
 	if option.IPv6Enable {
 		ips, ttl, err := rec6.getIPs() // it's safe
-		if !mergeReq || go_errors.Is(err, errRecordNotFound) {
+		if !mergeReq {
+			if go_errors.Is(err, errRecordNotFound) && len(errs) > 0 {
+				return nil, ttl, errors.Combine(errs...)
+			}
 			return ips, ttl, err
 		}
-		if ttl < rTTL {
+		if rec6 != nil && ttl < rTTL {
 			rTTL = ttl
 		}
 		if len(ips) > 0 {

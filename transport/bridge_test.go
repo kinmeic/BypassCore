@@ -257,3 +257,29 @@ func TestConnRWC_Close(t *testing.T) {
 }
 
 var _ = sync.WaitGroup{}
+
+func TestBridgeIdleTimeoutUnblocksWritesInBothDirections(t *testing.T) {
+	a, peerA := net.Pipe()
+	b, peerB := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	defer peerA.Close()
+	defer peerB.Close()
+	done := make(chan error, 1)
+	go func() { done <- BridgeWithIdleTimeout(a, b, 50*time.Millisecond) }()
+	// Both copies read a byte and then block writing to peers that never read.
+	if _, err := peerA.Write([]byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := peerB.Write([]byte("b")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("idle eviction returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("bridge retained two blocked writes beyond the idle timeout")
+	}
+}
