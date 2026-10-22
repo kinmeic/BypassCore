@@ -2,7 +2,7 @@
 
 BINARY := bypasscore
 CONFIG ?= examples/config.example.json
-VERSION ?= 1.5.4
+VERSION ?= 1.5.5
 LDFLAGS ?= -X main.version=$(VERSION)
 
 build:
