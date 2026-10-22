@@ -18,7 +18,6 @@ import (
 	"github.com/eugene/bypasscore/common/log"
 	bcnet "github.com/eugene/bypasscore/common/net"
 	dns_feature "github.com/eugene/bypasscore/features/dns"
-	"golang.org/x/net/http2"
 )
 
 // DoHNameServer implements DNS over HTTPS (RFC 8484) wire format using the
@@ -63,9 +62,11 @@ func NewDoHNameServer(u *url.URL, h2c bool, disableCache bool, serveStale bool, 
 		return d.DialContext(ctx, "tcp", dest.NetAddr())
 	}
 	if h2c {
-		s.httpClient = &http.Client{Transport: &http2.Transport{
-			AllowHTTP: true,
-			DialTLSContext: func(ctx context.Context, _, _ string, _ *tls.Config) (net.Conn, error) {
+		protocols := new(http.Protocols)
+		protocols.SetUnencryptedHTTP2(true)
+		s.httpClient = &http.Client{Transport: &http.Transport{
+			Protocols: protocols,
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				return s.dialRaw(ctx, s.destination)
 			},
 		}, Timeout: 8 * time.Second}
@@ -222,12 +223,7 @@ func (s *DoHNameServer) dohHTTPSContext(ctx context.Context, b []byte) ([]byte, 
 }
 
 func (s *DoHNameServer) Close() error {
-	if transport, ok := s.httpClient.Transport.(*http.Transport); ok {
-		transport.CloseIdleConnections()
-	}
-	if transport, ok := s.httpClient.Transport.(*http2.Transport); ok {
-		transport.CloseIdleConnections()
-	}
+	s.httpClient.CloseIdleConnections()
 	return s.cacheController.Close()
 }
 

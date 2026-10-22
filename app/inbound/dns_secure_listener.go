@@ -13,7 +13,6 @@ import (
 
 	"github.com/eugene/bypasscore/common/errors"
 	commonmetrics "github.com/eugene/bypasscore/common/metrics"
-	"golang.org/x/net/http2"
 )
 
 func loadDNSServerTLSConfig(cfg *Config) (*tls.Config, error) {
@@ -66,10 +65,11 @@ func (l *DNSListener) startDoH(address string, tlsConfig *tls.Config) error {
 		TLSConfig:         tlsConfig,
 		ConnState:         l.handleDoHConnState,
 	}
-	if err := http2.ConfigureServer(server, &http2.Server{MaxConcurrentStreams: uint32(maxDoHConcurrentStreams)}); err != nil {
-		_ = l.tcp.Close()
-		return errors.New("DNS inbound: configure HTTP/2").Base(err)
-	}
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
+	protocols.SetHTTP2(true)
+	server.Protocols = protocols
+	server.HTTP2 = &http.HTTP2Config{MaxConcurrentStreams: maxDoHConcurrentStreams}
 	l.httpServer = server
 	l.wg.Add(1)
 	go func() {

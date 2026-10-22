@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math"
 	"net"
+	"net/http"
 	"net/url"
 	"testing"
 	"time"
@@ -12,7 +13,6 @@ import (
 	bcnet "github.com/eugene/bypasscore/common/net"
 	dnsfeature "github.com/eugene/bypasscore/features/dns"
 	"golang.org/x/net/dns/dnsmessage"
-	"golang.org/x/net/http2"
 )
 
 func validDNSExchange(t *testing.T) (*dnsRequest, []byte) {
@@ -93,8 +93,12 @@ func TestDoHH2CUsesCleartextHTTP2(t *testing.T) {
 	if server.dohURL != "http://127.0.0.1:8053/dns-query" {
 		t.Fatalf("unexpected h2c URL %q", server.dohURL)
 	}
-	if _, ok := server.httpClient.Transport.(*http2.Transport); !ok {
+	transport, ok := server.httpClient.Transport.(*http.Transport)
+	if !ok {
 		t.Fatalf("h2c transport is %T", server.httpClient.Transport)
+	}
+	if transport.Protocols == nil || !transport.Protocols.UnencryptedHTTP2() {
+		t.Fatal("h2c transport does not enable unencrypted HTTP/2")
 	}
 }
 

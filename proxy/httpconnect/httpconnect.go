@@ -2,6 +2,8 @@
 // the upstream transport used by caddyserver/forwardproxy: establish TLS,
 // negotiate HTTP/1.1 or HTTP/2 with ALPN, issue CONNECT with optional Basic
 // proxy authentication, and expose the resulting tunnel as net.Conn.
+//
+//lint:file-ignore SA1019 The proxy needs x/net/http2's low-level ClientConn to bind HTTP/2 to its caller-owned TLS socket and preserve multiplexed tunnel lifecycle controls.
 package httpconnect
 
 import (
